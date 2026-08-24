@@ -1,4 +1,4 @@
-"""Entry point for MySQL Runner."""
+"""Entry point for Sitekeeper."""
 
 import sys
 

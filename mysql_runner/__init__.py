@@ -1,5 +1,20 @@
-"""MySQL Runner — a phpMyAdmin session manager (WinSCP-style) built with PyQt6."""
+"""Sitekeeper - a WinSCP-style session manager for phpMyAdmin, MySQL and SFTP.
 
-from mysql_runner.app import run
+This package is deliberately front-end agnostic. It used to re-export the Qt
+entrypoint here, which meant that importing anything at all from
+``mysql_runner`` - the vault, a model, an FTP client - dragged in PyQt6. That
+broke the FastAPI sidecar, which is frozen without any GUI toolkit.
 
-__all__ = ["run"]
+Import the entrypoint from where it lives instead:
+
+    from mysql_runner.app import run
+
+One consequence worth knowing: that re-export also imported Qt WebEngine early,
+which Qt requires to happen before any QCoreApplication is constructed. Nothing
+in this package can guarantee that ordering, so any GUI entrypoint has to do
+what ``mysql_runner.app`` does - import ``PyQt6.QtWebEngineWidgets`` (or set
+``AA_ShareOpenGLContexts``) before creating the QApplication - or browser tabs
+will fail to import.
+"""
+
+__all__: list[str] = []

@@ -1,13 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for MySQL Runner.
+"""PyInstaller spec for Sitekeeper.
 
 Build a one-file Windows executable:
 
     pip install -r requirements.txt
-    pyinstaller MySQLRunner.spec
+    pyinstaller Sitekeeper.spec
 
 Output:
-    dist/MySQLRunner.exe
+    dist/Sitekeeper.exe
 """
 
 from pathlib import Path
@@ -29,8 +29,17 @@ datas = [
 ]
 binaries = []
 # PyInstaller's PyQt6 hooks collect required WebEngine modules/resources
-# from imports in code.
-hiddenimports = []
+# from imports in code. The three below are loaded lazily (and keyring via a
+# string, which static analysis cannot see), so they are named explicitly:
+#   pymysql   - native MySQL connections for the SQL console tab
+#   paramiko  - SFTP transport for the file-manager tab
+#   keyring   - optional Windows Credential Manager cache for the vault key
+hiddenimports = [
+    "pymysql",
+    "paramiko",
+    "keyring",
+    "keyring.backends.Windows",
+]
 
 
 a = Analysis(
@@ -63,7 +72,7 @@ exe = EXE(
     a.datas,
     [],
     exclude_binaries=False,
-    name="MySQLRunner",
+    name="Sitekeeper",
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,

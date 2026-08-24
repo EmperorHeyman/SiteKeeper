@@ -16,6 +16,22 @@ class StoreError(Exception):
     """Raised when the server store cannot be read or decrypted."""
 
 
+def opens_store(vault: "Vault") -> bool:
+    """Whether ``vault``'s key can actually decrypt the stored profiles.
+
+    The OS keyring cache can go stale - it is keyed by application name, not by
+    which vault file it belongs to, so a key cached by another install (or by a
+    test run) will load happily and then fail to decrypt anything. Callers use
+    this to validate a cached key before trusting it, instead of discovering the
+    mismatch as a fatal error at startup.
+    """
+    try:
+        ServerStore(vault)
+    except StoreError:
+        return False
+    return True
+
+
 class ServerStore:
     """Loads and saves :class:`ServerProfile` records encrypted with the vault DEK."""
 

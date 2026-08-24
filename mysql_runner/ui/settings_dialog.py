@@ -1,4 +1,4 @@
-"""Application settings dialog (appearance + password/locking options)."""
+"""Application settings dialog (appearance, security, file transfer)."""
 
 from __future__ import annotations
 
@@ -11,10 +11,15 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QLabel,
     QPushButton,
+    QSpinBox,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
-from mysql_runner.storage.settings import Settings
+from mysql_runner.crypto import vault as vault_mod
+from mysql_runner.storage.settings import MAX_TRANSFER_WORKERS, Settings
+from mysql_runner.transfer import spawn
 
 # (label, minutes) — 0 means "never auto-lock".
 _LOCK_CHOICES = [
@@ -26,6 +31,27 @@ _LOCK_CHOICES = [
     ("After 1 hour", 60),
 ]
 
+_PROTECTION_CHOICES = [
+    ("Master password", vault_mod.PROTECTION_PASSWORD),
+    ("No password — tied to this Windows account", vault_mod.PROTECTION_WINDOWS),
+]
+
+#: Object name the application stylesheet renders as a grey note.
+_HINT_ROLE = "hint"
+
+_PROTECTION_HINT = {
+    vault_mod.PROTECTION_PASSWORD: (
+        "A master password unlocks the vault. Strongest option: the encryption "
+        "key cannot be recovered from the files alone."
+    ),
+    vault_mod.PROTECTION_WINDOWS: (
+        "No prompt, ever. Your saved connections stay encrypted, but the key is "
+        "sealed to this Windows user account — anyone who can log in as you (or "
+        "run code as you) can open them. Copies of the files are useless on "
+        "another account or machine."
+    ),
+}
+
 
 class SettingsDialog(QDialog):
     """Edits user preferences. Read the getters after :meth:`exec` returns truthy."""
@@ -35,24 +61,56 @@ class SettingsDialog(QDialog):
         self._on_change_password = on_change_password
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(520)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        tabs = QTabWidget()
+        general = QWidget()
+        layout = QVBoxLayout(general)
+        tabs.addTab(general, "General")
+        outer.addWidget(tabs)
 
         # ----- Appearance -------------------------------------------------
         appearance = QGroupBox("Appearance")
         appearance_form = QFormLayout(appearance)
-        self._dark = QCheckBox("Dark mode")
+        self._dark = QCheckBox("Dark app theme")
+        self._dark.setToolTip("The window, tabs, tables and dialogs")
         self._dark.setChecked(settings.dark_mode)
+        self._web_dark = QCheckBox("Dark phpMyAdmin pages")
+        self._web_dark.setToolTip(
+            "Darkens the phpMyAdmin page itself with the bundled Dark Reader. "
+            "Independent of the app theme."
+        )
+        self._web_dark.setChecked(settings.web_dark_mode)
         self._sidebar = QCheckBox("Show server sidebar")
         self._sidebar.setChecked(settings.sidebar_visible)
+        self._split = QCheckBox("Split view (two tab panes side by side)")
+        self._split.setChecked(settings.split_view)
         appearance_form.addRow(self._dark)
+        appearance_form.addRow(self._web_dark)
         appearance_form.addRow(self._sidebar)
+        appearance_form.addRow(self._split)
         layout.addWidget(appearance)
 
         # ----- Password & locking ----------------------------------------
         security = QGroupBox("Password && locking")
         sec_form = QFormLayout(security)
+
+        # Whether there is a master password at all.
+        self._protection = QComboBox()
+        for text, mode in _PROTECTION_CHOICES:
+            self._protection.addItem(text, mode)
+        self._initial_protection = vault_mod.protection_mode()
+        index = self._protection.findData(self._initial_protection)
+        if index >= 0:
+            self._protection.setCurrentIndex(index)
+        self._protection.currentIndexChanged.connect(self._sync_protection)
+        sec_form.addRow("Vault protection:", self._protection)
+
+        self._protection_hint = QLabel("")
+        self._protection_hint.setWordWrap(True)
+        self._protection_hint.setObjectName(_HINT_ROLE)
+        sec_form.addRow(self._protection_hint)
 
         # The headline option: unlock once and never get pestered again.
         self._stay = QCheckBox("Stay logged in (unlock once, never ask again)")
@@ -66,7 +124,7 @@ class SettingsDialog(QDialog):
             "re-asking for the master password."
         )
         stay_hint.setWordWrap(True)
-        stay_hint.setStyleSheet("color: gray;")
+        stay_hint.setObjectName(_HINT_ROLE)
         sec_form.addRow(stay_hint)
 
         self._lock = QComboBox()
@@ -83,21 +141,133 @@ class SettingsDialog(QDialog):
         self._remember.setChecked(settings.remember_password)
         sec_form.addRow(self._remember)
 
-        change_btn = QPushButton("Change master password…")
-        change_btn.clicked.connect(self._on_change_clicked)
-        sec_form.addRow(change_btn)
+        self._change_btn = QPushButton("Change master password…")
+        self._change_btn.clicked.connect(self._on_change_clicked)
+        sec_form.addRow(self._change_btn)
 
         layout.addWidget(security)
+        layout.addStretch(1)
 
-        # Reflect the initial "stay logged in" state on the granular controls.
-        self._sync_stay_logged_in(self._stay.isChecked())
+        # ----- File transfer ---------------------------------------------
+        tabs.addTab(self._build_transfer_tab(settings), "File transfer")
+
+        # Reflect the initial state on the dependent controls.
+        self._sync_protection()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        outer.addWidget(buttons)
+
+    # ----- file transfer --------------------------------------------------
+    def _build_transfer_tab(self, settings: Settings) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+
+        speed = QGroupBox("Speed")
+        speed_form = QFormLayout(speed)
+        self._workers = QSpinBox()
+        self._workers.setRange(1, MAX_TRANSFER_WORKERS)
+        self._workers.setValue(settings.transfer_workers)
+        self._workers.setToolTip(
+            "Each one is a separate connection. Three is a good default; shared "
+            "hosting sometimes limits how many you may open."
+        )
+        speed_form.addRow("Files at once:", self._workers)
+        speed_note = QLabel(
+            "Browsing always uses its own connection, so a running queue never "
+            "blocks the file panes."
+        )
+        speed_note.setWordWrap(True)
+        speed_note.setObjectName(_HINT_ROLE)
+        speed_form.addRow(speed_note)
+        self._folder_stats = QCheckBox(
+            "Show folders' real size and newest change date"
+        )
+        self._folder_stats.setChecked(settings.folder_stats)
+        self._folder_stats.setToolTip(
+            "Servers report a folder's own timestamp, which does not change "
+            "when a file inside it does. This walks the folder instead."
+        )
+        speed_form.addRow(self._folder_stats)
+        page_layout.addWidget(speed)
+
+        safety = QGroupBox("Safety")
+        safety_form = QFormLayout(safety)
+        self._atomic = QCheckBox("Upload to a temporary name, then rename (safe deploy)")
+        self._atomic.setChecked(settings.atomic_uploads)
+        self._atomic.setToolTip(
+            "A live request can never see a half-written file."
+        )
+        self._shadow = QCheckBox("Keep the previous version of anything overwritten")
+        self._shadow.setChecked(settings.shadow_backups)
+        self._verify = QCheckBox("Check each upload by comparing digests afterwards")
+        self._verify.setChecked(settings.verify_uploads)
+        self._guard = QCheckBox("Ask before anything destructive on production")
+        self._guard.setChecked(settings.production_guard)
+        self._history_days = QSpinBox()
+        self._history_days.setRange(0, 365)
+        self._history_days.setValue(settings.history_days)
+        self._history_days.setSuffix(" days")
+        self._history_days.setSpecialValueText("Don't keep any")
+        safety_form.addRow(self._atomic)
+        safety_form.addRow(self._shadow)
+        safety_form.addRow("Keep those copies for:", self._history_days)
+        safety_form.addRow(self._verify)
+        safety_form.addRow(self._guard)
+        page_layout.addWidget(safety)
+
+        behaviour = QGroupBox("Behaviour")
+        behaviour_form = QFormLayout(behaviour)
+        self._ignore_rules = QCheckBox("Obey .deployignore / .gitignore")
+        self._ignore_rules.setChecked(settings.use_ignore_rules)
+        self._ignore_defaults = QCheckBox(
+            "Also skip node_modules, vendor, .git, caches and .env"
+        )
+        self._ignore_defaults.setChecked(settings.ignore_defaults)
+        self._mirror = QCheckBox("Mirror navigation between the two panes")
+        self._mirror.setChecked(settings.mirror_navigation)
+        self._autosync = QCheckBox("While watching a folder, upload changes at once")
+        self._autosync.setChecked(settings.watch_autosync)
+        behaviour_form.addRow(self._ignore_rules)
+        behaviour_form.addRow(self._ignore_defaults)
+        behaviour_form.addRow(self._mirror)
+        behaviour_form.addRow(self._autosync)
+        page_layout.addWidget(behaviour)
+
+        terminal = QGroupBox("External terminal")
+        terminal_form = QFormLayout(terminal)
+        self._terminal = QComboBox()
+        self._terminal.addItem("The first one found", "")
+        for found in spawn.detect_terminals():
+            self._terminal.addItem(found.name, found.name)
+        index = self._terminal.findData(settings.terminal_program)
+        if index >= 0:
+            self._terminal.setCurrentIndex(index)
+        elif settings.terminal_program:
+            self._terminal.addItem(
+                f"{settings.terminal_program} (not found)", settings.terminal_program
+            )
+            self._terminal.setCurrentIndex(self._terminal.count() - 1)
+        self._terminal_password = QCheckBox("Pass the password on the command line")
+        self._terminal_password.setChecked(settings.terminal_send_password)
+        self._terminal_password.setToolTip(
+            "Convenient, but the password is briefly visible to anything that "
+            "can list processes on this machine. A key file is used instead "
+            "whenever the connection has one."
+        )
+        terminal_form.addRow("Prefer:", self._terminal)
+        terminal_form.addRow(self._terminal_password)
+        page_layout.addWidget(terminal)
+
+        page_layout.addStretch(1)
+        self._ignore_rules.toggled.connect(self._ignore_defaults.setEnabled)
+        self._ignore_defaults.setEnabled(self._ignore_rules.isChecked())
+        self._shadow.toggled.connect(self._history_days.setEnabled)
+        self._history_days.setEnabled(self._shadow.isChecked())
+        return page
 
     # ----- helpers --------------------------------------------------------
     def _select_lock(self, minutes: int) -> None:
@@ -108,13 +278,26 @@ class SettingsDialog(QDialog):
             index = self._lock.count() - 1
         self._lock.setCurrentIndex(index)
 
+    def _sync_protection(self) -> None:
+        """Grey out password options when there is no master password."""
+        mode = self.protection_mode()
+        self._protection_hint.setText(_PROTECTION_HINT.get(mode, ""))
+        has_password = mode == vault_mod.PROTECTION_PASSWORD
+        self._stay.setEnabled(has_password)
+        self._change_btn.setEnabled(
+            has_password and mode == self._initial_protection
+        )
+        self._sync_stay_logged_in(self._stay.isChecked())
+
     def _sync_stay_logged_in(self, staying: bool) -> None:
-        """Disable the granular options while "stay logged in" overrides them."""
-        # When staying logged in, the auto-lock / ask-on-start / remember
-        # controls have no effect, so grey them out to make that obvious.
-        self._lock.setEnabled(not staying)
-        self._ask_start.setEnabled(not staying)
-        self._remember.setEnabled(not staying)
+        """Disable the granular options while they cannot take effect."""
+        # Without a master password there is nothing to prompt for, and while
+        # "stay logged in" is on it overrides all three anyway.
+        has_password = self.protection_mode() == vault_mod.PROTECTION_PASSWORD
+        active = has_password and not staying
+        self._lock.setEnabled(active)
+        self._ask_start.setEnabled(active)
+        self._remember.setEnabled(active)
 
     def _on_change_clicked(self) -> None:
         if self._on_change_password is not None:
@@ -124,8 +307,14 @@ class SettingsDialog(QDialog):
     def dark_mode(self) -> bool:
         return self._dark.isChecked()
 
+    def web_dark_mode(self) -> bool:
+        return self._web_dark.isChecked()
+
     def sidebar_visible(self) -> bool:
         return self._sidebar.isChecked()
+
+    def split_view(self) -> bool:
+        return self._split.isChecked()
 
     def idle_lock_minutes(self) -> int:
         return int(self._lock.currentData())
@@ -138,3 +327,50 @@ class SettingsDialog(QDialog):
 
     def stay_logged_in(self) -> bool:
         return self._stay.isChecked()
+
+    def protection_mode(self) -> str:
+        return str(self._protection.currentData())
+
+    def protection_changed(self) -> bool:
+        """Whether the user picked a different protection mode."""
+        return self.protection_mode() != self._initial_protection
+
+    # ----- file transfer results -----------------------------------------
+    def transfer_workers(self) -> int:
+        return int(self._workers.value())
+
+    def atomic_uploads(self) -> bool:
+        return self._atomic.isChecked()
+
+    def shadow_backups(self) -> bool:
+        return self._shadow.isChecked()
+
+    def history_days(self) -> int:
+        return int(self._history_days.value())
+
+    def verify_uploads(self) -> bool:
+        return self._verify.isChecked()
+
+    def use_ignore_rules(self) -> bool:
+        return self._ignore_rules.isChecked()
+
+    def ignore_defaults(self) -> bool:
+        return self._ignore_defaults.isChecked()
+
+    def folder_stats(self) -> bool:
+        return self._folder_stats.isChecked()
+
+    def mirror_navigation(self) -> bool:
+        return self._mirror.isChecked()
+
+    def production_guard(self) -> bool:
+        return self._guard.isChecked()
+
+    def watch_autosync(self) -> bool:
+        return self._autosync.isChecked()
+
+    def terminal_program(self) -> str:
+        return str(self._terminal.currentData() or "")
+
+    def terminal_send_password(self) -> bool:
+        return self._terminal_password.isChecked()

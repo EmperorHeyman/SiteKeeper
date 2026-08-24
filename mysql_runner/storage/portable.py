@@ -20,7 +20,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from mysql_runner.storage.models import ServerProfile
 
-_MAGIC = "mysql-runner-export"
+_MAGIC = "sitekeeper-export"
+#: Exports written before the rename. Still imported, of course.
+_LEGACY_MAGIC = "mysql-runner-export"
 _VERSION = 1
 _ITERATIONS = 480_000
 _SALT_BYTES = 16
@@ -65,8 +67,8 @@ def import_profiles(path: str | Path, passphrase: str) -> list[ServerProfile]:
         bundle = json.loads(Path(path).read_text(encoding="utf-8"))
     except (ValueError, OSError) as exc:
         raise PortableError("The file is not a valid export bundle.") from exc
-    if bundle.get("magic") != _MAGIC:
-        raise PortableError("The file is not a MySQL Runner export.")
+    if bundle.get("magic") not in (_MAGIC, _LEGACY_MAGIC):
+        raise PortableError("The file is not a Sitekeeper export.")
     try:
         salt = base64.b64decode(bundle["salt"])
         token = base64.b64decode(bundle["data"])

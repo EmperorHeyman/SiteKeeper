@@ -1,0 +1,10 @@
+PyQt6>=6.6
+PyQt6-WebEngine>=6.6
+cryptography>=42.0
+# Native MySQL connections for the SQL console tab.
+PyMySQL>=1.1
+# SFTP for the file-manager tab (FTP/FTPS use the standard library).
+paramiko>=3.4
+# Optional: caches the vault key in Windows Credential Manager.
+keyring>=25.0
+pyinstaller>=6.0

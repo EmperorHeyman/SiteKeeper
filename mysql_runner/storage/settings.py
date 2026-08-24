@@ -1,24 +1,46 @@
 """Plain-JSON UI settings (non-sensitive preferences only).
 
 These preferences do not contain credentials, so they are stored unencrypted:
-dark-mode toggle, sidebar visibility, the idle auto-lock timeout, and the
-master-password prompt policy.
+dark-mode toggle, sidebar layout, split-view state, the idle auto-lock timeout,
+and the master-password prompt policy.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from mysql_runner.paths import settings_path
+
+#: Sidebar width used when no width has been remembered yet.
+DEFAULT_SIDEBAR_WIDTH = 280
+#: Narrowest remembered sidebar width, so it can always be grabbed again.
+MIN_SIDEBAR_WIDTH = 140
+#: Parallel transfer connections per tab, and the ceiling the UI allows.
+DEFAULT_TRANSFER_WORKERS = 3
+MAX_TRANSFER_WORKERS = 16
 
 
 @dataclass
 class Settings:
     """User-interface preferences."""
 
-    dark_mode: bool = False
+    # The application's own chrome: window, tabs, tables, dialogs.
+    dark_mode: bool = True
+    # Dark mode *injected into phpMyAdmin pages* by the bundled Dark Reader.
+    # Separate on purpose: a dark app with a light phpMyAdmin (or the reverse)
+    # is a perfectly reasonable thing to want, and one switch could not say so.
+    web_dark_mode: bool = True
     sidebar_visible: bool = True
+    # Collapsed to the icon rail: the sidebar's contents are hidden but a slim
+    # strip with an expand button stays put, so there is always a way back.
+    sidebar_collapsed: bool = False
+    # Width to restore when the sidebar is expanded again.
+    sidebar_width: int = DEFAULT_SIDEBAR_WIDTH
+    # Second tab pane shown beside the first (side-by-side view).
+    split_view: bool = False
+    # Pixel widths of the two tab panes while split view is on.
+    split_sizes: list[int] = field(default_factory=list)
     idle_lock_minutes: int = 15  # 0 disables auto-lock.
     # Prompt for the master password on every app launch (ignore the keyring
     # cache at startup). The keyring is still used for in-session re-unlocks.
@@ -31,6 +53,36 @@ class Settings:
     # encrypted. See the effective_* helpers below.
     stay_logged_in: bool = False
 
+    # ----- file transfer -------------------------------------------------
+    # Parallel connections per file-manager tab. One is the old behaviour.
+    transfer_workers: int = DEFAULT_TRANSFER_WORKERS
+    # Upload to a scratch name and rename into place, so a half-written file
+    # is never served to a live request.
+    atomic_uploads: bool = True
+    # Keep the previous version of anything overwritten, so it can be undone.
+    shadow_backups: bool = True
+    # How long those saved copies are kept.
+    history_days: int = 30
+    # Re-read each upload and compare digests. Slow, and sometimes worth it.
+    verify_uploads: bool = False
+    # Apply .deployignore / .gitignore to batch transfers and comparisons.
+    use_ignore_rules: bool = True
+    # Add the built-in list (node_modules, vendor, .git, ...) to those rules.
+    ignore_defaults: bool = True
+    # Walk folders to show their real size and newest content date.
+    folder_stats: bool = True
+    # Keep both panes on matching directories.
+    mirror_navigation: bool = False
+    # Ask twice before anything destructive on a production connection.
+    production_guard: bool = True
+    # Upload changed files automatically while a tab is watching.
+    watch_autosync: bool = False
+    # Preferred external terminal ("" picks the first one found).
+    terminal_program: str = ""
+    # Hand the password to that terminal. It becomes visible to anything that
+    # can list processes on this machine, so it is a deliberate choice.
+    terminal_send_password: bool = True
+
     @classmethod
     def load(cls) -> "Settings":
         path = settings_path()
@@ -40,14 +92,69 @@ class Settings:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             return cls()
+        # A file written before the app/web split had one shared flag whose
+        # default was "off". There is no way to tell a deliberate "off" from an
+        # untouched default in those files, so they are treated as never having
+        # chosen and get the new dark default; whatever is saved after that
+        # sticks.
+        chose_before = "web_dark_mode" in data
+        app_dark = bool(data.get("dark_mode", True)) if chose_before else True
         return cls(
-            dark_mode=bool(data.get("dark_mode", False)),
+            dark_mode=app_dark,
+            web_dark_mode=bool(data.get("web_dark_mode", app_dark)),
             sidebar_visible=bool(data.get("sidebar_visible", True)),
+            sidebar_collapsed=bool(data.get("sidebar_collapsed", False)),
+            sidebar_width=cls._sane_width(data.get("sidebar_width")),
+            split_view=bool(data.get("split_view", False)),
+            split_sizes=cls._sane_sizes(data.get("split_sizes")),
             idle_lock_minutes=int(data.get("idle_lock_minutes", 15)),
             ask_password_on_start=bool(data.get("ask_password_on_start", False)),
             remember_password=bool(data.get("remember_password", False)),
             stay_logged_in=bool(data.get("stay_logged_in", False)),
+            transfer_workers=cls._sane_workers(data.get("transfer_workers")),
+            atomic_uploads=bool(data.get("atomic_uploads", True)),
+            shadow_backups=bool(data.get("shadow_backups", True)),
+            history_days=max(0, int(data.get("history_days", 30) or 0)),
+            verify_uploads=bool(data.get("verify_uploads", False)),
+            use_ignore_rules=bool(data.get("use_ignore_rules", True)),
+            ignore_defaults=bool(data.get("ignore_defaults", True)),
+            folder_stats=bool(data.get("folder_stats", True)),
+            mirror_navigation=bool(data.get("mirror_navigation", False)),
+            production_guard=bool(data.get("production_guard", True)),
+            watch_autosync=bool(data.get("watch_autosync", False)),
+            terminal_program=str(data.get("terminal_program", "") or ""),
+            terminal_send_password=bool(data.get("terminal_send_password", True)),
         )
+
+    # ----- validation -----------------------------------------------------
+    @staticmethod
+    def _sane_width(value: object) -> int:
+        """Clamp a remembered sidebar width so it can never become unusable."""
+        try:
+            width = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return DEFAULT_SIDEBAR_WIDTH
+        return max(MIN_SIDEBAR_WIDTH, width)
+
+    @staticmethod
+    def _sane_workers(value: object) -> int:
+        """Clamp the connection count; zero or nonsense means the default."""
+        try:
+            count = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return DEFAULT_TRANSFER_WORKERS
+        return max(1, min(MAX_TRANSFER_WORKERS, count))
+
+    @staticmethod
+    def _sane_sizes(value: object) -> list[int]:
+        """Accept only a pair of positive pane widths; otherwise fall back."""
+        if not isinstance(value, list) or len(value) != 2:
+            return []
+        try:
+            sizes = [int(v) for v in value]
+        except (TypeError, ValueError):
+            return []
+        return sizes if all(s > 0 for s in sizes) else []
 
     # ----- effective behaviour -------------------------------------------
     # "Stay logged in" takes precedence over the granular options so the app

@@ -9,3 +9,25 @@ settings.json
 build/
 dist/
 *.egg-info/
+
+# PyInstaller one-file build outputs and packaged releases (hundreds of MB).
+build_onefile_upx/
+dist_onefile_upx/
+release/
+*.exe.broken-*
+
+# Frontend build + dependency trees. node_modules is a junction to local disk
+# (see dev-setup.ps1) because SMB cannot execute the tools inside it.
+frontend/node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+frontend/src-tauri/binaries/
+backend/build/
+backend/dist/
+
+# Installer build output: the staged payload (a copy of the 191 MB exe), the
+# generated licence copy, and the setup binary itself.
+installer/payload/
+installer/LICENSE.txt
+installer/*-Setup.exe

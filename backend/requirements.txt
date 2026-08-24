@@ -1,0 +1,11 @@
+# Backend service (localhost sidecar started by the Tauri shell).
+fastapi>=0.115
+uvicorn>=0.30
+websockets>=13.0
+pydantic>=2.9
+pydantic-settings>=2.5
+# Shared core, same versions the PyQt build uses.
+cryptography>=42.0
+PyMySQL>=1.1
+paramiko>=3.4
+keyring>=25.0

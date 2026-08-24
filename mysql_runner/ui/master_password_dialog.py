@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -18,7 +19,7 @@ class UnlockDialog(QDialog):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Unlock MySQL Runner")
+        self.setWindowTitle("Unlock Sitekeeper")
         self.setModal(True)
 
         layout = QVBoxLayout(self)
@@ -42,9 +43,9 @@ class UnlockDialog(QDialog):
 
 
 class CreateMasterPasswordDialog(QDialog):
-    """First-run dialog to choose a master password."""
+    """First-run dialog to choose a master password - or to go without one."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, allow_no_password: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Set Master Password")
         self.setModal(True)
@@ -66,6 +67,20 @@ class CreateMasterPasswordDialog(QDialog):
         form.addRow("Confirm:", self._confirm)
         layout.addLayout(form)
 
+        self._skip: QCheckBox | None = None
+        if allow_no_password:
+            self._skip = QCheckBox("Don't use a master password")
+            self._skip.toggled.connect(self._on_skip_toggled)
+            layout.addWidget(self._skip)
+            hint = QLabel(
+                "Your connections still get encrypted, but the key is sealed to "
+                "this Windows account instead of a password. You can change this "
+                "later in Settings."
+            )
+            hint.setWordWrap(True)
+            hint.setObjectName("hint")
+            layout.addWidget(hint)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -73,7 +88,18 @@ class CreateMasterPasswordDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _on_skip_toggled(self, skipping: bool) -> None:
+        self._password.setEnabled(not skipping)
+        self._confirm.setEnabled(not skipping)
+
+    def use_password(self) -> bool:
+        """Whether the user wants a master password at all."""
+        return self._skip is None or not self._skip.isChecked()
+
     def _on_accept(self) -> None:
+        if not self.use_password():
+            self.accept()
+            return
         if len(self._password.text()) < 6:
             QMessageBox.warning(
                 self, "Weak password", "Use at least 6 characters."
