@@ -128,6 +128,8 @@ def nav_icon(kind: str, dark: bool, *, size: int = 14) -> QIcon:
     letter, and Qt's own standard icons are drawn in a fixed dark grey that
     disappears against a dark window. Painting them means they always show and
     always match the theme.
+
+    Kinds: ``back``, ``forward``, ``up``, ``down``, ``refresh``, ``browse``.
     """
     colour = QColor(palette(dark).text_dim)
     scale = 2  # draw at 2x so the edges stay crisp when scaled down
@@ -138,6 +140,10 @@ def nav_icon(kind: str, dark: bool, *, size: int = 14) -> QIcon:
     box = pixmap.rect().adjusted(scale * 2, scale * 2, -scale * 2, -scale * 2)
     if kind == "refresh":
         _paint_refresh(painter, box, colour, scale)
+    elif kind == "browse":
+        # The same folder the listing draws, in the navigation grey: a browse
+        # button that looked like an arrow read as one more way to move up.
+        _paint_folder(painter, QRectF(box).adjusted(0, scale, 0, -scale), colour)
     else:
         _paint_triangle(painter, box, colour, kind)
     painter.end()

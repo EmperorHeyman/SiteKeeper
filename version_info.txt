@@ -5,8 +5,8 @@
 #
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 5, 2, 0),
-        prodvers=(1, 5, 2, 0),
+        filevers=(1, 6, 0, 0),
+        prodvers=(1, 6, 0, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -22,7 +22,7 @@ VSVersionInfo(
                     [
                         StringStruct("CompanyName", "RAPL Group"),
                         StringStruct("FileDescription", "Sitekeeper"),
-                        StringStruct("FileVersion", "1.5.2.0"),
+                        StringStruct("FileVersion", "1.6.0.0"),
                         StringStruct("InternalName", "Sitekeeper"),
                         StringStruct(
                             "LegalCopyright",
@@ -30,7 +30,7 @@ VSVersionInfo(
                         ),
                         StringStruct("OriginalFilename", "Sitekeeper.exe"),
                         StringStruct("ProductName", "Sitekeeper"),
-                        StringStruct("ProductVersion", "1.5.2.0"),
+                        StringStruct("ProductVersion", "1.6.0.0"),
                         StringStruct("Author", "Lukáš Peterek"),
                     ],
                 )

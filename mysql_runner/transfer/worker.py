@@ -135,6 +135,10 @@ class TransferWorker(QObject):
     tool_failed = pyqtSignal(str, str)
     #: Progress of a long tool job: (kind, text).
     tool_progress = pyqtSignal(str, str)
+    #: Sub-folders of one directory, for the folder picker: (path, list[str]).
+    folders_listed = pyqtSignal(str, object)
+    #: The folder picker could not read a directory: (path, message).
+    folders_failed = pyqtSignal(str, str)
     #: The connection has been closed.
     closed = pyqtSignal()
 
@@ -159,6 +163,8 @@ class TransferWorker(QObject):
         self._tool_lock = threading.Lock()
         self._tool_cancel = False
         self._tool_busy = ""
+        self._browse_fs: RemoteFS | None = None
+        self._browse_lock = threading.Lock()
         self._queue_totals = [0, 0, 0]  # queued, completed, failed
         self._last_listing = ""        # refreshed after a queue drains
 
@@ -203,6 +209,13 @@ class TransferWorker(QObject):
                 except Exception:
                     pass
                 self._tool_fs = None
+        with self._browse_lock:
+            if self._browse_fs is not None:
+                try:
+                    self._browse_fs.close()
+                except Exception:
+                    pass
+                self._browse_fs = None
         if self._fs is not None:
             self._fs.close()
             self._fs = None
@@ -702,6 +715,58 @@ class TransferWorker(QObject):
         self._options = options.sane()
         if self._pool is not None:
             self._pool.set_workers(self._options.workers)
+
+    # ----- the folder picker's channel ------------------------------------
+    # Deliberately neither the navigation session nor the tool channel. The
+    # navigation session's listings drive the remote pane, so borrowing it
+    # would yank the pane around while somebody is only looking for a folder;
+    # the tool channel takes one job at a time and a folder-size sweep can sit
+    # on it for a minute, which is far too long to wait for a directory list.
+    def _browse_connection(self) -> RemoteFS:
+        """The picker's own read-only session. Call with ``_browse_lock`` held."""
+        if self._browse_fs is not None:
+            if self._browse_fs.alive():
+                return self._browse_fs
+            try:
+                self._browse_fs.close()
+            except Exception:
+                pass
+            self._browse_fs = None
+        spec = self._spec
+        if spec is None:
+            raise TransferError(NOT_CONNECTED)
+        self._browse_fs = spec.connected()
+        return self._browse_fs
+
+    @pyqtSlot(str)
+    def request_folders(self, path: str) -> None:
+        """Name the directories inside ``path`` for the remote folder picker.
+
+        Files are dropped here rather than in the dialog: a listing of a
+        release directory can be thousands of entries, and none of them are
+        anything the picker can show.
+        """
+        target = path or "/"
+
+        def runner() -> None:
+            with self._browse_lock:
+                try:
+                    entries = self._browse_connection().listdir(target)
+                except (TransferError, OSError) as exc:
+                    self.folders_failed.emit(target, str(exc))
+                    return
+                except Exception as exc:
+                    self.folders_failed.emit(
+                        target, str(exc) or exc.__class__.__name__
+                    )
+                    return
+            names = sorted(
+                (entry.name for entry in entries if entry.is_dir),
+                key=str.lower,
+            )
+            self.folders_listed.emit(target, names)
+
+        threading.Thread(target=runner, name="browse-folders", daemon=True).start()
 
     # ----- tool jobs (their own connection, their own thread) -------------
     def _tool_connection(self) -> RemoteFS:

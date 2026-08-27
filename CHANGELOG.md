@@ -6,6 +6,38 @@ All notable changes to Sitekeeper are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-27
+
+### Added
+- **A Browse button on both path bars.** The local one opens Windows's own
+  folder picker. The remote one opens a tree of the server's folders that
+  expands a branch at a time and leaves the pane where it was until you press
+  *Go here* - so reaching `/var/www/vhosts/example.com/httpdocs` is one dialog
+  rather than six listings, each of which used to repaint the pane you were
+  working in. The picker reads over a connection of its own, so it still opens
+  while a comparison or a folder-size sweep is running.
+- **A commit offer can be opened up.** Clicking the notice - or its *What goes
+  where…* button, or *Sync ▸ What the last commit would send…* - lists every
+  file the push would send with the full server path it lands on, the
+  deletions it would carry out, and the files in the commit that are **not**
+  going anywhere, each with the reason.
+
+### Changed
+- **The commit offer says where it is actually going.** It used to say only
+  that it "would upload 3 file(s) under /some/folder", which left the pairing
+  to be guessed and made it read as though the commit would go to whichever
+  folder happened to be open. It now names both folders - the one it reads
+  from and the one it writes to - says outright that the pair is the two panes,
+  and counts the files in the commit that fall outside that folder instead of
+  dropping them silently. Move either pane and the offer is worked out again
+  for the new pair, so the folder named on the strip is always the folder the
+  push uses. Accepting it now pushes the commit that is remembered rather than
+  one captured when the strip was drawn.
+- **The connection sidebar wastes less width.** Its tree used Qt's default
+  indent, which is meant for trees that nest deeply; this one is two levels
+  deep and every row carries an icon saying what it is, so a third of a narrow
+  sidebar was empty space to the left of every connection. Tightened.
+
 ## [1.5.2] - 2026-08-27
 
 ### Fixed

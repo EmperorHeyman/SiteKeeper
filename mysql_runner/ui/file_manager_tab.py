@@ -85,11 +85,13 @@ from mysql_runner.transfer.treestat import FolderStatsCache, local_folder_stats
 from mysql_runner.transfer.watcher import Change, ChangeKind, DirectoryWatcher, summarise
 from mysql_runner.transfer.worker import ConnectionSpec, TransferWorker
 from mysql_runner.ui import theme
+from mysql_runner.ui.commit_plan_dialog import CommitPlanDialog
 from mysql_runner.ui.compare_dialog import CompareDialog
 from mysql_runner.ui.history_dialog import HistoryDialog
 from mysql_runner.ui.sync_activity_dialog import SyncActivityDialog
 from mysql_runner.ui.log_viewer import LogViewerDialog
 from mysql_runner.ui.permissions_dialog import PermissionsDialog
+from mysql_runner.ui.remote_folder_dialog import RemoteFolderDialog
 from mysql_runner.ui.sync_dialog import SyncFoldersDialog
 from mysql_runner.ui.remote_tools import (
     ArchiveDialog,
@@ -243,6 +245,12 @@ class _NoticeBar(QWidget):
         self._label = QLabel("")
         self._label.setWordWrap(True)
         self._label.setObjectName("noticetext")
+        # The buttons answer the offer; clicking the sentence asks what the
+        # offer actually is, which for anything involving a file list is the
+        # question that gets asked first.
+        self._label.mousePressEvent = (  # type: ignore[method-assign]
+            lambda _event: self._click()
+        )
         row.addWidget(self._label, 1)
         self._remember = QCheckBox("")
         self._remember.setVisible(False)
@@ -251,6 +259,7 @@ class _NoticeBar(QWidget):
         self._buttons: list[QPushButton] = []
         self._row = row
         self._on_dismiss = None
+        self._on_click = None
         close = QToolButton()
         close.setObjectName("tabclose")
         close.setText("✕")
@@ -269,6 +278,7 @@ class _NoticeBar(QWidget):
         detail: str = "",
         checkbox: str = "",
         on_dismiss=None,
+        on_click=None,
     ) -> None:
         """Say ``text`` and offer ``actions`` as (label, callback) pairs.
 
@@ -276,12 +286,22 @@ class _NoticeBar(QWidget):
         hides itself first, so a callback that opens something of its own is
         never drawn behind this strip. ``on_dismiss`` is called when the strip
         is closed instead - which is how a ticked checkbox is honoured by
-        someone who answers by walking away.
+        someone who answers by walking away. ``on_click`` runs when the text
+        itself is clicked, for a notice that has more to say than fits.
         """
         self._on_dismiss = on_dismiss
+        self._on_click = on_click
         self._clear_buttons()
         self._label.setText(text)
-        self._label.setToolTip(detail)
+        self._label.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if on_click is not None
+            else Qt.CursorShape.ArrowCursor
+        )
+        hint = "Click for the whole list." if on_click is not None else ""
+        self._label.setToolTip(
+            "\n\n".join(part for part in (detail, hint) if part)
+        )
         self._remember.setVisible(bool(checkbox))
         self._remember.setText(checkbox)
         self._remember.setChecked(False)
@@ -304,14 +324,33 @@ class _NoticeBar(QWidget):
     def dismiss(self) -> None:
         self.setVisible(False)
         callback, self._on_dismiss = self._on_dismiss, None
+        self._on_click = None
         self._clear_buttons()
         self._label.setText("")
         if callback is not None:
             callback()
 
+    def hide_quietly(self) -> None:
+        """Take the strip down without counting it as an answer.
+
+        For when what the notice said stops being true rather than the user
+        having closed it - the folder it named moved out from under it, say.
+        Firing the dismissal callback there would record an answer nobody gave.
+        """
+        self._on_dismiss = None
+        self._on_click = None
+        self.setVisible(False)
+        self._clear_buttons()
+        self._label.setText("")
+
+    def _click(self) -> None:
+        if self._on_click is not None:
+            self._on_click()
+
     def _run(self, callback) -> None:
         self.setVisible(False)
         self._on_dismiss = None  # answered; the dismissal path is not owed one
+        self._on_click = None
         try:
             callback()
         finally:
@@ -335,6 +374,8 @@ class _PathBar(QWidget):
     """
 
     navigate = pyqtSignal(str)
+    #: The Browse button was pressed; the pane decides what browsing means.
+    browse = pyqtSignal()
 
     #: More segments than this collapse into one "…" menu after the root, so
     #: a deep path cannot push the folder you are in out of view.
@@ -367,8 +408,20 @@ class _PathBar(QWidget):
         self._row.setContentsMargins(4, 0, 4, 0)
         self._row.setSpacing(0)
 
+        # Typing a path means knowing it; a picker is for the far commoner
+        # case of knowing the folder when you see it. Local opens Windows's own
+        # dialog, remote a tree of the server - see FileManagerTab.
+        self._browse = _icon_button(
+            "browse",
+            "Browse the server for a folder…"
+            if posix
+            else "Browse for a local folder…",
+        )
+        self._browse.clicked.connect(self.browse.emit)
+
         layout.addWidget(self._crumbs)
         layout.addWidget(self._edit)
+        layout.addWidget(self._browse)
         self._show_crumbs()
 
     # ----- state ------------------------------------------------------------
@@ -499,6 +552,8 @@ class _FilePane(QWidget):
 
     #: The user asked to show a different directory.
     navigate = pyqtSignal(str)
+    #: The path bar's Browse button was pressed.
+    browse = pyqtSignal()
     #: A file row was double-clicked (name only; the owner knows the side).
     open_file = pyqtSignal(str)
     #: Delete was pressed while this pane's table had focus.
@@ -588,6 +643,7 @@ class _FilePane(QWidget):
 
         self._path_bar = _PathBar(posix=posix)
         self._path_bar.navigate.connect(self.navigate.emit)
+        self._path_bar.browse.connect(self.browse.emit)
         layout.addWidget(self._path_bar)
 
         self._table = _FileTable(0, len(_COLUMNS))
@@ -1167,6 +1223,8 @@ class FileManagerTab(QWidget):
     _sync_scan_requested = pyqtSignal(str, str, bool, object, str, bool)
     _sync_delete_requested = pyqtSignal(object)
     _folder_stats_requested = pyqtSignal(str, object)
+    #: Ask the worker to name the directories inside one remote folder.
+    _folders_requested = pyqtSignal(str)
     _digest_requested = pyqtSignal(str)
     _grep_requested = pyqtSignal(str, str, bool, bool, str)
     _disk_usage_requested = pyqtSignal(str)
@@ -1235,6 +1293,14 @@ class FileManagerTab(QWidget):
         #: touched, so it can still be pushed after the notice is gone:
         #: {"repo", "detail", "short", "changes"}.
         self._last_commit: dict | None = None
+        #: The commit whose offer is still on the strip, kept so the offer can
+        #: be worked out again for a new folder pair when either pane moves.
+        self._pending_commit: dict | None = None
+        #: Whether that offer is still waiting for an answer.
+        self._commit_notice_open = False
+        #: The folder pair the strip was last worked out for, so a refresh of
+        #: a listing does not re-stat a whole commit for the same answer.
+        self._commit_notice_pair: tuple[str, str] | None = None
         #: One-shot rules made by "Sync now" on a folder that is not armed.
         self._sync_transient: dict[str, SyncRule] = {}
         #: Scope the next new rule gets, until told otherwise.
@@ -1308,6 +1374,7 @@ class FileManagerTab(QWidget):
         self._local.menu_requested.connect(lambda pos: self._show_menu(pos, remote=False))
         self._local.paths_dropped.connect(self._on_local_drop)
         self._local.transfer_dropped.connect(self._on_pane_drop)
+        self._local.browse.connect(self._on_browse_local)
 
         self._remote = _FilePane(f"Remote — {self._profile.label}", posix=True)
         self._remote.bind_paths(self._remote_child, self._remote_parent)
@@ -1318,6 +1385,7 @@ class FileManagerTab(QWidget):
         self._remote.menu_requested.connect(lambda pos: self._show_menu(pos, remote=True))
         self._remote.paths_dropped.connect(self._on_remote_drop)
         self._remote.transfer_dropped.connect(self._on_pane_drop)
+        self._remote.browse.connect(self._on_browse_remote)
 
         panes = QSplitter(Qt.Orientation.Horizontal)
         panes.addWidget(self._local)
@@ -1616,6 +1684,7 @@ class FileManagerTab(QWidget):
             (self._sync_scan_requested, self._worker.request_sync_scan),
             (self._sync_delete_requested, self._worker.delete_quietly),
             (self._folder_stats_requested, self._worker.request_folder_stats),
+            (self._folders_requested, self._worker.request_folders),
             (self._digest_requested, self._worker.request_digest),
             (self._grep_requested, self._worker.request_grep),
             (self._disk_usage_requested, self._worker.request_disk_usage),
@@ -1653,6 +1722,8 @@ class FileManagerTab(QWidget):
             (self._worker.tool_result, self._on_tool_result),
             (self._worker.tool_failed, self._on_tool_failed),
             (self._worker.tool_progress, self._on_tool_progress),
+            (self._worker.folders_listed, self._on_folders_listed),
+            (self._worker.folders_failed, self._on_folders_failed),
             (self._worker.edit_ready, self._on_edit_ready),
             (self._worker.closed, self._on_closed),
         )
@@ -1714,6 +1785,8 @@ class FileManagerTab(QWidget):
         self._request_remote_stats(path, entries)
         if self._mirror_box.isChecked():
             self._mirror_to_local(path)
+        # The other half of the pair a commit offer names - see _load_local.
+        self._show_pane_commit_notice()
 
     def _on_op_message(self, message: str) -> None:
         """Both success and failure of a single operation just report text."""
@@ -1891,6 +1964,9 @@ class FileManagerTab(QWidget):
         if self._watcher is not None and self._watcher.root != target:
             self._restart_watcher(target)
         self._watch_pane_repo(target)
+        # A live commit offer is between two folders, and one of them just
+        # changed, so what the strip says has to be worked out again.
+        self._show_pane_commit_notice()
 
     def _local_child(self, name: str) -> str:
         return os.path.join(self._local.path, name)
@@ -2716,35 +2792,65 @@ class FileManagerTab(QWidget):
             parts.append(f"leaving {len(removals)} removal(s) alone")
         self._set_status(f"{rule.name}: " + ", ".join(parts) + ".")
 
-    def _commit_targets(
+    def _commit_plan(
         self, rule: SyncRule, repo: str, changes: list, ignores: IgnoreRules
-    ) -> tuple[list[str], list[str]]:
-        """What one commit means for one rule: (local uploads, remote removals).
+    ) -> dict:
+        """Everything one commit means for one rule, with the reasons kept.
 
         Filters the commit's file list down to what the rule owns and what
-        ``ignores`` allows - the caller reads those rules once and passes them
-        in, because it needs the same set for the upload itself. Removals come
-        back regardless of the rule's delete_remote flag; the caller decides
-        whether to act on them.
+        ``ignores`` allows, and - unlike the counts that used to be all anyone
+        saw - records the server path each file is going to and why the rest
+        are staying put. Removals come back regardless of the rule's
+        delete_remote flag; the caller decides whether to act on them.
+
+        ``uploads`` are (local path, path within the folder, remote path),
+        ``removals`` are (path within the folder, remote path), and ``skipped``
+        are (path within the repository, why it is not going).
         """
-        uploads: list[str] = []
-        removals: list[str] = []
+        uploads: list[tuple[str, str, str]] = []
+        removals: list[tuple[str, str]] = []
+        skipped: list[tuple[str, str]] = []
         for status, rel in changes:
             path = os.path.normpath(os.path.join(repo, rel.replace("/", os.sep)))
             if not rule.owns(path):
+                skipped.append((rel, "outside the folder on the left"))
                 continue
             relative = rule.relative(path)
-            if not relative or ignores.is_ignored(relative):
+            if not relative:
+                skipped.append((rel, "is the folder itself"))
+                continue
+            if ignores.is_ignored(relative):
+                skipped.append((rel, "matched by .deployignore / .gitignore"))
                 continue
             if status == "D":
                 remote = rule.remote_for(path)
                 if remote and remote != rule.remote:
-                    removals.append(remote)
+                    removals.append((relative, remote))
+                else:
+                    skipped.append((rel, "deleted, but not a file this rule owns"))
             elif os.path.isfile(path):
-                uploads.append(path)
-            # A committed file already gone from disk again is the next
-            # commit's (or the watcher's) business, not this one's.
-        return uploads, removals
+                uploads.append((path, relative, rule.remote_for(path)))
+            else:
+                # A committed file already gone from disk again is the next
+                # commit's (or the watcher's) business, not this one's.
+                skipped.append((rel, "gone from disk again since the commit"))
+        return {
+            "uploads": uploads,
+            "removals": removals,
+            "skipped": skipped,
+            "local": rule.local,
+            "remote": rule.remote,
+        }
+
+    def _commit_targets(
+        self, rule: SyncRule, repo: str, changes: list, ignores: IgnoreRules
+    ) -> tuple[list[str], list[str]]:
+        """(local uploads, remote removals) for one commit - the acting view."""
+        plan = self._commit_plan(rule, repo, changes, ignores)
+        return (
+            [local for local, _rel, _remote in plan["uploads"]],
+            [remote for _rel, remote in plan["removals"]],
+        )
 
     # ----- offering to push commits nothing is syncing ---------------------
     # "I committed" is the strongest signal this app ever gets that a tree is
@@ -2758,6 +2864,12 @@ class FileManagerTab(QWidget):
         current = self._repo_watcher.repo if self._repo_watcher is not None else ""
         if repo == current:
             return
+        # A different repository entirely: whatever the old one committed is
+        # no longer what the pane is about, so the offer goes with it.
+        if self._commit_notice_open:
+            self._notice.hide_quietly()
+        self._pending_commit = None
+        self._commit_notice_open = False
         if self._repo_watcher is not None:
             self._repo_watcher.stop()
             self._repo_watcher = None
@@ -2797,9 +2909,6 @@ class FileManagerTab(QWidget):
         """Offer to push a commit made in a folder nothing is syncing yet."""
         if self._closing or not self._connected:
             return
-        local, remote = self._local.path, self._remote.path
-        if not local or not remote:
-            return
         detail = event.describe() if isinstance(event, CommitEvent) else "HEAD moved"
         short = event.short if isinstance(event, CommitEvent) else ""
         if not isinstance(changes, list):
@@ -2807,39 +2916,146 @@ class FileManagerTab(QWidget):
             return
         # Remembered whatever the answer turns out to be, so "Push the last
         # commit" in the Sync menu still works once this notice is gone.
-        self._last_commit = {
+        self._pending_commit = {
             "repo": repo, "detail": detail, "short": short, "changes": changes,
         }
-        # The offer maps the pane pair: what you committed under the folder
-        # you are looking at goes to the folder you are looking at remotely.
+        self._last_commit = dict(self._pending_commit)
+        self._commit_notice_open = True
+        self._commit_notice_pair = None  # a new commit; nothing is up to date
+        self._show_pane_commit_notice()
+
+    def _pane_commit_plan(self) -> dict | None:
+        """What the last noticed commit would do, for the panes as they are.
+
+        There is no rule for this folder - that is the whole reason the offer
+        exists - so the only pairing available is the one on screen. Working it
+        out fresh each time is what keeps the strip honest: the folder it names
+        is the folder the push uses, even after the panes have moved.
+        """
+        last = self._pending_commit or self._last_commit
+        if not last or not self._local.path or not self._remote.path:
+            return None
+        changes = last.get("changes")
+        if not isinstance(changes, list):
+            return None
+        repo = str(last.get("repo", ""))
         rule = self._pane_commit_rule()
-        uploads, removals = self._commit_targets(
-            rule, repo, changes, self._rule_ignores(rule)
+        plan = self._commit_plan(rule, repo, changes, self._rule_ignores(rule))
+        plan.update(
+            repo=repo,
+            repo_label=describe_repo(repo) or os.path.basename(repo),
+            detail=str(last.get("detail", "")),
+            short=str(last.get("short", "")),
         )
+        return plan
+
+    def _show_pane_commit_notice(self) -> None:
+        """Say which two folders the offer is between, in so many words.
+
+        Saying only "this would upload 3 files" left the destination to be
+        guessed, and the guess - whichever folder happens to be open - is
+        exactly the thing worth being told. So both paths are named, the
+        pairing is admitted to be the panes, and files the commit touched that
+        are *not* going anywhere are counted rather than quietly dropped.
+        """
+        if not self._commit_notice_open or self._closing or not self._connected:
+            return
+        pair = (self._local.path, self._remote.path)
+        if pair == self._commit_notice_pair:
+            return  # same two folders; a re-listing changes none of this
+        self._commit_notice_pair = pair
+        plan = self._pane_commit_plan()
+        if plan is None:
+            return
+        self._refresh_commit_plan_dialog(plan)
+        uploads, removals, skipped = (
+            plan["uploads"], plan["removals"], plan["skipped"]
+        )
+        commit = plan["short"] or plan["detail"] or "HEAD"
         if not uploads and not removals:
-            return  # the commit touched nothing under the folder on show
+            # Nothing of the commit lives under the folder on show. The offer
+            # is not withdrawn - moving either pane brings it back - but there
+            # is nothing to put on the strip in the meantime.
+            self._notice.hide_quietly()
+            self._set_status(
+                f"Commit {commit}: nothing it changed is under {plan['local']}."
+            )
+            return
         parts = [f"upload {len(uploads)} file(s)"]
         if removals:
-            parts.append(f"remove {len(removals)} deleted file(s)")
+            parts.append(f"delete {len(removals)} file(s) from the server")
+        where = plan["repo_label"]
+        text = (
+            f"Commit {commit}" + (f" in {where}" if where else "")
+            + ": pushing it would " + " and ".join(parts)
+            + f" — from {plan['local']} to {plan['remote']}, the two folders "
+            "open in the panes."
+        )
+        if skipped:
+            text += (
+                f" {len(skipped)} other file(s) in the commit are not under that "
+                "folder and stay where they are."
+            )
         listing = "\n".join(
-            [local_relative(local, path) for path in uploads[:150]]
-            + [f"remove {path}" for path in removals[:50]]
+            [f"{rel}  →  {remote}" for _local, rel, remote in uploads[:60]]
+            + [f"delete  {remote}" for _rel, remote in removals[:20]]
         )
         self._notice.show_notice(
-            f"Committed {detail} — this would " + " and ".join(parts)
-            + f" under {remote}.",
+            text,
             [
-                ("Push", lambda: self._push_pane_commit(repo, changes, arm=False)),
-                ("Push every commit",
-                 lambda: self._push_pane_commit(repo, changes, arm=True)),
+                ("Push", lambda: self._push_pane_commit(arm=False)),
+                ("Push every commit", lambda: self._push_pane_commit(arm=True)),
+                ("What goes where…", self._open_commit_plan),
             ],
             detail=listing,
             checkbox="Don't ask again",
             on_dismiss=self._remember_pane_answer,
+            on_click=self._open_commit_plan,
         )
+
+    # ----- the file-by-file view of an offer -------------------------------
+    def _open_commit_plan(self) -> None:
+        """Show every file the commit would send, and where each one lands."""
+        plan = self._pane_commit_plan()
+        if plan is None:
+            self._set_status("No commit has been noticed in this folder yet.")
+            return
+        dialog = self._commit_plan_dialog(create=True)
+        if dialog is None:
+            return
+        dialog.set_plan(plan)
+        self._present(dialog)
+
+    def _commit_plan_dialog(self, *, create: bool) -> CommitPlanDialog | None:
+        dialog = self._dialogs.get("commit_plan")
+        if isinstance(dialog, CommitPlanDialog):
+            try:
+                dialog.isVisible()  # probes that the C++ side is still there
+                return dialog
+            except RuntimeError:
+                self._dialogs.pop("commit_plan", None)
+        if not create:
+            return None
+        dialog = CommitPlanDialog(self._settings.dark_mode, self)
+        dialog.push_requested.connect(
+            lambda arm: self._push_pane_commit(arm=bool(arm))
+        )
+        self._dialogs["commit_plan"] = dialog
+        return dialog
+
+    def _refresh_commit_plan_dialog(self, plan: dict) -> None:
+        """Keep an open plan window in step with the panes underneath it."""
+        dialog = self._commit_plan_dialog(create=False)
+        if dialog is None:
+            return
+        try:
+            dialog.set_plan(plan)
+        except RuntimeError:
+            self._dialogs.pop("commit_plan", None)
 
     def _remember_pane_answer(self) -> None:
         """Closing the notice with "Don't ask again" ticked is an answer too."""
+        self._commit_notice_open = False
         if not self._notice.remembered():
             return
         rule = self._pane_commit_rule()
@@ -2862,8 +3078,20 @@ class FileManagerTab(QWidget):
             mode=SyncMode.OFF,
         )
 
-    def _push_pane_commit(self, repo: str, changes: list, *, arm: bool) -> None:
-        """Act on the notice: push this commit, and arm the folder if asked."""
+    def _push_pane_commit(self, *, arm: bool) -> None:
+        """Act on the offer: push the noticed commit, arming the pair if asked.
+
+        The commit is taken from what is remembered rather than from arguments
+        bound when the strip was drawn, so pushing cannot send a different
+        commit - or into a different folder - than the strip described.
+        """
+        self._commit_notice_open = False
+        last = self._pending_commit or self._last_commit
+        if not last:
+            self._set_status("No commit has been noticed in this folder yet.")
+            return
+        repo = str(last.get("repo", ""))
+        changes = list(last.get("changes") or [])
         rule = self._pane_commit_rule()
         if not rule.local or not rule.remote:
             return
@@ -2886,13 +3114,10 @@ class FileManagerTab(QWidget):
 
     def _push_last_commit(self) -> None:
         """Push the most recent commit again, from the Sync menu."""
-        last = self._last_commit
-        if not last or not self._require_connection():
+        if not self._last_commit or not self._require_connection():
             self._set_status("No commit has been noticed in this folder yet.")
             return
-        self._push_pane_commit(
-            str(last.get("repo", "")), list(last.get("changes") or []), arm=False
-        )
+        self._push_pane_commit(arm=False)
 
     def _on_sync_scan(self, payload: object) -> None:
         """A comparison for one synced folder came back: act on it."""
@@ -3112,9 +3337,18 @@ class FileManagerTab(QWidget):
         if last:
             # The offer a commit made survives being dismissed: the commit is
             # remembered, so pushing it is still one click away afterwards.
-            label = f"Push the last commit ({last.get('short') or 'HEAD'})"
-            push_last = menu.addAction(label, self._push_last_commit)
-            push_last.setToolTip(str(last.get("detail", "")))
+            commit = last.get("short") or "HEAD"
+            push_last = menu.addAction(
+                f"Push the last commit ({commit})", self._push_last_commit
+            )
+            target = self._remote.path or "the folder open on the right"
+            push_last.setToolTip(
+                f"{last.get('detail', '')} - into {target}"
+            )
+            menu.addAction(
+                f"What the last commit ({commit}) would send\u2026",
+                self._open_commit_plan,
+            ).setToolTip("Every file, and the server path each one lands on")
         menu.addSeparator()
         for mode, label in (
             (SyncMode.ON_SAVE, "Keep in sync — on save"),
@@ -3248,6 +3482,52 @@ class FileManagerTab(QWidget):
         )
         if chosen:
             self._load_local(chosen)
+
+    def _on_browse_remote(self) -> None:
+        """Pick a folder on the server without walking the pane there first.
+
+        A fresh dialog every time: it is aimed at wherever the pane is now, and
+        a stale tree from three folders ago is worse than no tree at all.
+        """
+        if not self._require_connection():
+            return
+        stale = self._dialogs.pop("folders", None)
+        if stale is not None:
+            try:
+                stale.close()
+                stale.deleteLater()  # parented here, so closing alone keeps it
+            except RuntimeError:
+                pass  # its C++ side has already gone
+        dialog = RemoteFolderDialog(
+            self._remote.path or "/",
+            label=f"Folders on {self._profile.label}.",
+            dark=self._settings.dark_mode,
+            parent=self,
+        )
+        dialog.folders_requested.connect(self._folders_requested.emit)
+        dialog.chosen.connect(self._list_remote)
+        self._dialogs["folders"] = dialog
+        self._present(dialog)
+        dialog.start()  # connected first, so the answer for "/" has a home
+
+    def _on_folders_listed(self, path: str, names: object) -> None:
+        dialog = self._dialogs.get("folders")
+        if not isinstance(dialog, RemoteFolderDialog) or not isinstance(names, list):
+            return
+        try:
+            dialog.add_folders(path, names)
+        except RuntimeError:
+            self._dialogs.pop("folders", None)
+
+    def _on_folders_failed(self, path: str, message: str) -> None:
+        dialog = self._dialogs.get("folders")
+        if isinstance(dialog, RemoteFolderDialog):
+            try:
+                dialog.show_error(path, message)
+                return
+            except RuntimeError:
+                self._dialogs.pop("folders", None)
+        self._set_status(f"{path}: {message}")
 
     def _on_local_drop(self, payload: object) -> None:
         """Files dropped on the local pane from outside are copied in."""

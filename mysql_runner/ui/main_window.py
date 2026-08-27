@@ -191,6 +191,11 @@ class MainWindow(QMainWindow):
 
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
+        # Qt's default indent is sized for trees that nest; this one is two
+        # levels deep and every connection carries an icon that says what it
+        # is, so the default spent a third of a narrow sidebar on empty space
+        # to the left of every row.
+        self._tree.setIndentation(10)
         self._tree.itemDoubleClicked.connect(self._on_item_activated)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_menu)
