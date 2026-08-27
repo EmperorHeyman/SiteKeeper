@@ -599,13 +599,22 @@ class TransferWorker(QObject):
         self._last_listing = remote_dir
         self._start_queue(pool, jobs, skipped)
 
-    @pyqtSlot(object, str)
-    def upload_quietly(self, items: object, remote_dir: str) -> None:
+    @pyqtSlot(object, str, bool)
+    def upload_quietly(
+        self, items: object, remote_dir: str, create: bool = False
+    ) -> None:
         """Upload without adopting ``remote_dir`` as the directory on show.
 
         Edit-in-place saves land wherever the edited file lives, which is not
         necessarily where the user is browsing - the refresh after the queue
-        drains must not yank the remote pane over there.
+        drains must not yank the remote pane over there. Everything a trigger
+        starts - a save, a commit, a comparison - comes this way for the same
+        reason: it was never the user asking to go anywhere.
+
+        ``create`` makes the target directory first, for the callers whose
+        target may not be there yet - a commit that adds a folder. A save of a
+        file edited in place is not one of them: it came from that directory,
+        so the round trips would buy nothing.
         """
         fs = self._ensure_session()
         pool = self._ensure_pool()
@@ -615,6 +624,15 @@ class TransferWorker(QObject):
         sources, rules = _split_items(items)
         self._cancelled = False
         jobs, directories, skipped = expand_local(fs, sources, remote_dir, rules=rules)
+        if create and remote_dir and remote_dir != self._last_listing:
+            # As in run_upload: a sync can aim single files at a directory that
+            # does not exist yet, and a commit that adds a folder does exactly
+            # that. The directory on show obviously exists, so it is not paid
+            # for.
+            try:
+                fs.makedirs(remote_dir)
+            except TransferError:
+                pass  # a real problem surfaces when the first file lands
         for path in directories:
             try:
                 fs.mkdir(path)

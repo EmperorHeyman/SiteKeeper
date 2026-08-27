@@ -80,7 +80,12 @@ from mysql_runner.transfer.ignore import IgnoreRules
 from mysql_runner.transfer.navhistory import NavHistory, mirror_path
 from mysql_runner.transfer.pool import Overwrite, PoolOptions
 from mysql_runner.transfer.snippets import SnippetLibrary
-from mysql_runner.transfer.syncrules import SyncMode, SyncRule, SyncRuleStore
+from mysql_runner.transfer.syncrules import (
+    SyncMode,
+    SyncRule,
+    SyncRuleStore,
+    normalise_remote,
+)
 from mysql_runner.transfer.treestat import FolderStatsCache, local_folder_stats
 from mysql_runner.transfer.watcher import Change, ChangeKind, DirectoryWatcher, summarise
 from mysql_runner.transfer.worker import ConnectionSpec, TransferWorker
@@ -1240,7 +1245,7 @@ class FileManagerTab(QWidget):
     _workers_requested = pyqtSignal(int)
     _options_changed = pyqtSignal(object)
     _edit_requested = pyqtSignal(str, str)
-    _upload_quiet_requested = pyqtSignal(object, str)
+    _upload_quiet_requested = pyqtSignal(object, str, bool)
 
     #: Marshals watcher callbacks (a plain thread) onto the GUI thread.
     _watch_changes = pyqtSignal(object)
@@ -2124,7 +2129,7 @@ class FileManagerTab(QWidget):
             self._set_status(f"{name} changed, but the connection is down.")
             return
         self._upload_quiet_requested.emit(
-            ([(local, False)], IgnoreRules.empty()), RemoteFS.parent(remote)
+            ([(local, False)], IgnoreRules.empty()), RemoteFS.parent(remote), False
         )
         self._set_status(f"Uploading {name} → {remote}")
 
@@ -2213,12 +2218,31 @@ class FileManagerTab(QWidget):
         self._download_tree(items, self._diff_local or self._local.path, flatten=base)
 
     def _upload_tree(
-        self, items, remote_dir: str, *, flatten: str = "", rules=None
+        self, items, remote_dir: str, *, flatten: str = "", rules=None,
+        quiet: bool = False,
     ) -> None:
-        """Send items, keeping their layout relative to ``flatten`` if given."""
+        """Send items, keeping their layout relative to ``flatten`` if given.
+
+        ``quiet`` sends them without the remote pane following the transfer.
+        Anything a trigger starts has to be quiet. A push is split into one
+        batch per sub-directory, so the pane would otherwise be left in
+        whichever of them happened to go up last - an arbitrary folder like
+        ``/admin`` - and the next push, whose target is read off the pane,
+        would aim inside it: ``/admin/admin/file``. The refresh when the queue
+        drains still repaints whatever directory the user is actually in.
+        """
         ignore = rules if rules is not None else self._ignore_rules()
+
+        def send(group, target: str) -> None:
+            if quiet:
+                # True: a trigger's target can be a folder the commit only
+                # just added, which the upload has to make for itself.
+                self._upload_quiet_requested.emit((group, ignore), target, True)
+            else:
+                self._upload_requested.emit((group, ignore), target)
+
         if not flatten:
-            self._upload_requested.emit((items, ignore), remote_dir)
+            send(items, remote_dir)
             return
         # Group by their sub-directory so nested files land in the right place.
         by_dir: dict[str, list[tuple[str, bool]]] = {}
@@ -2227,7 +2251,7 @@ class FileManagerTab(QWidget):
             target = RemoteFS.join(remote_dir, rel_dir.replace("\\", "/")) if rel_dir else remote_dir
             by_dir.setdefault(target, []).append((path, is_dir))
         for target, group in by_dir.items():
-            self._upload_requested.emit((group, ignore), target)
+            send(group, target)
 
     def _download_tree(self, items, local_dir: str, *, flatten: str = "") -> None:
         if not flatten:
@@ -2303,15 +2327,21 @@ class FileManagerTab(QWidget):
             if not self._confirm_production(f"upload {len(wanted)} changed file(s) to"):
                 self._watch_box.setChecked(False)
                 return
+        # Read the destination once, before anything goes up, and send the
+        # batches quietly: the pane this target came from must not be moved by
+        # the upload it is aiming, or the next save nests inside the last one.
+        remote_base = self._remote.path
         by_dir: dict[str, list[tuple[str, bool]]] = {}
         for change in wanted:
             rel_dir = os.path.dirname(change.rel)
             target = (
-                RemoteFS.join(self._remote.path, rel_dir) if rel_dir else self._remote.path
+                RemoteFS.join(remote_base, rel_dir) if rel_dir else remote_base
             )
             by_dir.setdefault(target, []).append((change.path, False))
         for target, group in by_dir.items():
-            self._upload_requested.emit((group, self._ignore_rules()), target)
+            self._upload_quiet_requested.emit(
+                (group, self._ignore_rules()), target, True
+            )
         self._set_status(f"Uploading {len(wanted)} changed file(s) from {base}.")
 
     # ----- synced folders -------------------------------------------------
@@ -2423,6 +2453,7 @@ class FileManagerTab(QWidget):
             self._set_status("Pick a local folder to sync.")
             return
         rule = self._sync_store.find(self._profile.id, local)
+        elsewhere = ""      # the pane's folder, when it is not the rule's own
         nested = [
             other
             for other in self._sync_rules()
@@ -2446,6 +2477,13 @@ class FileManagerTab(QWidget):
             )
         else:
             rule.mode = mode
+            # Arming does not re-point a rule that already exists: a pane that
+            # happens to be elsewhere must not silently move a working target.
+            # Which one is kept is said outright below, because the difference
+            # is otherwise discovered from the uploaded paths.
+            implied = normalise_remote(self._remote_target_for(local))
+            if implied and implied != rule.remote:
+                elsewhere = implied
         rule = self._sync_store.put(rule)
         self._sync_transient.pop(rule.id, None)
         self._start_sync_rule(rule)
@@ -2468,8 +2506,14 @@ class FileManagerTab(QWidget):
             if nested and not rule.recursive
             else f" ({rule.scope})"
         )
+        aside = (
+            f" The pane is on {elsewhere}, but this rule keeps {rule.remote} - "
+            "Sync ▸ Synced folders… ▸ Server folder… changes it."
+            if elsewhere
+            else ""
+        )
         self._set_status(
-            f"Syncing {rule.local} to {rule.remote} {trigger}{because}."
+            f"Syncing {rule.local} to {rule.remote} {trigger}{because}.{aside}"
         )
         self.status_message.emit(f"{self._profile.label}: syncing {rule.name} {trigger}")
         self._sync_now(rule)
@@ -2526,6 +2570,71 @@ class FileManagerTab(QWidget):
         self._apply_sync_marks()
         self._refresh_sync_dialog()
         self._set_status(f"{rule.name}: syncing {rule.scope}.")
+
+    def _on_sync_edit_remote(self, rule_id: str) -> None:
+        """Re-point one rule at another folder on the server.
+
+        Opens the folder tree on the rule's current target, so the usual case -
+        "this is one level too deep" - is a click on the parent.
+        """
+        rule = self._sync_store.get(rule_id)
+        if rule is None or not self._require_connection():
+            return
+        self._open_folder_picker(
+            rule.remote or "/",
+            f"Where {rule.name} belongs on {self._profile.label}.",
+            lambda path: self._apply_sync_remote(rule_id, path),
+        )
+
+    def _apply_sync_remote(self, rule_id: str, remote: str) -> None:
+        before = self._sync_store.get(rule_id)
+        was = before.remote if before is not None else ""
+        rule = self._sync_store.set_remote(rule_id, remote)
+        if rule is None:
+            self._set_status("That folder cannot be used as a sync target.")
+            return
+        self._apply_sync_marks()
+        self._refresh_sync_dialog()
+        if rule.remote == was:
+            self._set_status(f"{rule.name}: already syncing to {rule.remote}.")
+            return
+        self._set_status(
+            f"{rule.name}: now syncing to {rule.remote} (was {was}). Nothing has "
+            "been sent yet - use Sync now to bring the new folder into step."
+        )
+        self.status_message.emit(
+            f"{self._profile.label}: {rule.name} now syncs to {rule.remote}"
+        )
+
+    def _on_sync_edit_local(self, rule_id: str) -> None:
+        """Re-point one rule at another folder on this machine."""
+        rule = self._sync_store.get(rule_id)
+        if rule is None:
+            return
+        chosen = QFileDialog.getExistingDirectory(
+            self, f"The local side of {rule.remote}", rule.local
+        )
+        if not chosen:
+            return
+        clash = self._sync_store.find(self._profile.id, chosen)
+        if clash is not None and clash.id != rule.id:
+            self._set_status(
+                f"{clash.name} already syncs that folder, to {clash.remote}. "
+                "Two rules on one folder would be ambiguous."
+            )
+            return
+        was = rule.local
+        updated = self._sync_store.set_local(rule_id, chosen)
+        if updated is None:
+            self._set_status("That folder cannot be used as a sync source.")
+            return
+        # The watcher was rooted at the old folder, so it has to be replaced.
+        self._start_sync_rule(updated)
+        self._apply_sync_marks()
+        self._refresh_sync_dialog()
+        self._set_status(
+            f"Syncing {updated.local} to {updated.remote} (was {was})."
+        )
 
     def _on_sync_removals_changed(self, rule_id: str, mirror: bool) -> None:
         rule = self._sync_store.set_flag(rule_id, "delete_remote", mirror)
@@ -2658,6 +2767,7 @@ class FileManagerTab(QWidget):
                 rule.remote,
                 flatten=rule.local,
                 rules=self._rule_ignores(rule),
+                quiet=True,
             )
         gone = [rule.remote_for(change.path) for change in removals]
         gone = [path for path in gone if path and path != rule.remote]
@@ -2771,6 +2881,7 @@ class FileManagerTab(QWidget):
                 rule.remote,
                 flatten=rule.local,
                 rules=ignores,
+                quiet=True,
             )
         if removals:
             shown = removals[:20]
@@ -3170,6 +3281,7 @@ class FileManagerTab(QWidget):
                 rule.remote,
                 flatten=rule.local,
                 rules=self._rule_ignores(rule),
+                quiet=True,
             )
         if removals:
             shown = removals[:20]
@@ -3409,6 +3521,8 @@ class FileManagerTab(QWidget):
         dialog.mode_changed.connect(self._on_sync_mode_changed)
         dialog.removals_changed.connect(self._on_sync_removals_changed)
         dialog.scope_changed.connect(self._on_sync_scope_changed)
+        dialog.remote_requested.connect(self._on_sync_edit_remote)
+        dialog.local_requested.connect(self._on_sync_edit_local)
         dialog.removed.connect(self._on_sync_forget)
         self._dialogs["sync"] = dialog
         self._refresh_sync_dialog()
@@ -3491,6 +3605,19 @@ class FileManagerTab(QWidget):
         """
         if not self._require_connection():
             return
+        self._open_folder_picker(
+            self._remote.path or "/",
+            f"Folders on {self._profile.label}.",
+            self._list_remote,
+        )
+
+    def _open_folder_picker(self, start: str, label: str, on_chosen) -> None:
+        """Open the server's folder tree at ``start`` and report the answer.
+
+        One dialog at a time, under the key the listing callbacks look up. A
+        fresh one every time: it is aimed at wherever it was asked to start,
+        and a stale tree from three folders ago is worse than no tree at all.
+        """
         stale = self._dialogs.pop("folders", None)
         if stale is not None:
             try:
@@ -3499,13 +3626,13 @@ class FileManagerTab(QWidget):
             except RuntimeError:
                 pass  # its C++ side has already gone
         dialog = RemoteFolderDialog(
-            self._remote.path or "/",
-            label=f"Folders on {self._profile.label}.",
+            start or "/",
+            label=label,
             dark=self._settings.dark_mode,
             parent=self,
         )
         dialog.folders_requested.connect(self._folders_requested.emit)
-        dialog.chosen.connect(self._list_remote)
+        dialog.chosen.connect(on_chosen)
         self._dialogs["folders"] = dialog
         self._present(dialog)
         dialog.start()  # connected first, so the answer for "/" has a home

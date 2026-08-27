@@ -291,6 +291,45 @@ class SyncRuleStore:
         self.save()
         return rule
 
+    def set_remote(self, rule_id: str, remote: str) -> SyncRule | None:
+        """Point a rule at a different folder on the server.
+
+        A rule whose remote is one folder out sends everything one folder out
+        with it, and the pairing is the one thing about a rule that cannot be
+        seen by looking at either side - so it has to be correctable in place.
+        Dropping the rule and arming it again used to be the only way, which
+        loses the trigger and the flags along with the mistake.
+        """
+        rule = self.get(rule_id)
+        if rule is None:
+            return None
+        remote = normalise_remote(remote)
+        if not remote:
+            return None
+        rule.remote = remote
+        self.save()
+        return rule
+
+    def set_local(self, rule_id: str, local: str) -> SyncRule | None:
+        """Point a rule at a different folder on this machine.
+
+        Rules are found by their local folder, so two on one folder would make
+        which of them is meant ambiguous: a folder another rule on the same
+        connection already holds is refused.
+        """
+        rule = self.get(rule_id)
+        if rule is None:
+            return None
+        local = normalise_local(local)
+        if not local:
+            return None
+        clash = self.find(rule.profile_id, local)
+        if clash is not None and clash.id != rule.id:
+            return None
+        rule.local = local
+        self.save()
+        return rule
+
     def remove(self, rule_id: str) -> bool:
         before = len(self._rules)
         self._rules = [rule for rule in self._rules if rule.id != rule_id]

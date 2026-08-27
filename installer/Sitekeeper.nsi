@@ -6,7 +6,7 @@ SetCompressor /SOLID lzma
 
 !define APP_NAME        "Sitekeeper"
 !define APP_EXE         "Sitekeeper.exe"
-!define APP_VERSION     "1.6.0"
+!define APP_VERSION     "1.7.0"
 !define APP_PUBLISHER   "RAPL Group"
 !define APP_ID          "Sitekeeper"
 !define APP_REGKEY      "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
@@ -20,7 +20,7 @@ RequestExecutionLevel admin
 ShowInstDetails show
 ShowUnInstDetails show
 
-VIProductVersion "1.6.0.0"
+VIProductVersion "1.7.0.0"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} Setup"
 VIAddVersionKey "CompanyName"     "${APP_PUBLISHER}"

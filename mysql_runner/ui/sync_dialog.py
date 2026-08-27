@@ -42,6 +42,11 @@ class SyncFoldersDialog(QDialog):
     removals_changed = pyqtSignal(str, bool)
     #: Include the folder's subfolders, or just the files in it.
     scope_changed = pyqtSignal(str, bool)
+    #: Point one rule at a different folder on the server (rule id). The tab
+    #: owns the picker, because only it can ask the worker for a listing.
+    remote_requested = pyqtSignal(str)
+    #: Point one rule at a different folder on this machine (rule id).
+    local_requested = pyqtSignal(str)
     #: Forget one rule entirely.
     removed = pyqtSignal(str)
 
@@ -62,7 +67,10 @@ class SyncFoldersDialog(QDialog):
             "only the files sitting in the folder itself - which is how a site "
             "root is synced without dragging everything under it along. Rules "
             "are remembered and start again the next time this connection is "
-            "opened."
+            "opened. Either half of a pair can be changed in place - double-"
+            "click a <b>Folder</b> or <b>Server folder</b> cell, or use the "
+            "buttons below - so a rule pointing one folder out is corrected "
+            "rather than dropped and armed again."
         )
         header.setWordWrap(True)
         header.setTextFormat(Qt.TextFormat.RichText)
@@ -75,7 +83,7 @@ class SyncFoldersDialog(QDialog):
         self._tree.setAlternatingRowColors(True)
         self._tree.header().setSectionResizeMode(_FOLDER, QHeaderView.ResizeMode.Stretch)
         self._tree.header().setSectionResizeMode(_REMOTE, QHeaderView.ResizeMode.Stretch)
-        self._tree.itemDoubleClicked.connect(lambda *_: self._emit_sync())
+        self._tree.itemDoubleClicked.connect(self._on_double_clicked)
         self._tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self._tree, 1)
 
@@ -93,13 +101,21 @@ class SyncFoldersDialog(QDialog):
         commit_btn = QPushButton("On git commit")
         commit_btn.setToolTip("Reconcile the folder whenever a commit lands")
         commit_btn.clicked.connect(lambda: self._emit_mode(SyncMode.ON_COMMIT))
+        local_btn = QPushButton("Local folder…")
+        local_btn.setToolTip("Point this rule at a different folder on this machine")
+        local_btn.clicked.connect(lambda: self._emit_edit(self.local_requested))
+        remote_btn = QPushButton("Server folder…")
+        remote_btn.setToolTip("Point this rule at a different folder on the server")
+        remote_btn.clicked.connect(lambda: self._emit_edit(self.remote_requested))
         pause_btn = QPushButton("Pause")
         pause_btn.setToolTip("Keep the rule but stop acting on it")
         pause_btn.clicked.connect(lambda: self._emit_mode(SyncMode.OFF))
         stop_btn = QPushButton("Stop syncing")
         stop_btn.setToolTip("Forget this folder")
         stop_btn.clicked.connect(self._emit_removed)
-        for button in (sync_btn, save_btn, commit_btn, pause_btn):
+        for button in (
+            sync_btn, save_btn, commit_btn, pause_btn, local_btn, remote_btn
+        ):
             row.addWidget(button)
         row.addStretch(1)
         row.addWidget(stop_btn)
@@ -180,6 +196,25 @@ class SyncFoldersDialog(QDialog):
             self._status.setText("Pick a folder first.")
             return
         self.mode_changed.emit(rule_id, mode.value)
+
+    def _emit_edit(self, signal) -> None:
+        rule_id = self._selected_id()
+        if not rule_id:
+            self._status.setText("Pick a folder first.")
+            return
+        signal.emit(rule_id)
+
+    def _on_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        """Double-clicking a path edits it; anywhere else runs the sync."""
+        rule_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+        if not rule_id:
+            return
+        if column == _FOLDER:
+            self.local_requested.emit(rule_id)
+        elif column == _REMOTE:
+            self.remote_requested.emit(rule_id)
+        else:
+            self.sync_now.emit(rule_id)
 
     def _emit_removed(self) -> None:
         rule_id = self._selected_id()

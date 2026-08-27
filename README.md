@@ -286,7 +286,7 @@ installer once ended up wrapping a 1.1.0 exe.
 ```powershell
 .\build_release.ps1                  # -> dist_onefile_upx\Sitekeeper.exe + release\*.zip
 powershell -ExecutionPolicy Bypass -File installer\build.ps1
-                                     # -> installer\Sitekeeper-1.6.0-Setup.exe
+                                     # -> installer\Sitekeeper-1.7.0-Setup.exe
 ```
 
 It builds from the virtual environment at `%USERPROFILE%\.venvs\mysqlrunner`, which needs

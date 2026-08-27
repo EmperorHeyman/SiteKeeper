@@ -6,6 +6,51 @@ All notable changes to Sitekeeper are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-27
+
+### Added
+- **Either folder of a sync rule can be changed in place.** In *Synced
+  folders*, double-click a **Folder** or **Server folder** cell - or use the
+  two new buttons - to point an existing rule somewhere else. The server
+  side opens the folder tree at the rule's current target, so the usual
+  correction ("this is one level too deep") is a single click on the parent.
+  Correcting a rule used to mean *Stop syncing* and arming it again, which
+  throws away the trigger, the scope and the removal setting along with the
+  mistake - and re-arming quietly kept the old server folder, so the obvious
+  fix changed nothing. The local side refuses a folder another rule on the
+  same connection already holds, since rules are found by their folder and
+  two on one folder would be ambiguous.
+
+### Changed
+- **Arming a folder that is already synced now says which server folder it
+  keeps.** Arming has never re-pointed an existing rule from the panes - a
+  pane that happens to be somewhere else must not silently move a working
+  target - but it never mentioned the difference either, so a rule whose
+  server folder was wrong looked correctly armed. The status line now names
+  the folder the rule keeps, the one the pane is showing, and where to change
+  it.
+
+## [1.6.1] - 2026-08-27
+
+### Fixed
+- **A sync no longer walks the remote pane off into one of the folders it
+  just wrote to.** Every push is split into one batch per sub-directory,
+  and each batch was adopted as "the directory the transfers landed in" -
+  so when the queue drained, the pane was refreshed into whichever
+  sub-directory happened to go up last. An `/admin` in the commit was
+  enough to leave the pane sitting in `/admin`. That mattered because the
+  destination of the next push is read off the pane: the commit offer
+  pairs the two folders on show, and a watched folder uploads relative to
+  the remote pane. So the push after that aimed inside the folder the
+  previous one had wandered into - `/admin/admin/new_file` - and each one
+  nested deeper. Uploads a trigger starts (a save, a commit, a folder
+  comparison) now go up without moving the pane, exactly as an
+  edit-in-place save already did; when the queue drains, the directory you
+  are actually in is the one that gets refreshed. Folders a commit adds
+  are still created before the files land, and a watched folder now reads
+  its destination once, before the first file goes up, rather than once
+  per batch.
+
 ## [1.6.0] - 2026-08-27
 
 ### Added
