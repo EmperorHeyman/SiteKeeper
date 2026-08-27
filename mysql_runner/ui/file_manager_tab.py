@@ -19,10 +19,21 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 import threading
+import uuid
 from datetime import datetime
 
-from PyQt6.QtCore import QMimeData, QSize, QThread, QTimer, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import (
+    QEvent,
+    QMimeData,
+    QSize,
+    QThread,
+    QTimer,
+    Qt,
+    QUrl,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QBrush, QColor, QDrag, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -45,15 +56,23 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from mysql_runner.runtime_mode import mapped_drive_letter, running_elevated
 from mysql_runner.storage.models import Environment, ServerProfile
 from mysql_runner.storage.settings import Settings
 from mysql_runner.transfer import permissions as perm
 from mysql_runner.transfer import spawn
-from mysql_runner.transfer.base import Capability, RemoteEntry, RemoteFS
+from mysql_runner.transfer.base import (
+    Capability,
+    RemoteEntry,
+    RemoteFS,
+    local_relative,
+)
 from mysql_runner.transfer.gitwatch import (
     CommitEvent,
     GitCommitWatcher,
+    commit_changes,
     describe_repo,
+    find_repo,
 )
 from mysql_runner.transfer.hashing import DiffStatus
 from mysql_runner.transfer.history import HistoryStore
@@ -68,6 +87,7 @@ from mysql_runner.transfer.worker import ConnectionSpec, TransferWorker
 from mysql_runner.ui import theme
 from mysql_runner.ui.compare_dialog import CompareDialog
 from mysql_runner.ui.history_dialog import HistoryDialog
+from mysql_runner.ui.sync_activity_dialog import SyncActivityDialog
 from mysql_runner.ui.log_viewer import LogViewerDialog
 from mysql_runner.ui.permissions_dialog import PermissionsDialog
 from mysql_runner.ui.sync_dialog import SyncFoldersDialog
@@ -110,16 +130,55 @@ _SYNC_MARK = "⟳"
 #: as a mistake worth asking about, even when removals were approved once.
 _BULK_REMOVAL = 25
 
+#: Editing a remote file bigger than this asks first - the whole file comes
+#: down now and goes back up on every save.
+_MAX_EDIT_BYTES = 20 * 1024 * 1024
+
 #: How close to a pane's top or bottom edge a drag has to be before the
 #: listing starts scrolling itself, and how often it steps while it is there.
 _DRAG_EDGE = 32
 _DRAG_SCROLL_MS = 60
+
+#: Extension -> icon flavour. The icons are painted (see theme.entry_icon), so
+#: remote files - which have no real path for the native icon provider to look
+#: at - get exactly the same glyphs as local ones.
+_CODE_EXT = frozenset((
+    ".php", ".py", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".html", ".htm",
+    ".css", ".scss", ".less", ".sql", ".json", ".xml", ".yml", ".yaml",
+    ".sh", ".ps1", ".bat", ".ini", ".conf", ".env", ".htaccess", ".twig",
+    ".vue", ".c", ".h", ".cpp", ".cs", ".java", ".rb", ".go", ".rs", ".pl",
+    ".toml", ".md", ".lock",
+))
+_IMAGE_EXT = frozenset((
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico",
+    ".tif", ".tiff", ".avif",
+))
+_ARCHIVE_EXT = frozenset(
+    (".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".rar", ".7z")
+)
+
+
+def _icon_kind(name: str, is_dir: bool) -> str:
+    if is_dir:
+        return "folder"
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _CODE_EXT:
+        return "file-code"
+    if ext in _IMAGE_EXT:
+        return "file-image"
+    if ext in _ARCHIVE_EXT:
+        return "file-archive"
+    return "file"
 
 
 class _FileTable(QTableWidget):
     """Listing table that reports when it takes focus, and starts drags."""
 
     focused = pyqtSignal()
+    delete_pressed = pyqtSignal()
+    #: The mouse's own Back / Forward buttons, pressed over this pane.
+    back_requested = pyqtSignal()
+    forward_requested = pyqtSignal()
 
     def __init__(self, rows: int, columns: int) -> None:
         super().__init__(rows, columns)
@@ -129,6 +188,26 @@ class _FileTable(QTableWidget):
     def focusInEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self.focused.emit()
         super().focusInEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # The thumb buttons navigate, the way every browser and Explorer do.
+        if event.button() == Qt.MouseButton.BackButton:
+            self.back_requested.emit()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.ForwardButton:
+            self.forward_requested.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Handled here rather than as a window shortcut, so pressing Delete
+        # while typing in a filter or path box can never mean "delete files".
+        if event.key() == Qt.Key.Key_Delete:
+            self.delete_pressed.emit()
+            return
+        super().keyPressEvent(event)
 
     def startDrag(self, _actions) -> None:  # noqa: N802 - Qt naming
         """Begin dragging the selected rows out of this pane."""
@@ -140,11 +219,290 @@ class _FileTable(QTableWidget):
         drag.exec(Qt.DropAction.CopyAction)
 
 
+class _NoticeBar(QWidget):
+    """A dismissible strip above the panes that says something and offers actions.
+
+    Deliberately not a QMessageBox: what appears here is noticed in the
+    background - a commit, most of all - and background news must never seize
+    the window. A modal box stole focus mid-keystroke and had to be answered
+    before anything else could happen, which is exactly the wrong shape for
+    "by the way, want me to push that?". This waits instead, and the offer
+    stays in the Sync menu even after it is dismissed.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("notice")
+        # A QWidget subclass paints no stylesheet background or border without
+        # this - the strip would be an invisible row of loose buttons.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setVisible(False)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 6, 6, 6)
+        row.setSpacing(8)
+        self._label = QLabel("")
+        self._label.setWordWrap(True)
+        self._label.setObjectName("noticetext")
+        row.addWidget(self._label, 1)
+        self._remember = QCheckBox("")
+        self._remember.setVisible(False)
+        row.addWidget(self._remember)
+        #: Action buttons, rebuilt per notice.
+        self._buttons: list[QPushButton] = []
+        self._row = row
+        self._on_dismiss = None
+        close = QToolButton()
+        close.setObjectName("tabclose")
+        close.setText("✕")
+        close.setToolTip("Dismiss")
+        close.setAutoRaise(True)
+        close.setFixedSize(18, 18)
+        close.clicked.connect(self.dismiss)
+        self._close = close
+        row.addWidget(close)
+
+    def show_notice(
+        self,
+        text: str,
+        actions: list[tuple[str, object]],
+        *,
+        detail: str = "",
+        checkbox: str = "",
+        on_dismiss=None,
+    ) -> None:
+        """Say ``text`` and offer ``actions`` as (label, callback) pairs.
+
+        A callback runs on the GUI thread when its button is pressed; the bar
+        hides itself first, so a callback that opens something of its own is
+        never drawn behind this strip. ``on_dismiss`` is called when the strip
+        is closed instead - which is how a ticked checkbox is honoured by
+        someone who answers by walking away.
+        """
+        self._on_dismiss = on_dismiss
+        self._clear_buttons()
+        self._label.setText(text)
+        self._label.setToolTip(detail)
+        self._remember.setVisible(bool(checkbox))
+        self._remember.setText(checkbox)
+        self._remember.setChecked(False)
+        for index, (label, callback) in enumerate(actions):
+            button = QPushButton(label)
+            if index == 0:
+                button.setObjectName("primary")
+            button.clicked.connect(
+                lambda _checked=False, run=callback: self._run(run)
+            )
+            # Before the checkbox and the close button, after the text.
+            self._row.insertWidget(1 + index, button)
+            self._buttons.append(button)
+        self.setVisible(True)
+
+    def remembered(self) -> bool:
+        """Whether the notice's checkbox was ticked."""
+        return self._remember.isChecked()
+
+    def dismiss(self) -> None:
+        self.setVisible(False)
+        callback, self._on_dismiss = self._on_dismiss, None
+        self._clear_buttons()
+        self._label.setText("")
+        if callback is not None:
+            callback()
+
+    def _run(self, callback) -> None:
+        self.setVisible(False)
+        self._on_dismiss = None  # answered; the dismissal path is not owed one
+        try:
+            callback()
+        finally:
+            self._clear_buttons()
+
+    def _clear_buttons(self) -> None:
+        for button in self._buttons:
+            self._row.removeWidget(button)
+            button.deleteLater()
+        self._buttons.clear()
+
+
+class _PathBar(QWidget):
+    """The current path as clickable crumbs, with the plain edit a click away.
+
+    Each segment is a button that jumps straight back to that folder - being
+    three levels deep and wanting the first one back is the single most common
+    navigation there is. Clicking the empty space to the right of the crumbs
+    turns the bar into the familiar line edit for typing or pasting a path;
+    Enter navigates, Escape or clicking elsewhere puts the crumbs back.
+    """
+
+    navigate = pyqtSignal(str)
+
+    #: More segments than this collapse into one "…" menu after the root, so
+    #: a deep path cannot push the folder you are in out of view.
+    _MAX_CRUMBS = 7
+
+    def __init__(self, *, posix: bool, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._posix = posix
+        self._path = ""
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._edit = QLineEdit()
+        self._edit.setPlaceholderText("Path")
+        self._edit.returnPressed.connect(self._commit_edit)
+        self._edit.installEventFilter(self)
+
+        self._crumbs = QWidget()
+        self._crumbs.setObjectName("pathbar")
+        self._crumbs.setToolTip(
+            "Click a folder to go back to it; click the empty space to type a path"
+        )
+        self._crumbs.setFixedHeight(self._edit.sizeHint().height())
+        self._crumbs.mousePressEvent = (  # type: ignore[method-assign]
+            lambda _event: self._start_edit()
+        )
+        self._row = QHBoxLayout(self._crumbs)
+        self._row.setContentsMargins(4, 0, 4, 0)
+        self._row.setSpacing(0)
+
+        layout.addWidget(self._crumbs)
+        layout.addWidget(self._edit)
+        self._show_crumbs()
+
+    # ----- state ------------------------------------------------------------
+    def set_path(self, path: str) -> None:
+        self._path = path
+        # A listing arriving while the edit is open means the answer came back;
+        # showing it as crumbs is the confirmation.
+        self._show_crumbs()
+
+    def _show_crumbs(self) -> None:
+        if not self._path:
+            # Nowhere to crumb to yet: typing is the only way in.
+            self._crumbs.setVisible(False)
+            self._edit.setVisible(True)
+            return
+        self._edit.setVisible(False)
+        self._rebuild()
+        self._crumbs.setVisible(True)
+
+    # ----- edit mode ----------------------------------------------------------
+    def _start_edit(self) -> None:
+        if not self.isEnabled():
+            return
+        self._crumbs.setVisible(False)
+        self._edit.setText(self._path)
+        self._edit.setVisible(True)
+        self._edit.setFocus()
+        self._edit.selectAll()
+
+    def _commit_edit(self) -> None:
+        text = self._edit.text().strip()
+        self._show_crumbs()
+        if text:
+            self.navigate.emit(text)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt naming
+        if obj is self._edit and self._path:
+            if (
+                event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Escape
+            ):
+                self._show_crumbs()
+                return True
+            if event.type() == QEvent.Type.FocusOut:
+                self._show_crumbs()
+        return super().eventFilter(obj, event)
+
+    # ----- building the crumbs ------------------------------------------------
+    def _rebuild(self) -> None:
+        while self._row.count():
+            item = self._row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        segments = self._segments()
+        hidden: list[tuple[str, str]] = []
+        if len(segments) > self._MAX_CRUMBS:
+            keep_tail = self._MAX_CRUMBS - 2
+            hidden = segments[1:-keep_tail]
+            segments = [segments[0]] + segments[-keep_tail:]
+        for position, (label, target) in enumerate(segments):
+            if position == 1 and hidden:
+                self._row.addWidget(self._separator())
+                self._row.addWidget(self._overflow_button(hidden))
+            if position:
+                self._row.addWidget(self._separator())
+            self._row.addWidget(self._crumb_button(label, target))
+        self._row.addStretch(1)
+
+    def _crumb_button(self, label: str, target: str) -> QToolButton:
+        button = QToolButton()
+        shown = button.fontMetrics().elidedText(
+            label, Qt.TextElideMode.ElideMiddle, 200
+        )
+        button.setText(shown)
+        button.setToolTip(target)
+        button.setAutoRaise(True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(lambda _checked=False, t=target: self.navigate.emit(t))
+        return button
+
+    def _overflow_button(self, hidden: list[tuple[str, str]]) -> QToolButton:
+        button = QToolButton()
+        button.setText("…")
+        button.setToolTip("Folders in between")
+        button.setAutoRaise(True)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(button)
+        for label, target in hidden:
+            menu.addAction(label, lambda t=target: self.navigate.emit(t))
+        button.setMenu(menu)
+        return button
+
+    @staticmethod
+    def _separator() -> QLabel:
+        return QLabel("›")
+
+    def _segments(self) -> list[tuple[str, str]]:
+        """(label, full path) per crumb, root first."""
+        path = self._path
+        if not path:
+            return []
+        if self._posix:
+            clean = path.rstrip("/") or "/"
+            crumbs = [("/", "/")]
+            current = ""
+            for part in clean.lstrip("/").split("/"):
+                if not part:
+                    continue
+                current = f"{current}/{part}"
+                crumbs.append((part, current))
+            return crumbs
+        # A UNC share's \\server\share is the root, not two folders.
+        drive, tail = os.path.splitdrive(path)
+        root = drive + os.sep if drive else os.sep
+        crumbs = [(drive or os.sep, root)]
+        current = root
+        for part in tail.strip("\\/").split(os.sep):
+            if not part:
+                continue
+            current = os.path.join(current, part)
+            crumbs.append((part, current))
+        return crumbs
+
+
 class _FilePane(QWidget):
     """A path bar plus a listing table, used for both the local and remote side."""
 
     #: The user asked to show a different directory.
     navigate = pyqtSignal(str)
+    #: A file row was double-clicked (name only; the owner knows the side).
+    open_file = pyqtSignal(str)
+    #: Delete was pressed while this pane's table had focus.
+    delete_requested = pyqtSignal()
     #: The table gained focus (so it is the pane commands act on).
     focused = pyqtSignal()
     #: A right-click, with the global position for the menu.
@@ -163,6 +521,12 @@ class _FilePane(QWidget):
         self._posix = posix
         self._history = NavHistory()
         self._replaying = False
+        self._dark = False
+        # Newest first by default: on a live site, "what changed?" is the
+        # question a listing answers far more often than "what is here?".
+        self._sort_column = _MODIFIED
+        self._sort_desc = True
+        self._filter = ""
         self._diff_colours = theme.diff_colours(False)
         #: name -> tooltip for folders that keep themselves on the server.
         self._sync_marks: dict[str, str] = {}
@@ -186,6 +550,8 @@ class _FilePane(QWidget):
         header = QHBoxLayout()
         self._title = QLabel(title)
         self._title.setObjectName("title")
+        self._count = QLabel("")
+        self._count.setObjectName("hint")
         self._back = _icon_button("back", "Back (Alt+Left)")
         self._back.clicked.connect(self.go_back)
         self._forward = _icon_button("forward", "Forward (Alt+Right)")
@@ -196,8 +562,19 @@ class _FilePane(QWidget):
         self._up.clicked.connect(self._go_up)
         self._refresh_btn = _icon_button("refresh", "Refresh (F5)")
         self._refresh_btn.clicked.connect(self.refresh)
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("Filter")
+        self._filter_edit.setToolTip(
+            "Show only names containing this (Ctrl+F; Esc clears)"
+        )
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.setMaximumWidth(130)
+        self._filter_edit.textChanged.connect(self._on_filter)
+        self._filter_edit.installEventFilter(self)
         header.addWidget(self._title)
+        header.addWidget(self._count)
         header.addStretch(1)
+        header.addWidget(self._filter_edit)
         self._nav_buttons = {
             "back": self._back,
             "forward": self._forward,
@@ -209,15 +586,15 @@ class _FilePane(QWidget):
             header.addWidget(button)
         layout.addLayout(header)
 
-        self._path_edit = QLineEdit()
-        self._path_edit.setPlaceholderText("Path")
-        self._path_edit.returnPressed.connect(
-            lambda: self.navigate.emit(self._path_edit.text().strip())
-        )
-        layout.addWidget(self._path_edit)
+        self._path_bar = _PathBar(posix=posix)
+        self._path_bar.navigate.connect(self.navigate.emit)
+        layout.addWidget(self._path_bar)
 
         self._table = _FileTable(0, len(_COLUMNS))
         self._table.focused.connect(self.focused.emit)
+        self._table.delete_pressed.connect(self.delete_requested.emit)
+        self._table.back_requested.connect(self._on_mouse_back)
+        self._table.forward_requested.connect(self.go_forward)
         self._table.setHorizontalHeaderLabels(list(_COLUMNS))
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(
@@ -228,17 +605,29 @@ class _FilePane(QWidget):
         )
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setShowGrid(False)
+        # Qt's own sorting cannot be used: it sorts the text ("1.2 MB"), and
+        # the ".." row must stay on top. _sorted() does it properly instead.
         self._table.setSortingEnabled(False)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setDefaultSectionSize(22)
+        self._table.setIconSize(QSize(16, 16))
         header = self._table.horizontalHeader()
         header.setDefaultAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         header.setHighlightSections(False)
-        self._table.horizontalHeader().setSectionResizeMode(
-            _NAME, QHeaderView.ResizeMode.Stretch
-        )
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(_MODIFIED, Qt.SortOrder.DescendingOrder)
+        header.sectionClicked.connect(self._on_sort)
+        # The name takes whatever is left; the rest hold fixed, draggable
+        # widths sized for their content ("999.9 MB", "2026-08-26 14:03").
+        # Nothing re-fits them later, so a width the user drags out stays.
+        header.setSectionResizeMode(_NAME, QHeaderView.ResizeMode.Stretch)
+        for column, width in (
+            (_SIZE, 90), (_MODIFIED, 135), (_MODE, 60), (_SYNC, 46)
+        ):
+            header.resizeSection(column, width)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
         self._table.cellDoubleClicked.connect(self._on_double_click)
@@ -251,19 +640,82 @@ class _FilePane(QWidget):
         self._table.dragMoveEvent = self._on_drag  # type: ignore[method-assign]
         self._table.dragLeaveEvent = self._on_drag_leave  # type: ignore[method-assign]
         self._table.dropEvent = self._on_drop  # type: ignore[method-assign]
+        self._table.itemSelectionChanged.connect(self._update_count)
         layout.addWidget(self._table, 1)
 
         self._sync_buttons()
 
     # ----- content --------------------------------------------------------
     def set_listing(self, path: str, entries: list[RemoteEntry], *, at_root: bool) -> None:
+        if path != self._path and self._filter:
+            # The filter belongs to the directory it was typed in.
+            self._filter_edit.blockSignals(True)
+            self._filter_edit.clear()
+            self._filter_edit.blockSignals(False)
+            self._filter = ""
         self._path = path
         self._entries = list(entries)
-        self._path_edit.setText(path)
+        self._path_bar.set_path(path)
         if not self._replaying:
             self._history.visit(path)
         self._sync_buttons()
         self._render()
+
+    def _on_filter(self, text: str) -> None:
+        self._filter = text.strip().lower()
+        self._render()
+
+    def focus_filter(self) -> None:
+        self._filter_edit.setFocus()
+        self._filter_edit.selectAll()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt naming
+        if (
+            obj is self._filter_edit
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self._filter_edit.clear()
+            self._table.setFocus()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _on_sort(self, column: int) -> None:
+        if column == _SYNC:
+            return  # the comparison marks have no order worth sorting by
+        if column == self._sort_column:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_column, self._sort_desc = column, False
+        order = (
+            Qt.SortOrder.DescendingOrder
+            if self._sort_desc
+            else Qt.SortOrder.AscendingOrder
+        )
+        self._table.horizontalHeader().setSortIndicator(column, order)
+        self._render()
+
+    def _sorted(self) -> list[RemoteEntry]:
+        """The listing in display order: folders first, then the chosen column."""
+        column = self._sort_column
+
+        def key(entry: RemoteEntry):
+            if column == _SIZE:
+                return (entry.size, entry.name.lower())
+            if column == _MODIFIED:
+                return (entry.modified or 0.0, entry.name.lower())
+            if column == _MODE:
+                return (
+                    entry.mode if entry.mode is not None else -1,
+                    entry.name.lower(),
+                )
+            return entry.name.lower()
+
+        ordered = sorted(self._entries, key=key, reverse=self._sort_desc)
+        ordered.sort(key=lambda e: not e.is_dir)  # stable: folders stay on top
+        if self._filter:
+            ordered = [e for e in ordered if self._filter in e.name.lower()]
+        return ordered
 
     def _render(self) -> None:
         table = self._table
@@ -271,7 +723,8 @@ class _FilePane(QWidget):
         self._hover_row = -1
         if not self._at_root():
             self._append_row(_PARENT, "", "", "", is_parent=True)
-        for entry in self._entries:
+        shown = self._sorted()
+        for entry in shown:
             self._append_row(
                 _display_name(entry),
                 "" if entry.is_dir and not entry.size else _human_size(entry.size),
@@ -282,10 +735,28 @@ class _FilePane(QWidget):
                 is_link=entry.is_link,
                 sync_hint=self._sync_marks.get(entry.name, ""),
             )
-        table.resizeColumnsToContents()
-        table.horizontalHeader().setSectionResizeMode(
-            _NAME, QHeaderView.ResizeMode.Stretch
-        )
+        # Column widths are deliberately left alone here: re-fitting them on
+        # every render (each sort click renders) collapsed whatever the user
+        # had dragged the columns to.
+        self._update_count(shown)
+
+    def _update_count(self, shown: list[RemoteEntry] | None = None) -> None:
+        """The little truth next to the title: what is here, or what is picked."""
+        selected = self.selected_entries()
+        if selected:
+            size = sum(entry.size for entry in selected)
+            self._count.setText(
+                f"·  {len(selected)} selected — {_human_size(size)}"
+            )
+            return
+        if shown is None:
+            shown = self._sorted()
+        folders = sum(1 for entry in shown if entry.is_dir)
+        files = len(shown) - folders
+        text = f"·  {folders} folder(s), {files} file(s)"
+        if self._filter and len(shown) != len(self._entries):
+            text += f" of {len(self._entries)}"
+        self._count.setText(text if shown else "")
 
     def _at_root(self) -> bool:
         if not self._path:
@@ -310,6 +781,11 @@ class _FilePane(QWidget):
         row = self._table.rowCount()
         self._table.insertRow(row)
         first = QTableWidgetItem(f"{_SYNC_MARK} {label}" if sync_hint else label)
+        first.setIcon(
+            theme.entry_icon(
+                _icon_kind(name or label, is_dir or is_parent), self._dark
+            )
+        )
         first.setData(
             Qt.ItemDataRole.UserRole,
             (name or label, is_dir or is_parent, is_parent),
@@ -394,10 +870,13 @@ class _FilePane(QWidget):
         self._render()
 
     def set_theme(self, dark: bool) -> None:
-        """Repaint the navigation glyphs for the current theme."""
+        """Repaint the navigation and listing glyphs for the current theme."""
         for kind, button in self._nav_buttons.items():
             button.setIcon(theme.nav_icon(kind, dark))
         self._hover_colour = _hover_colour(dark)
+        if dark != self._dark:
+            self._dark = dark
+            self._render()  # the row icons carry the old palette otherwise
 
     def clear_diff(self) -> None:
         for row in range(self._table.rowCount()):
@@ -435,7 +914,7 @@ class _FilePane(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self._table.setEnabled(not busy)
-        self._path_edit.setEnabled(not busy)
+        self._path_bar.setEnabled(not busy)
 
     def set_title(self, text: str) -> None:
         self._title.setText(text)
@@ -453,6 +932,13 @@ class _FilePane(QWidget):
         target = self._history.forward()
         if target:
             self._replay(target)
+
+    def _on_mouse_back(self) -> None:
+        """The mouse's Back button: back through history, or up when empty."""
+        if self._history.can_go_back():
+            self.go_back()
+        else:
+            self._go_up()
 
     def _replay(self, target: str) -> None:
         """Navigate without disturbing the history stack."""
@@ -493,6 +979,8 @@ class _FilePane(QWidget):
             self._go_up()
         elif is_dir:
             self.navigate.emit(self._child_path(name))
+        else:
+            self.open_file.emit(name)
 
     def _go_up(self) -> None:
         self.navigate.emit(self._parent_path())
@@ -689,8 +1177,12 @@ class FileManagerTab(QWidget):
     _prioritize_requested = pyqtSignal(str)
     _reorder_requested = pyqtSignal(object)
     _clear_finished_requested = pyqtSignal()
+    _retry_failed_requested = pyqtSignal()
+    _retry_item_requested = pyqtSignal(str)
     _workers_requested = pyqtSignal(int)
     _options_changed = pyqtSignal(object)
+    _edit_requested = pyqtSignal(str, str)
+    _upload_quiet_requested = pyqtSignal(object, str)
 
     #: Marshals watcher callbacks (a plain thread) onto the GUI thread.
     _watch_changes = pyqtSignal(object)
@@ -698,6 +1190,14 @@ class FileManagerTab(QWidget):
     _sync_changes = pyqtSignal(str, object)
     #: Marshals a synced folder's git commits onto the GUI thread.
     _sync_commit = pyqtSignal(str, object)
+    #: Marshals "what did that commit touch" answers onto the GUI thread:
+    #: (rule_id, repo root, list of (status, path) or None).
+    _commit_diff_ready = pyqtSignal(str, str, object)
+    #: Marshals commits seen in the (unsynced) repository the local pane is
+    #: browsing onto the GUI thread.
+    _pane_commit = pyqtSignal(object)
+    #: The diff for such a commit: (repo root, CommitEvent, changes or None).
+    _pane_commit_diff = pyqtSignal(str, object, object)
     #: Marshals background local folder statistics onto the GUI thread.
     _local_stats_ready = pyqtSignal(str, object)
 
@@ -722,12 +1222,19 @@ class FileManagerTab(QWidget):
         self._snippets = SnippetLibrary()
         self._stats_cache = FolderStatsCache()
         self._watcher: DirectoryWatcher | None = None
+        #: Watches the repository the local pane is inside even when no sync
+        #: rule exists, so a commit there can offer itself for pushing.
+        self._repo_watcher: GitCommitWatcher | None = None
         #: Folders this connection keeps on the server, and their watchers.
         self._sync_store = SyncRuleStore()
         self._sync_watchers: dict[str, DirectoryWatcher] = {}
         self._git_watchers: dict[str, GitCommitWatcher] = {}
         #: Rules whose trigger fired while the connection was down.
         self._sync_pending: set[str] = set()
+        #: The last commit noticed in the pane's repository and what it
+        #: touched, so it can still be pushed after the notice is gone:
+        #: {"repo", "detail", "short", "changes"}.
+        self._last_commit: dict | None = None
         #: One-shot rules made by "Sync now" on a folder that is not armed.
         self._sync_transient: dict[str, SyncRule] = {}
         #: Scope the next new rule gets, until told otherwise.
@@ -735,6 +1242,18 @@ class FileManagerTab(QWidget):
         #: Rules with a scan in flight, and how often each has been re-queued.
         self._sync_running: set[str] = set()
         self._sync_retries: dict[str, int] = {}
+        #: Per rule, the activity-log entry still waiting for its scan result.
+        self._activity_events: dict[str, object] = {}
+        #: Remote files being edited locally: scratch copy -> remote path.
+        self._edit_watch: dict[str, str] = {}
+        self._edit_mtimes: dict[str, float] = {}
+        self._edit_dirty: dict[str, float] = {}
+        self._edit_root = os.path.join(
+            tempfile.gettempdir(), "Sitekeeper", "edit", uuid.uuid4().hex[:8]
+        )
+        self._edit_timer = QTimer(self)
+        self._edit_timer.setInterval(1500)
+        self._edit_timer.timeout.connect(self._poll_edits)
         self._diff_report = None
         self._diff_local = ""
         self._diff_remote = ""
@@ -777,9 +1296,14 @@ class FileManagerTab(QWidget):
         layout.addWidget(body, 1)
         layout = body_layout  # everything below lives inside the padded body
 
+        self._notice = _NoticeBar()
+        layout.addWidget(self._notice)
+
         self._local = _FilePane("Local")
         self._local.bind_paths(self._local_child, self._local_parent)
         self._local.navigate.connect(self._load_local)
+        self._local.open_file.connect(self._on_open_local)
+        self._local.delete_requested.connect(self._on_delete)
         self._local.focused.connect(lambda: self._set_active(remote=False))
         self._local.menu_requested.connect(lambda pos: self._show_menu(pos, remote=False))
         self._local.paths_dropped.connect(self._on_local_drop)
@@ -788,6 +1312,8 @@ class FileManagerTab(QWidget):
         self._remote = _FilePane(f"Remote — {self._profile.label}", posix=True)
         self._remote.bind_paths(self._remote_child, self._remote_parent)
         self._remote.navigate.connect(self._list_remote)
+        self._remote.open_file.connect(self._on_edit_remote)
+        self._remote.delete_requested.connect(self._on_delete)
         self._remote.focused.connect(lambda: self._set_active(remote=True))
         self._remote.menu_requested.connect(lambda pos: self._show_menu(pos, remote=True))
         self._remote.paths_dropped.connect(self._on_remote_drop)
@@ -797,7 +1323,6 @@ class FileManagerTab(QWidget):
         panes.addWidget(self._local)
         panes.addWidget(self._remote)
         panes.setSizes([500, 500])
-        layout.addWidget(panes, 1)
 
         self._queue_panel = TransferQueuePanel(workers=self._settings.transfer_workers)
         self._queue_panel.setVisible(False)
@@ -808,8 +1333,19 @@ class FileManagerTab(QWidget):
         self._queue_panel.prioritize_item_requested.connect(self._prioritize_requested.emit)
         self._queue_panel.reorder_requested.connect(self._reorder_requested.emit)
         self._queue_panel.clear_finished_requested.connect(self._on_clear_finished)
+        self._queue_panel.retry_failed_requested.connect(self._retry_failed_requested.emit)
+        self._queue_panel.retry_item_requested.connect(self._retry_item_requested.emit)
         self._queue_panel.workers_changed.connect(self._workers_requested.emit)
-        layout.addWidget(self._queue_panel)
+
+        # The queue shares a vertical splitter with the panes, so its height
+        # is the user's to drag - down to a sliver when it is in the way.
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(panes)
+        split.addWidget(self._queue_panel)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setCollapsible(0, False)
+        layout.addWidget(split, 1)
 
         self.layout().addWidget(self._build_footer())
 
@@ -839,6 +1375,7 @@ class FileManagerTab(QWidget):
             "matching folder on the other"
         )
         self._mirror_box.setChecked(self._settings.mirror_navigation)
+        self._mirror_box.toggled.connect(self._on_mirror_toggled)
         row.addWidget(self._mirror_box)
 
         self._watch_box = QCheckBox("Watch")
@@ -984,6 +1521,9 @@ class FileManagerTab(QWidget):
             ("Alt+Right", lambda: self._active_pane().go_forward()),
             ("Alt+Up", lambda: self._active_pane()._go_up()),
             ("F5", lambda: self._active_pane().refresh()),
+            ("Ctrl+F", lambda: self._active_pane().focus_filter()),
+            ("F2", self._on_rename),
+            ("F7", self._on_mkdir),
             ("F9", lambda: self._on_compare(with_hashes=True)),
             ("Ctrl+T", self._on_terminal),
             ("Ctrl+P", self._on_command_bar),
@@ -1002,6 +1542,9 @@ class FileManagerTab(QWidget):
             pane.set_diff_colours(colours)
             pane.set_theme(enable)
         self._queue_panel.set_theme(enable)
+        activity = self._activity(create=False)
+        if activity is not None:
+            activity.set_theme(enable)
         self._apply_diff_marks()
 
     def apply_settings(self, settings: Settings) -> None:
@@ -1083,8 +1626,12 @@ class FileManagerTab(QWidget):
             (self._prioritize_requested, self._worker.prioritize_item),
             (self._reorder_requested, self._worker.reorder_queue),
             (self._clear_finished_requested, self._worker.clear_finished),
+            (self._retry_failed_requested, self._worker.retry_failed),
+            (self._retry_item_requested, self._worker.retry_item),
             (self._workers_requested, self._worker.set_workers),
             (self._options_changed, self._worker.update_options),
+            (self._edit_requested, self._worker.fetch_for_edit),
+            (self._upload_quiet_requested, self._worker.upload_quietly),
         )
         for signal, slot in outgoing:
             signal.connect(slot)
@@ -1101,10 +1648,12 @@ class FileManagerTab(QWidget):
             (self._worker.file_finished, self._on_file_finished),
             (self._worker.queue_finished, self._on_queue_finished),
             (self._worker.queue_item, self._queue_panel.update_item),
+            (self._worker.queue_item, self._on_activity_item),
             (self._worker.queue_stats, self._queue_panel.update_stats),
             (self._worker.tool_result, self._on_tool_result),
             (self._worker.tool_failed, self._on_tool_failed),
             (self._worker.tool_progress, self._on_tool_progress),
+            (self._worker.edit_ready, self._on_edit_ready),
             (self._worker.closed, self._on_closed),
         )
         for signal, slot in incoming:
@@ -1113,6 +1662,9 @@ class FileManagerTab(QWidget):
         self._watch_changes.connect(self._on_watch_changes)
         self._sync_changes.connect(self._on_sync_changes)
         self._sync_commit.connect(self._on_sync_commit)
+        self._commit_diff_ready.connect(self._on_commit_diff)
+        self._pane_commit.connect(self._on_pane_commit)
+        self._pane_commit_diff.connect(self._on_pane_commit_diff)
         self._local_stats_ready.connect(self._on_local_stats)
         self._thread.start()
 
@@ -1177,6 +1729,7 @@ class FileManagerTab(QWidget):
     def _on_queue_started(self, total: int) -> None:
         self._queue_total = total
         self._queue_done = 0
+        self._queue_panel.start_batch(total)
         self._progress.setVisible(total > 0)
         self._cancel_btn.setVisible(total > 0)
         self._progress.setValue(0)
@@ -1321,7 +1874,7 @@ class FileManagerTab(QWidget):
     def _load_local(self, path: str) -> None:
         target = os.path.abspath(os.path.expanduser(path or "~"))
         if not os.path.isdir(target):
-            self._set_status(f"{target} is not a directory.")
+            self._set_status(_missing_local_reason(target))
             return
         try:
             entries = _scan_local(target)
@@ -1337,6 +1890,7 @@ class FileManagerTab(QWidget):
         self._apply_sync_marks()
         if self._watcher is not None and self._watcher.root != target:
             self._restart_watcher(target)
+        self._watch_pane_repo(target)
 
     def _local_child(self, name: str) -> str:
         return os.path.join(self._local.path, name)
@@ -1358,12 +1912,32 @@ class FileManagerTab(QWidget):
         return RemoteFS.parent(self._remote.path)
 
     # ----- mirrored navigation -------------------------------------------
+    def _on_mirror_toggled(self, enabled: bool) -> None:
+        """(Re)anchor mirroring at the pair of directories on screen now.
+
+        The anchor used to survive from whenever mirroring was first used, so
+        turning it on after browsing elsewhere left it matched against
+        directories long gone - it looked simply broken. Enabling always
+        anchors afresh; disabling forgets, so the next enable does too.
+        """
+        self._mirror_local_base = self._local.path if enabled else ""
+        self._mirror_remote_base = self._remote.path if enabled else ""
+
     def _mirror_to_local(self, remote_path: str) -> None:
-        if self._mirroring or not self._diff_bases_known():
+        if self._mirroring or not self._mirror_bases_known():
             return
         target = mirror_path(self._mirror_remote_base, remote_path,
                              self._mirror_local_base, posix=False)
-        if not target or target == self._local.path or not os.path.isdir(target):
+        if not target:
+            # The user left the anchored tree. Follow them - the pair on
+            # screen becomes the new anchor - rather than going silent.
+            self._mirror_remote_base = remote_path
+            self._mirror_local_base = self._local.path
+            return
+        if target == self._local.path:
+            return
+        if not os.path.isdir(target):
+            self._set_status(f"Mirror: there is no {target} on this side.")
             return
         self._mirroring = True
         try:
@@ -1372,11 +1946,15 @@ class FileManagerTab(QWidget):
             self._mirroring = False
 
     def _mirror_to_remote(self, local_path: str) -> None:
-        if self._mirroring or not self._diff_bases_known():
+        if self._mirroring or not self._mirror_bases_known():
             return
         target = mirror_path(self._mirror_local_base, local_path,
                              self._mirror_remote_base, posix=True)
-        if not target or target == self._remote.path:
+        if not target:
+            self._mirror_local_base = local_path
+            self._mirror_remote_base = self._remote.path
+            return
+        if target == self._remote.path:
             return
         self._mirroring = True
         try:
@@ -1384,8 +1962,8 @@ class FileManagerTab(QWidget):
         finally:
             self._mirroring = False
 
-    def _diff_bases_known(self) -> bool:
-        """Anchor mirroring at whichever pair of directories was paired first."""
+    def _mirror_bases_known(self) -> bool:
+        """Whether mirroring has a pair to work from, anchoring it if it can."""
         if not self._mirror_local_base or not self._mirror_remote_base:
             if self._local.path and self._remote.path:
                 self._mirror_local_base = self._local.path
@@ -1393,6 +1971,86 @@ class FileManagerTab(QWidget):
             else:
                 return False
         return True
+
+    # ----- opening and editing files ---------------------------------------
+    # Double-clicking a local file opens it the way Explorer would. Double-
+    # clicking a remote file downloads it to a scratch folder, opens it the
+    # same way, and from then on every save is noticed and uploaded back -
+    # because "download, edit, re-upload, delete the copy" is exactly the loop
+    # this app exists to remove.
+    def _on_open_local(self, name: str) -> None:
+        from PyQt6.QtGui import QDesktopServices
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self._local_child(name)))
+
+    def _on_edit_remote(self, name: str) -> None:
+        if not self._require_connection():
+            return
+        entry = self._remote.entry(name)
+        if entry is not None and entry.size > _MAX_EDIT_BYTES:
+            confirm = QMessageBox.question(
+                self,
+                "Large file",
+                f"{name} is {_human_size(entry.size)}. Download it for "
+                "editing anyway?",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+        # One question up front covers the saves that follow: agreeing to
+        # edit a production file is agreeing to upload the edits.
+        if not self._confirm_production(f"edit {name} (each save uploads to)"):
+            return
+        remote = self._remote_child(name)
+        local = os.path.join(self._edit_root, uuid.uuid4().hex[:8], name)
+        self._set_status(f"Fetching {name} for editing…")
+        self._edit_requested.emit(remote, local)
+
+    def _on_edit_ready(self, local: str, remote: str) -> None:
+        try:
+            self._edit_mtimes[local] = os.path.getmtime(local)
+        except OSError as exc:
+            self._set_status(f"{os.path.basename(local)}: {exc}")
+            return
+        self._edit_watch[local] = remote
+        if not self._edit_timer.isActive():
+            self._edit_timer.start()
+        from PyQt6.QtGui import QDesktopServices
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(local))
+        self._set_status(
+            f"Editing {os.path.basename(local)} - every save uploads back to "
+            f"{remote} while this tab is open."
+        )
+
+    def _poll_edits(self) -> None:
+        """Notice saves to edited copies, once their timestamps hold still.
+
+        A save is only pushed when the same new timestamp is seen twice, so an
+        editor still writing a large file is never caught mid-write.
+        """
+        for local, remote in list(self._edit_watch.items()):
+            try:
+                stamp = os.path.getmtime(local)
+            except OSError:
+                continue  # mid-save, or the copy is gone; look again next tick
+            if stamp <= self._edit_mtimes.get(local, 0.0):
+                continue
+            if self._edit_dirty.get(local) != stamp:
+                self._edit_dirty[local] = stamp
+                continue
+            self._edit_dirty.pop(local, None)
+            self._edit_mtimes[local] = stamp
+            self._push_edit(local, remote)
+
+    def _push_edit(self, local: str, remote: str) -> None:
+        name = os.path.basename(local)
+        if not self._connected:
+            self._set_status(f"{name} changed, but the connection is down.")
+            return
+        self._upload_quiet_requested.emit(
+            ([(local, False)], IgnoreRules.empty()), RemoteFS.parent(remote)
+        )
+        self._set_status(f"Uploading {name} → {remote}")
 
     # ----- comparison ----------------------------------------------------
     def _on_compare(self, *, with_hashes: bool = True) -> None:
@@ -1834,6 +2492,11 @@ class FileManagerTab(QWidget):
             return
         if not self._connected:
             self._sync_pending.add(rule.id)
+            entry = self._activity_events.get(rule.id)
+            if entry is not None:
+                self._activity().set_outcome(
+                    entry, "waiting for the connection…", kind="info"
+                )
             self._set_status(f"{rule.name}: will sync once the connection is up.")
             return
         if rule.id in self._sync_running:
@@ -1902,7 +2565,18 @@ class FileManagerTab(QWidget):
                 self._refresh_sync_dialog()
                 self._set_status(f"{rule.name}: sync paused.")
                 return
+        log = self._activity()
+        entry = log.log_event(
+            f"Save — {rule.name}", detail=summarise(changes)
+        )
         if uploads:
+            log.add_files(
+                entry,
+                [
+                    (change.path, local_relative(rule.local, change.path))
+                    for change in uploads
+                ],
+            )
             self._upload_tree(
                 [(change.path, False) for change in uploads],
                 rule.remote,
@@ -1912,6 +2586,7 @@ class FileManagerTab(QWidget):
         gone = [rule.remote_for(change.path) for change in removals]
         gone = [path for path in gone if path and path != rule.remote]
         if gone:
+            log.add_notes(entry, gone, outcome="removal requested")
             # A watched removal is unambiguous - the file was there and the user
             # deleted it - so this one does not stop to ask.
             self._sync_delete_requested.emit(gone)
@@ -1929,15 +2604,295 @@ class FileManagerTab(QWidget):
         return len(owner.local) <= len(rule.local)
 
     def _on_sync_commit(self, rule_id: str, event: object) -> None:
-        """A synced folder in on-commit mode saw its repository move."""
+        """A synced folder in on-commit mode saw its repository move.
+
+        The commit itself says which files it changed, so those are what goes
+        up - re-scanning a whole site against the server for every commit took
+        minutes on big trees, and its removal pass kept tripping over files
+        that only ever existed on the server (logs, caches, uploads). The full
+        comparison remains the fallback for when git cannot answer.
+        """
         rule = self._rule(rule_id)
         if rule is None:
             return
         detail = event.describe() if isinstance(event, CommitEvent) else ""
         headline = f"{rule.name}: commit {detail}" if detail else f"{rule.name}: commit"
+        log = self._activity()
+        stale = self._activity_events.get(rule_id)
+        if stale is not None:
+            log.set_outcome(stale, "superseded by a newer commit", kind="info")
+        self._activity_events[rule_id] = log.log_event(
+            f"Commit — {rule.name}",
+            detail=(detail or "HEAD moved") + " — reading the commit…",
+        )
         self._set_status(f"{headline} - syncing…")
         self.status_message.emit(f"{self._profile.label}: {headline}")
-        self._sync_now(rule)
+        if not isinstance(event, CommitEvent):
+            self._sync_now(rule)
+            return
+        repo = find_repo(rule.local) or rule.local
+
+        def measure() -> None:
+            # git runs off the GUI thread; a repo on a network drive can
+            # take a moment to answer.
+            self._commit_diff_ready.emit(
+                rule_id, repo, commit_changes(repo, event.old, event.new)
+            )
+
+        threading.Thread(target=measure, name="commit-diff", daemon=True).start()
+
+    def _on_commit_diff(self, rule_id: str, repo: str, changes: object) -> None:
+        """git named the files one commit touched; send exactly those."""
+        rule = self._rule(rule_id)
+        if rule is None or self._closing:
+            return
+        if not isinstance(changes, list):
+            self._sync_now(rule)  # git could not say; compare everything
+            return
+        ignores = self._rule_ignores(rule)
+        uploads, removals = self._commit_targets(rule, repo, changes, ignores)
+        if not rule.delete_remote:
+            removals = []
+        log = self._activity()
+        entry = self._activity_events.pop(rule_id, None)
+        if entry is None:
+            entry = log.log_event(f"Commit — {rule.name}")
+        if not uploads and not removals:
+            log.set_outcome(
+                entry, "nothing in the commit touches this folder", kind="info"
+            )
+            self._set_status(
+                f"{rule.name}: the commit changed nothing under this folder."
+            )
+            return
+        if not self._connected:
+            # The full comparison on reconnect covers however many commits
+            # pile up while the connection is down.
+            self._sync_pending.add(rule.id)
+            self._activity_events[rule_id] = entry
+            log.set_outcome(entry, "waiting for the connection…", kind="info")
+            self._set_status(f"{rule.name}: will sync once the connection is up.")
+            return
+        what = (
+            f"sync {len(uploads)} file(s) and {len(removals)} removal(s) "
+            "from this commit to"
+        )
+        if not self._confirm_production(what):
+            log.set_outcome(entry, "stopped at the production guard", kind="cancelled")
+            return
+        removing = bool(removals)
+        if len(removals) > _BULK_REMOVAL:
+            # A checkout or reset moves HEAD too, and can "delete" thousands
+            # of files; that much removal is worth a question even here.
+            removing = self._confirm_removals(rule, removals)
+        if uploads:
+            log.add_files(
+                entry,
+                [(path, local_relative(rule.local, path)) for path in uploads],
+            )
+            self._upload_tree(
+                [(path, False) for path in uploads],
+                rule.remote,
+                flatten=rule.local,
+                rules=ignores,
+            )
+        if removals:
+            shown = removals[:20]
+            if len(removals) > len(shown):
+                shown = shown + [f"… and {len(removals) - len(shown)} more"]
+            log.add_notes(
+                entry,
+                shown,
+                outcome="removal requested" if removing else "left alone",
+            )
+        if removing:
+            self._sync_delete_requested.emit(removals)
+        parts = []
+        if uploads:
+            parts.append(f"uploading {len(uploads)} file(s)")
+        if removing:
+            parts.append(f"removing {len(removals)} item(s)")
+        elif removals:
+            parts.append(f"leaving {len(removals)} removal(s) alone")
+        self._set_status(f"{rule.name}: " + ", ".join(parts) + ".")
+
+    def _commit_targets(
+        self, rule: SyncRule, repo: str, changes: list, ignores: IgnoreRules
+    ) -> tuple[list[str], list[str]]:
+        """What one commit means for one rule: (local uploads, remote removals).
+
+        Filters the commit's file list down to what the rule owns and what
+        ``ignores`` allows - the caller reads those rules once and passes them
+        in, because it needs the same set for the upload itself. Removals come
+        back regardless of the rule's delete_remote flag; the caller decides
+        whether to act on them.
+        """
+        uploads: list[str] = []
+        removals: list[str] = []
+        for status, rel in changes:
+            path = os.path.normpath(os.path.join(repo, rel.replace("/", os.sep)))
+            if not rule.owns(path):
+                continue
+            relative = rule.relative(path)
+            if not relative or ignores.is_ignored(relative):
+                continue
+            if status == "D":
+                remote = rule.remote_for(path)
+                if remote and remote != rule.remote:
+                    removals.append(remote)
+            elif os.path.isfile(path):
+                uploads.append(path)
+            # A committed file already gone from disk again is the next
+            # commit's (or the watcher's) business, not this one's.
+        return uploads, removals
+
+    # ----- offering to push commits nothing is syncing ---------------------
+    # "I committed" is the strongest signal this app ever gets that a tree is
+    # meant to go somewhere - waiting for the user to configure a sync first
+    # meant the commits before that quietly went nowhere. So the repository
+    # the local pane is browsing is watched even with no rule, and a commit
+    # there offers itself: push once, push every commit, or stop asking.
+    def _watch_pane_repo(self, path: str) -> None:
+        """Keep one commit watcher on the repository the local pane is in."""
+        repo = find_repo(path) or ""
+        current = self._repo_watcher.repo if self._repo_watcher is not None else ""
+        if repo == current:
+            return
+        if self._repo_watcher is not None:
+            self._repo_watcher.stop()
+            self._repo_watcher = None
+        if not repo:
+            return
+        watcher = GitCommitWatcher(repo, self._pane_commit.emit)
+        if watcher.valid and watcher.start(prime=True):
+            self._repo_watcher = watcher
+
+    def _on_pane_commit(self, event: object) -> None:
+        """The repository on show recorded a commit; consider offering a push."""
+        if self._closing or not isinstance(event, CommitEvent):
+            return
+        if not self._connected or not self._local.path or not self._remote.path:
+            return
+        repo = self._repo_watcher.repo if self._repo_watcher is not None else ""
+        if not repo:
+            return
+        # A folder the user has already made a sync decision about - any rule,
+        # any mode, anywhere in this repository - is never nagged about. An
+        # armed on-commit rule handles the push itself; a paused one is the
+        # user having said "stop asking".
+        for rule in self._sync_rules():
+            if rule.covers(self._local.path):
+                return
+            if _inside(rule.local, repo) or _same_path(rule.local, repo):
+                return
+
+        def measure() -> None:
+            self._pane_commit_diff.emit(
+                repo, event, commit_changes(repo, event.old, event.new)
+            )
+
+        threading.Thread(target=measure, name="pane-commit-diff", daemon=True).start()
+
+    def _on_pane_commit_diff(self, repo: str, event: object, changes: object) -> None:
+        """Offer to push a commit made in a folder nothing is syncing yet."""
+        if self._closing or not self._connected:
+            return
+        local, remote = self._local.path, self._remote.path
+        if not local or not remote:
+            return
+        detail = event.describe() if isinstance(event, CommitEvent) else "HEAD moved"
+        short = event.short if isinstance(event, CommitEvent) else ""
+        if not isinstance(changes, list):
+            self._set_status(f"Commit noticed ({detail}); use Sync to push it.")
+            return
+        # Remembered whatever the answer turns out to be, so "Push the last
+        # commit" in the Sync menu still works once this notice is gone.
+        self._last_commit = {
+            "repo": repo, "detail": detail, "short": short, "changes": changes,
+        }
+        # The offer maps the pane pair: what you committed under the folder
+        # you are looking at goes to the folder you are looking at remotely.
+        rule = self._pane_commit_rule()
+        uploads, removals = self._commit_targets(
+            rule, repo, changes, self._rule_ignores(rule)
+        )
+        if not uploads and not removals:
+            return  # the commit touched nothing under the folder on show
+        parts = [f"upload {len(uploads)} file(s)"]
+        if removals:
+            parts.append(f"remove {len(removals)} deleted file(s)")
+        listing = "\n".join(
+            [local_relative(local, path) for path in uploads[:150]]
+            + [f"remove {path}" for path in removals[:50]]
+        )
+        self._notice.show_notice(
+            f"Committed {detail} — this would " + " and ".join(parts)
+            + f" under {remote}.",
+            [
+                ("Push", lambda: self._push_pane_commit(repo, changes, arm=False)),
+                ("Push every commit",
+                 lambda: self._push_pane_commit(repo, changes, arm=True)),
+            ],
+            detail=listing,
+            checkbox="Don't ask again",
+            on_dismiss=self._remember_pane_answer,
+        )
+
+    def _remember_pane_answer(self) -> None:
+        """Closing the notice with "Don't ask again" ticked is an answer too."""
+        if not self._notice.remembered():
+            return
+        rule = self._pane_commit_rule()
+        if not rule.local or not rule.remote:
+            return
+        self._sync_store.put(rule)  # paused: remembered, but never triggers
+        self._apply_sync_marks()
+        self._refresh_sync_dialog()
+        self._set_status(
+            f"{rule.name}: no more commit prompts for this folder. The Sync "
+            "menu can still push it whenever you want."
+        )
+
+    def _pane_commit_rule(self) -> SyncRule:
+        """A rule pairing the two directories on show, for a one-off push."""
+        return SyncRule(
+            profile_id=self._profile.id,
+            local=self._local.path,
+            remote=self._remote.path,
+            mode=SyncMode.OFF,
+        )
+
+    def _push_pane_commit(self, repo: str, changes: list, *, arm: bool) -> None:
+        """Act on the notice: push this commit, and arm the folder if asked."""
+        rule = self._pane_commit_rule()
+        if not rule.local or not rule.remote:
+            return
+        if arm:
+            rule.mode = SyncMode.ON_COMMIT
+        if arm or self._notice.remembered():
+            # Stored even when paused: no more prompts, and the folder shows
+            # up in the Sync menu ready to be armed properly later.
+            rule = self._sync_store.put(rule)
+            if arm:
+                self._start_sync_rule(rule)
+                self._set_status(
+                    f"Syncing {rule.local} to {rule.remote} on each commit."
+                )
+            self._apply_sync_marks()
+            self._refresh_sync_dialog()
+        if self._sync_store.get(rule.id) is None:
+            self._sync_transient[rule.id] = rule
+        self._on_commit_diff(rule.id, repo, changes)
+
+    def _push_last_commit(self) -> None:
+        """Push the most recent commit again, from the Sync menu."""
+        last = self._last_commit
+        if not last or not self._require_connection():
+            self._set_status("No commit has been noticed in this folder yet.")
+            return
+        self._push_pane_commit(
+            str(last.get("repo", "")), list(last.get("changes") or []), arm=False
+        )
 
     def _on_sync_scan(self, payload: object) -> None:
         """A comparison for one synced folder came back: act on it."""
@@ -1957,7 +2912,18 @@ class FileManagerTab(QWidget):
         ]
         uploads = [path for path in uploads if os.path.isfile(path)]
         removals = self._removal_paths(rule, report) if rule.delete_remote else []
+        log = self._activity()
+        entry = self._activity_events.pop(rule_id, None)
+        if entry is None:
+            entry = log.log_event(
+                f"Sync — {rule.name}", detail=f"compared with {rule.remote}"
+            )
         if not uploads and not removals:
+            log.set_outcome(
+                entry,
+                f"already in step (compared by {report.compared_by})",
+                kind="info",
+            )
             self._set_status(
                 f"{rule.name}: already in step with {rule.remote} "
                 f"(compared by {report.compared_by})."
@@ -1966,14 +2932,28 @@ class FileManagerTab(QWidget):
         if uploads and not self._confirm_production(
             f"upload {len(uploads)} file(s) to"
         ):
+            log.set_outcome(entry, "stopped at the production guard", kind="cancelled")
             return
         removing = bool(removals) and self._confirm_removals(rule, removals)
         if uploads:
+            log.add_files(
+                entry,
+                [(path, local_relative(rule.local, path)) for path in uploads],
+            )
             self._upload_tree(
                 [(path, False) for path in uploads],
                 rule.remote,
                 flatten=rule.local,
                 rules=self._rule_ignores(rule),
+            )
+        if removals:
+            shown = removals[:20]
+            if len(removals) > len(shown):
+                shown = shown + [f"… and {len(removals) - len(shown)} more"]
+            log.add_notes(
+                entry,
+                shown,
+                outcome="removal requested" if removing else "left alone",
             )
         if removing:
             self._sync_delete_requested.emit(removals)
@@ -1996,7 +2976,11 @@ class FileManagerTab(QWidget):
         busy = "busy" in message.lower()
         for rule_id in waiting:
             attempts = self._sync_retries.get(rule_id, 0)
-            if busy and attempts < 5 and not self._closing:
+            # Folder statistics on a big directory can hold the tool channel
+            # for well over the 20 seconds that 5 retries allowed, and a sync
+            # dropped for that reason looked exactly like "git sync does not
+            # work". A minute of patience costs nothing.
+            if busy and attempts < 15 and not self._closing:
                 self._sync_retries[rule_id] = attempts + 1
                 # Parented to this widget, so a tab closed in the meantime
                 # takes its pending retries with it.
@@ -2009,6 +2993,9 @@ class FileManagerTab(QWidget):
                 continue
             self._sync_retries.pop(rule_id, None)
             rule = self._rule(rule_id)
+            entry = self._activity_events.pop(rule_id, None)
+            if entry is not None:
+                self._activity().set_outcome(entry, message, kind="failed")
             self._set_status(f"{rule.name if rule else 'Sync'}: {message}")
         if busy and waiting:
             self._set_status("Sync is waiting for the running job to finish…")
@@ -2121,6 +3108,13 @@ class FileManagerTab(QWidget):
             "Sync now (upload changes)", lambda: self._sync_folder_now(local)
         )
         sync_now.setEnabled(bool(local))
+        last = self._last_commit
+        if last:
+            # The offer a commit made survives being dismissed: the commit is
+            # remembered, so pushing it is still one click away afterwards.
+            label = f"Push the last commit ({last.get('short') or 'HEAD'})"
+            push_last = menu.addAction(label, self._push_last_commit)
+            push_last.setToolTip(str(last.get("detail", "")))
         menu.addSeparator()
         for mode, label in (
             (SyncMode.ON_SAVE, "Keep in sync — on save"),
@@ -2165,6 +3159,7 @@ class FileManagerTab(QWidget):
                 )
             menu.addAction("Sync all of them now", self._sync_all_now)
         menu.addAction("Synced folders…", self._open_sync_dialog)
+        menu.addAction("Sync activity…", self._open_sync_activity)
 
     def _open_sync_dialog(self) -> None:
         dialog = self._dialogs.get("sync")
@@ -2210,6 +3205,35 @@ class FileManagerTab(QWidget):
         dialog = self._dialogs.get("sync")
         if isinstance(dialog, SyncFoldersDialog):
             dialog.set_rules(self._sync_rules(), active=self._armed_rules())
+
+    # ----- the sync activity log -------------------------------------------
+    # The watchers work in the background, so "did it see my commit, and did
+    # everything go up?" needs somewhere to look. Events are logged into the
+    # dialog whether or not it is on screen; opening it later shows the lot.
+    def _activity(self, *, create: bool = True) -> SyncActivityDialog | None:
+        dialog = self._dialogs.get("activity")
+        if isinstance(dialog, SyncActivityDialog):
+            try:
+                dialog.isVisible()  # probes that the C++ side is still there
+                return dialog
+            except RuntimeError:
+                self._dialogs.pop("activity", None)
+        if not create:
+            return None
+        dialog = SyncActivityDialog(
+            self._profile.label, dark=self._settings.dark_mode, parent=self
+        )
+        self._dialogs["activity"] = dialog
+        return dialog
+
+    def _open_sync_activity(self) -> None:
+        self._present(self._activity())
+
+    def _on_activity_item(self, item) -> None:
+        """Feed upload outcomes to the activity log, when there is one."""
+        dialog = self._activity(create=False)
+        if dialog is not None and item.upload:
+            dialog.update_transfer(item)
 
     # ----- commands -------------------------------------------------------
     def _set_active(self, *, remote: bool) -> None:
@@ -2710,16 +3734,24 @@ class FileManagerTab(QWidget):
         menu = QMenu(self)
         has_shell = Capability.EXEC in self._capabilities
 
+        one_file = len(selection) == 1 and not selection[0][1]
         if remote:
             menu.addAction("Download", self._on_download).setEnabled(bool(selection))
+            menu.addAction(
+                "Edit locally",
+                lambda: self._on_edit_remote(selection[0][0]),
+            ).setEnabled(one_file)
             menu.addSeparator()
         else:
             menu.addAction("Upload", self._on_upload).setEnabled(bool(selection))
+            menu.addAction(
+                "Open", lambda: self._on_open_local(selection[0][0])
+            ).setEnabled(one_file)
             menu.addSeparator()
 
-        menu.addAction("New folder", self._on_mkdir)
-        menu.addAction("Rename", self._on_rename).setEnabled(len(selection) == 1)
-        menu.addAction("Delete", self._on_delete).setEnabled(bool(selection))
+        menu.addAction("New folder (F7)", self._on_mkdir)
+        menu.addAction("Rename (F2)", self._on_rename).setEnabled(len(selection) == 1)
+        menu.addAction("Delete (Del)", self._on_delete).setEnabled(bool(selection))
         menu.addAction("Refresh", pane.refresh)
         menu.addSeparator()
 
@@ -2816,18 +3848,43 @@ class FileManagerTab(QWidget):
         return False
 
     def _confirm_production(self, action: str) -> bool:
-        """Ask before anything destructive on a production connection."""
+        """Ask before anything destructive on a production connection.
+
+        The warning can be switched off from inside itself, per connection:
+        someone deploying to the same live site all day is answering the same
+        question dozens of times, and a prompt answered by reflex has stopped
+        being a safeguard. Settings can turn it back on for everything.
+        """
         if not self._is_production or not self._settings.production_guard:
             return True
-        confirm = QMessageBox.warning(
-            self,
-            "PRODUCTION",
+        if self._profile.id in self._settings.production_guard_off:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("PRODUCTION")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
             f"You are about to {action} {self._profile.label}, which is marked "
-            "as production.\n\nGo ahead?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            "as production.\n\nGo ahead?"
         )
-        return confirm == QMessageBox.StandardButton.Yes
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        remember = QCheckBox("Don't ask again for this connection")
+        remember.setToolTip(
+            "Uploads to this server stop asking. Settings ▸ Ask before "
+            "production changes turns it back on for every connection."
+        )
+        box.setCheckBox(remember)
+        confirmed = box.exec() == QMessageBox.StandardButton.Yes
+        if confirmed and remember.isChecked():
+            self._settings.production_guard_off.append(self._profile.id)
+            self._settings.save()
+            self._set_status(
+                f"{self._profile.label}: production warnings are off for this "
+                "connection."
+            )
+        return confirmed
 
     # ----- status ---------------------------------------------------------
     def _set_status(self, message: str) -> None:
@@ -2837,9 +3894,17 @@ class FileManagerTab(QWidget):
     def cleanup(self) -> None:
         """Cancel any transfer, close the connection, stop the thread."""
         self._closing = True
+        self._edit_timer.stop()
+        self._edit_watch.clear()
+        # Scratch copies of edited files; the editor may still hold one open,
+        # in which case it stays until Windows cleans the temp directory.
+        shutil.rmtree(self._edit_root, ignore_errors=True)
         if self._watcher is not None:
             self._watcher.stop()
             self._watcher = None
+        if self._repo_watcher is not None:
+            self._repo_watcher.stop()
+            self._repo_watcher = None
         for rule_id in list(self._sync_watchers) + list(self._git_watchers):
             self._stop_sync_rule(rule_id)
         for dialog in list(self._dialogs.values()):
@@ -2863,6 +3928,26 @@ class FileManagerTab(QWidget):
             pass
         self._thread.quit()
         self._thread.wait(3000)
+
+
+def _missing_local_reason(target: str) -> str:
+    """Why a local directory is not there - naming the usual culprit.
+
+    A mapped network drive that Explorer shows but this app cannot see is
+    almost always elevation: mapped drives belong to the unelevated logon
+    session, so running as administrator hides them completely. Saying so is
+    the difference between a five-second fix and concluding the app is broken.
+    """
+    drive = mapped_drive_letter(target)
+    if drive and running_elevated() and not os.path.isdir(drive + "\\"):
+        return (
+            f"{target} is not visible because Sitekeeper is running as "
+            f"administrator, and Windows hides mapped network drives like "
+            f"{drive} from elevated programs. Start it normally (without "
+            f"'Run as administrator'), or use the \\\\server\\share path "
+            "instead, which works either way."
+        )
+    return f"{target} is not a directory."
 
 
 def _scan_local(target: str) -> list[RemoteEntry]:
@@ -2946,6 +4031,16 @@ def _inside(child: str, parent: str) -> bool:
     return theirs.startswith(mine + os.sep)
 
 
+def _same_path(a: str, b: str) -> bool:
+    """Whether two local paths name the same directory (case-insensitively)."""
+    if not a or not b:
+        return False
+    return (
+        os.path.normcase(os.path.normpath(a)).rstrip("\\/")
+        == os.path.normcase(os.path.normpath(b)).rstrip("\\/")
+    )
+
+
 def _dropped(payload: object, fallback: str) -> tuple[list[str], str]:
     """Unpack a paths_dropped payload: (local paths, directory to drop into)."""
     if isinstance(payload, dict):
@@ -2977,8 +4072,11 @@ def _hover_colour(dark: bool) -> QColor:
 
 
 def _display_name(entry: RemoteEntry) -> str:
-    """How one entry is shown: folders bracketed, links with their target."""
-    label = f"[{entry.name}]" if entry.is_dir else entry.name
+    """How one entry is shown: links with their target, the rest plain.
+
+    Folders used to be bracketed; the folder icon says it now.
+    """
+    label = entry.name
     if entry.is_link:
         label = f"{label} →" + (f" {entry.link_target}" if entry.link_target else "")
     return label

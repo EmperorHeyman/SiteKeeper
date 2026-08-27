@@ -4,9 +4,18 @@ A progress bar tells you something is happening; this tells you *what*. Every
 file in the queue is a row you can cancel on its own, push to the front, or
 drag into the order you actually want, and the whole queue can be paused
 mid-file and resumed later.
+
+Each run of the queue is one timestamped batch. When a new batch starts, the
+previous ones fold up into their headline - "14:32:05 — 7 file(s)" with the
+outcome alongside - so an afternoon of deploys stays one screen tall while
+every failure is still one click away. Old batches with nothing unfinished in
+them are dropped once enough newer ones exist.
 """
 
 from __future__ import annotations
+
+import time
+from datetime import datetime
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
@@ -28,6 +37,25 @@ from mysql_runner.transfer.pool import JobState
 from mysql_runner.ui import theme
 
 _COLUMNS = ("File", "Direction", "Size", "Progress", "State")
+
+#: Collapsed batches kept around once every file in them has finished.
+_KEEP_BATCHES = 6
+
+#: The real state hides here; the visible State column carries error text.
+_STATE_ROLE = Qt.ItemDataRole.UserRole + 1
+
+#: Queue runs starting within this window join the previous batch: one sync
+#: that touches several subfolders arrives as several submissions.
+_BATCH_JOIN_SECONDS = 2.0
+
+_FINISHED = frozenset(
+    (
+        JobState.DONE.value,
+        JobState.FAILED.value,
+        JobState.CANCELLED.value,
+        JobState.SKIPPED.value,
+    )
+)
 
 
 def _state_colours(dark: bool) -> dict:
@@ -51,12 +79,17 @@ class TransferQueuePanel(QWidget):
     clear_finished_requested = pyqtSignal()
     cancel_item_requested = pyqtSignal(str)
     prioritize_item_requested = pyqtSignal(str)
+    retry_failed_requested = pyqtSignal()
+    retry_item_requested = pyqtSignal(str)
     reorder_requested = pyqtSignal(object)
     workers_changed = pyqtSignal(int)
 
     def __init__(self, parent: QWidget | None = None, *, workers: int = 3) -> None:
         super().__init__(parent)
         self._rows: dict[str, QTreeWidgetItem] = {}
+        self._batch: QTreeWidgetItem | None = None
+        self._batch_started = 0.0
+        self._batch_total = 0
         self._paused = False
         self._dark = True
         self._colours = _state_colours(True)
@@ -73,6 +106,10 @@ class TransferQueuePanel(QWidget):
         self._pause_btn.clicked.connect(self._toggle_pause)
         cancel_btn = QPushButton("Cancel all")
         cancel_btn.clicked.connect(self.cancel_all_requested.emit)
+        self._retry_btn = QPushButton("Retry failed")
+        self._retry_btn.setToolTip("Queue every failed transfer again")
+        self._retry_btn.setVisible(False)  # appears when something has failed
+        self._retry_btn.clicked.connect(self.retry_failed_requested.emit)
         clear_btn = QPushButton("Clear finished")
         clear_btn.clicked.connect(self.clear_finished_requested.emit)
 
@@ -89,13 +126,14 @@ class TransferQueuePanel(QWidget):
         header.addWidget(self._workers)
         header.addWidget(self._pause_btn)
         header.addWidget(cancel_btn)
+        header.addWidget(self._retry_btn)
         header.addWidget(clear_btn)
         layout.addLayout(header)
 
         self._tree = QTreeWidget()
         self._tree.setColumnCount(len(_COLUMNS))
         self._tree.setHeaderLabels(list(_COLUMNS))
-        self._tree.setRootIsDecorated(False)
+        self._tree.setRootIsDecorated(True)
         self._tree.setUniformRowHeights(True)
         self._tree.setAlternatingRowColors(True)
         self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -103,15 +141,115 @@ class TransferQueuePanel(QWidget):
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._show_menu)
         self._tree.model().rowsMoved.connect(self._on_rows_moved)
-        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._tree.setMinimumHeight(84)
-        self._tree.setMaximumHeight(190)
-        self._tree.header().setDefaultAlignment(
+        tree_header = self._tree.header()
+        # Every column can be dragged into a different order and resized by
+        # hand; the last one soaks up the leftover width.
+        tree_header.setSectionsMovable(True)
+        tree_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        tree_header.setStretchLastSection(True)
+        tree_header.setDefaultAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
+        self._tree.setColumnWidth(0, 260)
+        for column, width in ((1, 70), (2, 70), (3, 110)):
+            self._tree.setColumnWidth(column, width)
+        # No height cap: the panel sits in a splitter, so its size is the
+        # user's to drag - down to almost nothing if the queue is in the way.
+        self._tree.setMinimumHeight(48)
         layout.addWidget(self._tree, 1)
         self._placeholder: QTreeWidgetItem | None = None
         self._show_placeholder()
+
+    # ----- batches ----------------------------------------------------------
+    def start_batch(self, total: int) -> None:
+        """A new queue run: fold the previous batches up, group what is coming."""
+        if total <= 0:
+            return
+        now = time.monotonic()
+        if (
+            self._batch is not None
+            and now - self._batch_started < _BATCH_JOIN_SECONDS
+        ):
+            # The same action, arriving in pieces: extend rather than split.
+            self._batch_total += total
+            self._batch.setText(
+                0, f"{self._batch.text(0).split(' — ')[0]} — {self._batch_total} file(s)"
+            )
+            return
+        self._clear_placeholder()
+        for group in self._groups():
+            group.setExpanded(False)
+        self._prune_batches()
+        batch = QTreeWidgetItem(self._tree)
+        stamp = datetime.now().strftime("%H:%M:%S")
+        batch.setText(0, f"{stamp} — {total} file(s)")
+        batch.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+        font = batch.font(0)
+        font.setBold(True)
+        batch.setFont(0, font)
+        batch.setForeground(0, QColor(theme.palette(self._dark).text_dim))
+        batch.setExpanded(True)
+        self._batch = batch
+        self._batch_started = now
+        self._batch_total = total
+
+    def _groups(self) -> list[QTreeWidgetItem]:
+        found = []
+        for index in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(index)
+            if item is not self._placeholder:
+                found.append(item)
+        return found
+
+    def _prune_batches(self, *, keep: int = _KEEP_BATCHES) -> None:
+        """Drop the oldest fully-finished batches beyond ``keep``."""
+        groups = self._groups()
+        excess = len(groups) - keep
+        for group in groups:
+            if excess <= 0:
+                break
+            if not self._all_finished(group):
+                continue
+            for child in _children(group):
+                item_id = child.data(0, Qt.ItemDataRole.UserRole)
+                self._rows.pop(str(item_id), None)
+            index = self._tree.indexOfTopLevelItem(group)
+            if index >= 0:
+                self._tree.takeTopLevelItem(index)
+            if group is self._batch:
+                self._batch = None
+            excess -= 1
+
+    @staticmethod
+    def _all_finished(group: QTreeWidgetItem) -> bool:
+        return all(
+            child.data(0, _STATE_ROLE) in _FINISHED for child in _children(group)
+        )
+
+    def _refresh_batch(self, group: QTreeWidgetItem | None) -> None:
+        """Keep a batch's headline honest: n/m done, and whether any failed."""
+        if group is None:
+            return
+        done = failed = 0
+        total = group.childCount()
+        for child in _children(group):
+            state = child.data(0, _STATE_ROLE)
+            if state == JobState.FAILED.value:
+                failed += 1
+            elif state in _FINISHED:
+                done += 1
+        parts = [f"{done + failed}/{total} done"]
+        if failed:
+            parts.append(f"{failed} failed")
+        group.setText(4, ", ".join(parts))
+        palette = theme.palette(self._dark)
+        if failed:
+            colour = palette.red
+        elif done == total:
+            colour = palette.green
+        else:
+            colour = palette.text_dim
+        group.setForeground(4, QColor(colour))
 
     # ----- updates --------------------------------------------------------
     def _show_placeholder(self) -> None:
@@ -138,7 +276,14 @@ class TransferQueuePanel(QWidget):
         self._clear_placeholder()
         row = self._rows.get(item.id)
         if row is None:
-            row = QTreeWidgetItem(self._tree)
+            if self._batch is None:
+                self.start_batch(1)
+            row = QTreeWidgetItem(self._batch)
+            row.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDragEnabled
+            )
             row.setData(0, Qt.ItemDataRole.UserRole, item.id)
             self._rows[item.id] = row
         row.setText(0, item.name)
@@ -146,10 +291,13 @@ class TransferQueuePanel(QWidget):
         row.setText(2, _human_size(item.size))
         row.setText(3, _progress_text(item))
         row.setText(4, item.error or item.note or item.state.value)
+        row.setData(0, _STATE_ROLE, item.state.value)
         colour = self._colours.get(item.state)
         if colour:
             row.setForeground(4, QColor(colour))
         row.setToolTip(0, f"{item.source}  →  {item.destination}")
+        row.setToolTip(4, item.error or item.note or "")
+        self._refresh_batch(row.parent())
 
     def update_stats(self, stats: dict) -> None:
         counts = stats.get("counts", {})
@@ -160,6 +308,7 @@ class TransferQueuePanel(QWidget):
         parts = [f"{running} running", f"{queued} waiting", f"{done} done"]
         if failed:
             parts.append(f"{failed} failed")
+        self._retry_btn.setVisible(bool(failed))
         total = stats.get("bytes_total", 0)
         if total:
             parts.append(
@@ -183,22 +332,32 @@ class TransferQueuePanel(QWidget):
         self._tree.clear()
         self._rows.clear()
         self._placeholder = None
+        self._batch = None
         self._summary.setText("Nothing queued")
         self._show_placeholder()
 
     def remove_finished(self) -> None:
         """Drop finished rows locally (the pool has already forgotten them)."""
         for item_id, row in list(self._rows.items()):
-            state = row.text(4)
-            if state in (
-                JobState.DONE.value,
-                JobState.CANCELLED.value,
-                JobState.SKIPPED.value,
-            ):
+            if row.data(0, _STATE_ROLE) not in _FINISHED:
+                continue
+            parent = row.parent()
+            if parent is not None:
+                parent.removeChild(row)
+            else:
                 index = self._tree.indexOfTopLevelItem(row)
                 if index >= 0:
                     self._tree.takeTopLevelItem(index)
-                del self._rows[item_id]
+            del self._rows[item_id]
+        for group in self._groups():
+            if group.childCount():
+                self._refresh_batch(group)
+                continue
+            index = self._tree.indexOfTopLevelItem(group)
+            if index >= 0:
+                self._tree.takeTopLevelItem(index)
+            if group is self._batch:
+                self._batch = None
         self._show_placeholder()
 
     def set_theme(self, dark: bool) -> None:
@@ -226,6 +385,7 @@ class TransferQueuePanel(QWidget):
         return [
             str(row.data(0, Qt.ItemDataRole.UserRole))
             for row in self._tree.selectedItems()
+            if row.data(0, Qt.ItemDataRole.UserRole)
         ]
 
     def _show_menu(self, position) -> None:
@@ -234,22 +394,36 @@ class TransferQueuePanel(QWidget):
             return
         menu = QMenu(self)
         to_top = menu.addAction("Transfer next")
+        retry = menu.addAction("Retry")
         cancel = menu.addAction("Cancel")
         action = menu.exec(self._tree.viewport().mapToGlobal(position))
         if action is to_top:
             for item_id in chosen:
                 self.prioritize_item_requested.emit(item_id)
+        elif action is retry:
+            for item_id in chosen:
+                self.retry_item_requested.emit(item_id)
         elif action is cancel:
             for item_id in chosen:
                 self.cancel_item_requested.emit(item_id)
 
     def _on_rows_moved(self, *_args) -> None:
-        """A drag finished: tell the pool the new order."""
-        order = [
-            str(self._tree.topLevelItem(index).data(0, Qt.ItemDataRole.UserRole))
-            for index in range(self._tree.topLevelItemCount())
-        ]
+        """A drag finished: tell the pool the new order, batch by batch."""
+        order: list[str] = []
+        for index in range(self._tree.topLevelItemCount()):
+            top = self._tree.topLevelItem(index)
+            top_id = top.data(0, Qt.ItemDataRole.UserRole)
+            if top_id:
+                order.append(str(top_id))
+            for child in _children(top):
+                child_id = child.data(0, Qt.ItemDataRole.UserRole)
+                if child_id:
+                    order.append(str(child_id))
         self.reorder_requested.emit(order)
+
+
+def _children(group: QTreeWidgetItem) -> list[QTreeWidgetItem]:
+    return [group.child(index) for index in range(group.childCount())]
 
 
 def _progress_text(item) -> str:

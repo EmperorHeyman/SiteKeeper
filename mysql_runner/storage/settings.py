@@ -75,6 +75,12 @@ class Settings:
     mirror_navigation: bool = False
     # Ask twice before anything destructive on a production connection.
     production_guard: bool = True
+    # Connections whose production warning has been switched off from the
+    # warning itself ("Don't ask again for this connection"). Per connection
+    # rather than global: the whole point of the guard is that it fires on the
+    # servers that matter, and someone who deploys to one production site all
+    # day should not have to disarm it for the others too.
+    production_guard_off: list[str] = field(default_factory=list)
     # Upload changed files automatically while a tab is watching.
     watch_autosync: bool = False
     # Preferred external terminal ("" picks the first one found).
@@ -121,6 +127,7 @@ class Settings:
             folder_stats=bool(data.get("folder_stats", True)),
             mirror_navigation=bool(data.get("mirror_navigation", False)),
             production_guard=bool(data.get("production_guard", True)),
+            production_guard_off=cls._sane_ids(data.get("production_guard_off")),
             watch_autosync=bool(data.get("watch_autosync", False)),
             terminal_program=str(data.get("terminal_program", "") or ""),
             terminal_send_password=bool(data.get("terminal_send_password", True)),
@@ -144,6 +151,13 @@ class Settings:
         except (TypeError, ValueError):
             return DEFAULT_TRANSFER_WORKERS
         return max(1, min(MAX_TRANSFER_WORKERS, count))
+
+    @staticmethod
+    def _sane_ids(value: object) -> list[str]:
+        """A list of profile ids, ignoring anything that is not one."""
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if isinstance(item, str) and item]
 
     @staticmethod
     def _sane_sizes(value: object) -> list[int]:

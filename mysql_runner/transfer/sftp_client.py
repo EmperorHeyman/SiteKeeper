@@ -40,6 +40,12 @@ STREAM_POLL = 0.2
 #: Seconds allowed for the "can this account run commands at all" probe.
 PROBE_TIMEOUT = 6.0
 
+#: SSH channel window for the SFTP session. Paramiko's default (2 MB) caps
+#: how much data may be in flight unacknowledged, which throttles transfers
+#: badly on anything with real latency - the single biggest reason uploads
+#: here used to lose to WinSCP on the same link.
+WINDOW_SIZE = 16 * 1024 * 1024
+
 #: Used whenever an operation arrives with no live session.
 NOT_CONNECTED = "Not connected."
 
@@ -216,8 +222,18 @@ class SFTPFileSystem(RemoteFS):
             # Persisting the key is a convenience; carry on without it.
             pass
 
+        transport = client.get_transport()
         try:
-            self._sftp = client.open_sftp()
+            if transport is None:
+                raise TransferError("The SSH transport closed during login.")
+            self._sftp = paramiko.SFTPClient.from_transport(
+                transport, window_size=WINDOW_SIZE
+            )
+            if self._sftp is None:
+                raise TransferError("The server refused to open an SFTP session.")
+        except TransferError:
+            client.close()
+            raise
         except (paramiko.SSHException, OSError) as exc:
             client.close()
             raise TransferError(_describe(exc)) from exc
@@ -226,10 +242,7 @@ class SFTPFileSystem(RemoteFS):
         self._caps = _CAPABILITIES
         if not self._shell_works():
             self._caps = _CAPABILITIES - {Capability.EXEC}
-        transport = client.get_transport()
-        banner = ""
-        if transport is not None:
-            banner = transport.remote_version or ""
+        banner = transport.remote_version or ""
         return f"SFTP connected to {self._host}:{self._port}. {banner}".strip()
 
     def _shell_works(self) -> bool:
@@ -270,6 +283,25 @@ class SFTPFileSystem(RemoteFS):
         if self._client is None:
             raise TransferError(NOT_CONNECTED)
         return self._client
+
+    def alive(self) -> bool:
+        """Whether the SSH session still answers.
+
+        The transport flag flips the moment Paramiko's reader thread sees the
+        connection die, so the common case costs nothing; the ``realpath``
+        round trip catches a session that is up but no longer serving SFTP.
+        """
+        client, sftp = self._client, self._sftp
+        if client is None or sftp is None:
+            return False
+        transport = client.get_transport()
+        if transport is None or not transport.is_active():
+            return False
+        try:
+            sftp.normalize(".")
+        except Exception:
+            return False
+        return True
 
     # ----- capabilities ---------------------------------------------------
     def capabilities(self) -> frozenset[Capability]:
@@ -330,17 +362,20 @@ class SFTPFileSystem(RemoteFS):
             return ""
 
     def stat(self, path: str) -> RemoteStat:
+        # lstat first, and follow only actual links: one round trip per file
+        # instead of two, which the transfer queue pays for every overwrite.
         sftp = self._require()
         try:
-            attr = sftp.stat(path)
+            attr = sftp.lstat(path)
         except Exception as exc:
             raise TransferError(_describe(exc)) from exc
+        is_link = stat.S_ISLNK(attr.st_mode or 0)
+        if is_link:
+            try:
+                attr = sftp.stat(path)
+            except Exception:
+                pass  # dangling link: report the link itself
         mode = attr.st_mode or 0
-        is_link = False
-        try:
-            is_link = stat.S_ISLNK((sftp.lstat(path).st_mode or 0))
-        except Exception:
-            pass
         return RemoteStat(
             path=path,
             is_dir=stat.S_ISDIR(mode),

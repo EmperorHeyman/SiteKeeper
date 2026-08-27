@@ -186,6 +186,21 @@ class RemoteFS(ABC):
             wording = capability.value.replace("_", " ")
             raise Unsupported(f"This connection cannot {wording}.")
 
+    def alive(self) -> bool:
+        """Best-effort: whether the session still answers at all.
+
+        Idle connections get dropped by servers and firewalls without a word;
+        this is how callers tell "the server refused that operation" from
+        "the connection is gone", which is the case worth reconnecting for.
+        The default pays one round trip; backends override it with something
+        cheaper where the protocol has one.
+        """
+        try:
+            self.home()
+        except Exception:
+            return False
+        return True
+
     # ----- optional operations -------------------------------------------
     # Default implementations either emulate the operation with what every
     # backend has, or refuse politely. Backends override what they can do.

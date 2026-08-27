@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
 
 from mysql_runner.crypto import vault as vault_mod
 from mysql_runner.db import mysql_client
+from mysql_runner.runtime_mode import running_elevated
 from mysql_runner.storage.models import ConnectionKind, Environment, ServerProfile
 from mysql_runner.storage.portable import PortableError, export_profiles, import_profiles
 from mysql_runner.storage.settings import MIN_SIDEBAR_WIDTH, Settings
@@ -158,7 +159,7 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(theme.divider())
         central_layout.addWidget(self._splitter, 1)
         self.setCentralWidget(central)
-        self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage(_startup_message())
 
     def _build_sidebar(self) -> QWidget:
         self._sidebar = QWidget()
@@ -362,6 +363,14 @@ class MainWindow(QMainWindow):
         tab_menu.addAction(move_action)
         tab_menu.addAction(focus_action)
 
+        tools_menu = menubar.addMenu("T&ools")
+        mcp_action = QAction("Connect &Claude (MCP server)…", self)
+        mcp_action.setToolTip(
+            "Let Claude Code / Claude Desktop use these connections"
+        )
+        mcp_action.triggered.connect(self._show_mcp_hint)
+        tools_menu.addAction(mcp_action)
+
     def _build_shortcuts(self) -> None:
         # Cycle tabs.
         nxt = QShortcut(QKeySequence("Ctrl+Tab"), self)
@@ -482,6 +491,9 @@ class MainWindow(QMainWindow):
                 )
                 item = QTreeWidgetItem([label])
                 item.setData(0, Qt.ItemDataRole.UserRole, profile.id)
+                item.setIcon(
+                    0, theme.kind_icon(profile.kind.value, self._settings.dark_mode)
+                )
                 item.setToolTip(0, profile.describe_target())
                 color = _ENV_COLORS.get(profile.environment)
                 if color is not None:
@@ -896,6 +908,9 @@ class MainWindow(QMainWindow):
             self._on_tab_close(pane, index)
 
     def _style_tab(self, pane: QTabWidget, index: int, profile: ServerProfile) -> None:
+        pane.setTabIcon(
+            index, theme.kind_icon(profile.kind.value, self._settings.dark_mode)
+        )
         color = _ENV_COLORS.get(profile.environment)
         if color is not None:
             pane.tabBar().setTabTextColor(index, color)
@@ -1004,6 +1019,63 @@ class MainWindow(QMainWindow):
             return
         self._settings.sidebar_width = position
 
+    # ----- Claude / MCP ----------------------------------------------------
+    def _show_mcp_hint(self) -> None:
+        """How to hand these connections to Claude - said inside the app,
+        because the app is where anyone would go looking for it."""
+        import sys
+        from pathlib import Path
+
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+
+        command = "claude mcp add sitekeeper -- python -m mysql_runner.mcp --allow-write"
+        frozen = bool(getattr(sys, "frozen", False))
+        if frozen:
+            where = (
+                "Run it inside your Sitekeeper source checkout - the MCP "
+                "server runs from source, not from this installed build."
+            )
+        else:
+            root = Path(__file__).resolve().parents[2]
+            where = f"Run it in {root}."
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Connect Claude")
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            "Sitekeeper ships an MCP server, so Claude Code and Claude "
+            "Desktop can use these connections themselves: browse and read "
+            "remote files, push files and folders, and run MySQL queries - "
+            "against this same vault. Register it once:"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        command_edit = QLineEdit(command)
+        command_edit.setReadOnly(True)
+        layout.addWidget(command_edit)
+        note = QLabel(
+            f"{where}\n\n"
+            "It is read-only until a flag grants more: --allow-write "
+            "(uploads), --allow-delete, --allow-sql-write, and "
+            "--allow-production for servers marked PROD. --profiles \"A,B\" "
+            "restricts which connections Claude sees. Details are in the "
+            "README."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("hint")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        copy_btn = buttons.addButton(
+            "Copy command", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(command)
+        )
+        buttons.rejected.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.resize(560, dialog.sizeHint().height())
+        dialog.exec()
+
     # ----- view toggles --------------------------------------------------
     def _toggle_dark_mode(self) -> None:
         """The application's own chrome."""
@@ -1027,7 +1099,14 @@ class MainWindow(QMainWindow):
         application = QApplication.instance()
         if application is not None:
             application.setStyleSheet(theme.app_stylesheet(enabled))
-        for _pane, _index, widget in self._all_tabs():
+        # Painted icons carry the old theme's colours; draw them afresh.
+        self._refresh_server_list()
+        for pane, index, widget in self._all_tabs():
+            profile = getattr(widget, "server_profile", None)
+            if isinstance(profile, ServerProfile):
+                pane.setTabIcon(
+                    index, theme.kind_icon(profile.kind.value, enabled)
+                )
             if isinstance(widget, BrowserTab):
                 continue
             setter = getattr(widget, "set_dark_mode", None)
@@ -1100,6 +1179,11 @@ class MainWindow(QMainWindow):
         settings.ignore_defaults = dialog.ignore_defaults()
         settings.folder_stats = dialog.folder_stats()
         settings.mirror_navigation = dialog.mirror_navigation()
+        if dialog.production_guard() and not settings.production_guard:
+            # Switching the guard back on is the way back for connections that
+            # turned their own warning off; otherwise it would come back on
+            # everywhere except where it had actually been silenced.
+            settings.production_guard_off = []
         settings.production_guard = dialog.production_guard()
         settings.watch_autosync = dialog.watch_autosync()
         settings.terminal_program = dialog.terminal_program()
@@ -1260,6 +1344,22 @@ class MainWindow(QMainWindow):
     def _on_lock_clicked(self) -> None:
         if self._on_lock is not None:
             self._on_lock()
+
+
+def _startup_message() -> str:
+    """"Ready", or the one warning worth giving before anything is opened.
+
+    Running elevated makes every mapped network drive vanish from this
+    process while Explorer still shows it - which reads as "the app cannot
+    see my share any more". Said here, it is a five-second fix.
+    """
+    if not running_elevated():
+        return "Ready"
+    return (
+        "Ready — but Sitekeeper is running as administrator, so Windows hides "
+        "mapped network drives (Z:, Y:…) from it. Start it normally to browse "
+        "them, or use \\\\server\\share paths."
+    )
 
 
 def _category_of(profile: ServerProfile) -> str:

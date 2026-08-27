@@ -346,11 +346,47 @@ class TransferPool:
                     item._sequence = positions[item.id]
             self._condition.notify_all()
 
-    def clear_finished(self) -> int:
+    def clear_finished(self, *, keep_failed: bool = False) -> int:
+        """Forget finished items. ``keep_failed`` leaves failures retryable."""
         with self._condition:
             before = len(self._items)
-            self._items = [item for item in self._items if not item.state.finished]
+            self._items = [
+                item
+                for item in self._items
+                if not item.state.finished
+                or (keep_failed and item.state == JobState.FAILED)
+            ]
             return before - len(self._items)
+
+    def retry(self, item_id: str) -> bool:
+        """Put one failed (or cancelled) item back in the queue."""
+        with self._condition:
+            item = self._find(item_id)
+            if item is None or item.state not in (
+                JobState.FAILED, JobState.CANCELLED
+            ):
+                return False
+            item.state = JobState.QUEUED
+            item.error = ""
+            item.note = ""
+            item.transferred = 0
+            item.started = None
+            item.finished_at = None
+            item._cancel = False
+            self._sequence += 1
+            item._sequence = self._sequence
+            self._condition.notify_all()
+        self._events.item(item)
+        self._ensure_workers()
+        return True
+
+    def retry_failed(self) -> int:
+        """Queue every failed item again. Returns how many were requeued."""
+        with self._lock:
+            wanted = [
+                item.id for item in self._items if item.state == JobState.FAILED
+            ]
+        return sum(1 for item_id in wanted if self.retry(item_id))
 
     def shutdown(self, *, wait: bool = True, timeout: float = 5.0) -> None:
         """Stop the workers and close their connections."""
@@ -420,7 +456,27 @@ class TransferPool:
                     self._events.message(f"Connection {index + 1}: {exc}")
                     # Without a connection this worker can do nothing useful.
                     return
-                self._run_item(connection, item)
+                error = self._run_item(connection, item)
+                if error is None:
+                    continue
+                # A session dropped while the pool sat idle fails whatever it
+                # is handed, so check the connection before believing the
+                # error - a dead one earns the item one go on a fresh session.
+                if self._stopping or item._cancel or connection.alive():
+                    self._finish(item, JobState.FAILED, error=error)
+                    continue
+                self._close_connection(index)
+                try:
+                    connection = self._connection_for(index)
+                except TransferError as exc:
+                    self._finish(item, JobState.FAILED, error=str(exc))
+                    self._events.message(f"Connection {index + 1}: {exc}")
+                    return
+                self._events.message("A transfer connection was dropped; reconnected.")
+                item.transferred = 0
+                error = self._run_item(connection, item)
+                if error is not None:
+                    self._finish(item, JobState.FAILED, error=error)
         finally:
             self._retire()
             self._close_connection(index)
@@ -477,11 +533,15 @@ class TransferPool:
                 pass
 
     # ----- one file -------------------------------------------------------
-    def _run_item(self, fs: RemoteFS, item: TransferItem) -> None:
+    def _run_item(self, fs: RemoteFS, item: TransferItem) -> str | None:
+        """Carry one file. A remote failure is *returned*, not finished, so
+        the worker loop can decide whether a fresh connection deserves a retry;
+        every other outcome (done, skipped, cancelled, local error) is final.
+        """
         try:
             if self._should_skip(fs, item):
                 self._finish(item, JobState.SKIPPED)
-                return
+                return None
             self._prepare_destination(item)
             self._backup_destination(fs, item)
             if item.upload:
@@ -490,14 +550,14 @@ class TransferPool:
                 self._do_download(fs, item)
         except _Cancelled:
             self._finish(item, JobState.CANCELLED)
-            return
+            return None
         except TransferError as exc:
-            self._finish(item, JobState.FAILED, error=str(exc))
-            return
+            return str(exc) or exc.__class__.__name__
         except OSError as exc:
             self._finish(item, JobState.FAILED, error=str(exc))
-            return
+            return None
         self._finish(item, JobState.DONE)
+        return None
 
     def _should_skip(self, fs: RemoteFS, item: TransferItem) -> bool:
         mode = self._options.overwrite
@@ -564,6 +624,12 @@ class TransferPool:
             except TransferError:
                 return
             item.replaced = True
+            if self._unchanged(item.local, existing):
+                # Replacing a file with an identical copy loses nothing, so
+                # the backup - a full download of the old file - is skipped.
+                # Re-deploys are mostly unchanged files; this is where the
+                # bulk of their time used to go.
+                return
             backup, size, note = self._history.keep_remote_copy(
                 fs, item.remote, size=existing.size
             )
@@ -578,16 +644,40 @@ class TransferPool:
             target = item.local
         if note:
             item.note = note
-        self._history.record(
-            make_entry(
-                action,
-                profile_id=self._profile_id,
-                profile_label=self._profile_label,
-                target=target,
-                backup=backup,
-                size=size,
-                note=note,
+        try:
+            self._history.record(
+                make_entry(
+                    action,
+                    profile_id=self._profile_id,
+                    profile_label=self._profile_label,
+                    target=target,
+                    backup=backup,
+                    size=size,
+                    note=note,
+                )
             )
+        except OSError as exc:
+            # The journal is bookkeeping about the transfer; failing to write
+            # it must not fail the transfer itself.
+            item.note = f"backup kept but not journalled ({exc})"
+
+    @staticmethod
+    def _unchanged(local: str, existing) -> bool:
+        """Whether the server copy already matches the file about to go up.
+
+        Uploads carry the local timestamp over (see _preserve_mtime), so same
+        size and same mtime means the last upload of this very file - the two
+        seconds of slack absorb filesystems that round timestamps.
+        """
+        try:
+            result = os.stat(local)
+        except OSError:
+            return False
+        if existing.modified is None:
+            return False
+        return (
+            result.st_size == existing.size
+            and abs(result.st_mtime - existing.modified) <= 2.0
         )
 
     def _do_upload(self, fs: RemoteFS, item: TransferItem) -> None:

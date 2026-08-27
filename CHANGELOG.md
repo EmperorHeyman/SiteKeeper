@@ -6,6 +6,211 @@ All notable changes to Sitekeeper are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-08-27
+
+### Fixed
+- **The installer no longer starts a Sitekeeper that cannot see your network
+  drives.** Installing needs administrator rights, and *Launch Sitekeeper* on
+  the last page started the app from the installer itself - so it inherited
+  that elevated token. Windows maps network drives per logon session and
+  hides them from elevated programs, so the app came up blind to `Z:`, `Y:`
+  and every other mapped share while Explorer still showed them, which reads
+  exactly like the app breaking. The finish page now launches through
+  Explorer, which runs as you, so the app starts with your own token like a
+  Start-menu click does. Anything installed before this: close it and start
+  it from the Start menu.
+- **And if it happens anyway, the app says so.** Started as administrator by
+  hand, the status bar says up front that Windows is hiding mapped drives
+  from it, and a folder that cannot be reached for that reason explains it
+  instead of reporting a bare "is not a directory" - naming the two ways out
+  (start it normally, or use the `\\server\share` path, which works either
+  way).
+
+## [1.5.1] - 2026-08-27
+
+### Fixed
+- **Pushing a commit from the offer no longer crashes.** The handler still
+  referred to a variable that had moved into a helper during 1.5.0's
+  refactor, so accepting the offer raised `NameError` the moment the commit
+  had anything to upload - which is every time it is worth accepting. The
+  ignore rules are now read once and passed where they are needed, and the
+  package is linted for undefined names so this class of mistake cannot ship
+  again.
+- **A dismissed commit offer is no longer lost.** The commit and what it
+  touched are remembered, so *Sync ▸ Push the last commit* pushes it however
+  long afterwards - previously, once the prompt was gone (or had crashed),
+  that commit could not be deployed without a full folder sync.
+
+### Changed
+- **The commit offer is a strip above the panes, not a modal dialog.** A
+  commit is noticed in the background, and background news must not seize the
+  window mid-keystroke and demand an answer before anything else can happen.
+  The offer now appears as a dismissible bar with *Push*, *Push every commit*
+  and a *Don't ask again* box; browsing, transfers and everything else carry
+  on around it, and the hovering tooltip lists the files it would send.
+- **The production warning can switch itself off, per connection.** Deploying
+  to the same live site all day meant answering the same question dozens of
+  times, and a prompt answered by reflex has stopped being a safeguard. The
+  warning now carries *Don't ask again for this connection*; other production
+  connections keep asking, and turning *Ask before anything destructive on
+  production* off and on again in Settings restores it everywhere.
+
+## [1.5.0] - 2026-08-26
+
+### Fixed
+- **A commit-triggered sync sends the commit, not the site.** It used to
+  re-scan the whole tree against the server on every commit - minutes on a
+  large site, and its removal pass kept tripping over files that only ever
+  existed on the server (logs, caches, uploads). Now git itself is asked what
+  the commit changed (`git diff --name-status`), and exactly those files are
+  uploaded - and, when removals are mirrored, exactly the files the commit
+  deleted are removed. The full comparison remains the fallback when git
+  cannot answer (git not installed, an unknown parent commit), and a
+  checkout or reset that would remove more than 25 server files still asks
+  first.
+- **An expired session reconnects itself.** Idle FTP and SSH connections get
+  dropped by servers and firewalls without a word, and the first click after
+  a pause used to fail - and keep failing - until the tab was closed. Every
+  connection (navigation, transfer pool, tool channel) now notices it has
+  died, reconnects, and retries: a browse retries the listing, a queued file
+  gets one fresh attempt on a new connection, and a sync scan reopens its
+  channel.
+- **Mirrored navigation stays alive.** Mirror anchored itself at the first
+  pair of directories it ever saw and never re-anchored, so once you browsed
+  elsewhere it silently did nothing. Ticking Mirror now anchors at the pair
+  on screen, leaving the anchored tree follows you to the new pair, and a
+  matching folder that does not exist on the other side says so in the
+  status line instead of staying quiet.
+- **Sorting no longer wrecks the column layout.** Every sort click re-fitted
+  the columns to their content, collapsing whatever widths had been dragged
+  out. Columns now hold their widths; the name column takes the remaining
+  space.
+
+### Changed
+- **The palette is graphite now.** Every grey is a true neutral - the old
+  panels had a blue cast - and the blue accent is gone entirely: focus,
+  selection and primary actions read as brightness (light graphite on dark,
+  dark graphite on light), the way GrapheneOS does it. The only colours left
+  are the semantic ones - green, amber, red - plus a muted steel for the
+  comparison marks and code-file icons, which used to borrow the accent.
+- **Listings sort by modified time, newest first, by default.** On a live
+  site "what changed?" is the question a listing answers; click a header for
+  any other order, as before.
+- **SFTP transfers are much faster on real latency**: the SSH channel window
+  is raised from Paramiko's 2 MB default to 16 MB, so the link stays full
+  instead of waiting on acknowledgements, and per-file overwrite checks cost
+  one round trip instead of two.
+- **Re-uploading an unchanged file no longer downloads it first.** The shadow
+  backup exists so an overwrite can be undone - but when the server copy has
+  the same size and timestamp as the file going up, nothing is lost by
+  skipping it, and re-deploys stop paying a full download per file.
+
+### Added
+- **Connection icons.** Every connection now carries a glyph for what it is -
+  a globe for phpMyAdmin, a database cylinder for MySQL, transfer arrows for
+  FTP, and the same arrows with a green padlock for FTPS/SFTP - in the
+  sidebar and on every tab. Painted like the rest of the app's icons, so
+  they match both themes.
+- **Tools → Connect Claude (MCP server)…** explains the Claude integration
+  inside the app: the exact `claude mcp add` command with a Copy button,
+  where to run it, and what each permission flag grants.
+- **Commits offer themselves for pushing, sync rule or not.** The repository
+  the local pane is browsing is watched even when no folder sync is set up;
+  commit there and the app asks: *Push once*, *Push every commit* (which arms
+  an on-commit sync on the spot), or *Not now* - with a "don't ask about this
+  folder again" box that is remembered. The offer names exactly what the
+  commit would upload and remove, mapped from the local pane to the remote
+  one, and folders that already have any sync rule are never nagged.
+- **Claude can drive your servers (MCP).** `python -m mysql_runner.mcp`
+  starts a Model Context Protocol server - `claude mcp add sitekeeper --
+  python -m mysql_runner.mcp` registers it - giving Claude Code and Claude
+  Desktop tools to list profiles, browse and read remote files, download,
+  upload files and folders (ignore rules honoured), and run MySQL queries
+  with mysql-client-style output. It opens the same encrypted vault the app
+  uses (Windows-sealed or keyring-cached key; `SITEKEEPER_MASTER_PASSWORD`
+  as a fallback) and is read-only by default: uploads need `--allow-write`,
+  deletions `--allow-delete`, data-changing SQL `--allow-sql-write`, and
+  none of those touch a PROD-marked profile without `--allow-production`.
+  `--profiles` restricts which connections it may use at all. See the README.
+- **The mouse's Back and Forward buttons navigate the pane under them** -
+  back through the visited-directory history (or up a folder when there is
+  none), forward again the way a browser does.
+
+## [1.4.0] - 2026-08-24
+
+### Fixed
+- **Parallel transfers no longer fail on the undo journal.** The shadow-backup
+  journal was written with a fixed temporary name and no lock, so the pool's
+  worker threads collided on it - and the collision (`Permission denied` /
+  `being used by another process` on `journal.json.tmp`) failed the transfer
+  itself. This is also why a commit-triggered sync appeared to upload only one
+  file: the rest of the batch died on the journal, not on the server. The
+  journal now takes one lock per journal file, every write goes to a uniquely
+  named temp file, and even if a write still fails it becomes a note on the
+  item instead of a failed transfer.
+- **A commit-triggered sync waits out a busy tool channel.** Folder statistics
+  on a large directory could hold the channel longer than the 20 seconds the
+  sync was willing to retry, and the sync was silently dropped. It now retries
+  for a minute.
+
+### Changed
+- **FTP transfers use 128 KB blocks** instead of ftplib's 8 KB default, in
+  both directions - the same bytes in a sixteenth of the socket calls.
+
+### Added
+- **Remote files open for editing in place.** Double-click a remote file (or
+  right-click → Edit locally): it is fetched to a scratch folder and opened
+  with whatever that file type launches, and from then on every save is
+  noticed and uploaded straight back - the download-edit-reupload-delete loop,
+  removed. Saves are pushed only once their timestamp holds still, so an
+  editor mid-write is never caught half-saved; a file over 20 MB asks first,
+  and on a production connection the one question up front covers the saves
+  that follow. Double-clicking a *local* file simply opens it, as Explorer
+  would.
+- **Type-to-filter in both panes** (Ctrl+F): show only names containing what
+  you typed, Esc clears, and the filter resets when you change directory.
+- **Failed transfers can be retried** - a "Retry failed" button appears in the
+  queue whenever something has failed, and single rows retry from their
+  right-click menu. Starting a new transfer no longer forgets failures, so
+  they stay retryable until cleared.
+- **The standard file-manager keys work**: F2 renames, F7 makes a folder, and
+  Delete deletes - handled inside the listing itself, so pressing Delete
+  while typing in a filter or path box can never mean "delete files".
+- **Each pane counts itself**: "3 folder(s), 24 file(s)" beside the title,
+  turning into "5 selected — 1.2 MB" while anything is selected.
+- **A Sync activity window** (Sync menu → Sync activity…) answers the two
+  questions a background sync leaves hanging: did it see my commit, and did
+  everything actually go up? Every commit and save a watcher notices becomes
+  an entry - the commit's branch, hash and subject line - with the files the
+  comparison decided to send underneath, each one tracking its upload live:
+  queued, uploading, uploaded, or failed with the reason. Removals, "already
+  in step", "waiting for the connection" and the production guard all leave
+  their trace too. Events are logged whether or not the window is open, so
+  opening it after the fact still shows the whole session.
+- **The transfer queue groups each run into a timestamped batch.** A new
+  transfer folds the previous batches up into their headline -
+  "14:32:05 — 7 file(s)" with "7/7 done" or "1 failed" alongside - so an
+  afternoon of deploys stays one screen tall while every failure is still one
+  click away. The pool also forgets its finished items when a new run starts,
+  so the counters speak about the work at hand; old batches with nothing
+  unfinished are dropped once enough newer ones exist.
+- **The queue panel is now yours to shape**: its columns can be dragged into
+  a different order and resized, and the panel itself sits on a splitter, so
+  its height can be dragged down to a sliver instead of being fixed.
+- **The path bar is now clickable breadcrumbs.** Each folder in the path is a
+  button that jumps back to it; clicking the empty space to the right turns
+  the bar back into the familiar line edit for typing or pasting (Enter
+  navigates, Escape cancels). Very deep paths collapse their middle into a
+  "…" menu.
+- **Folder and file icons in both panes.** Painted like the navigation
+  glyphs, so remote files - which have no real path for Windows to supply an
+  icon for - look exactly like local ones: amber folders, and pages tinted by
+  type (code, image, archive). Folders lost their `[brackets]`; the icon says
+  it now.
+- **Listings sort by any column.** Click Name, Size, Modified or Mode to
+  sort, click again to reverse; folders stay above files and ".." stays on
+  top either way.
+
 ## [1.3.0] - 2026-08-24
 
 ### Changed

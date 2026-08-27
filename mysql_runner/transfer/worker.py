@@ -127,6 +127,8 @@ class TransferWorker(QObject):
     queue_item = pyqtSignal(object)
     #: Queue totals, for the panel header.
     queue_stats = pyqtSignal(object)
+    #: A remote file fetched for local editing is ready: (local, remote).
+    edit_ready = pyqtSignal(str, str)
     #: A tool job finished: (kind, payload).
     tool_result = pyqtSignal(str, object)
     #: A tool job failed: (kind, message).
@@ -208,24 +210,78 @@ class TransferWorker(QObject):
 
     @pyqtSlot()
     def request_home(self) -> None:
-        fs = self._fs
-        if fs is None:
+        if self._fs is None:
             self.op_failed.emit(NOT_CONNECTED)
             return
         try:
-            self.list_dir(fs.home())
+            home = self._with_session(lambda fs: fs.home())
         except TransferError as exc:
             self.op_failed.emit(str(exc))
+            return
+        self.list_dir(home)
+
+    # ----- the navigation session ------------------------------------------
+    # Idle connections get cut by servers and firewalls without a word.
+    # Without the revival below, the first click after a pause failed, every
+    # click after it failed the same way, and the only way out was closing
+    # the tab.
+    def _revive(self) -> RemoteFS:
+        """Replace a dead navigation session with a fresh one (or raise)."""
+        fs, self._fs = self._fs, None
+        if fs is not None:
+            try:
+                fs.close()
+            except Exception:
+                pass
+        spec = self._spec
+        if spec is None:
+            raise TransferError(NOT_CONNECTED)
+        self.op_done.emit("The connection was dropped - reconnecting…")
+        fresh = spec.build()
+        fresh.connect()  # a TransferError here reaches the caller as-is
+        self._fs = fresh
+        self.op_done.emit("Reconnected.")
+        return fresh
+
+    def _with_session(self, operation):
+        """Run ``operation(fs)``, reviving the session when it has died."""
+        fs = self._fs
+        if fs is None:
+            raise TransferError(NOT_CONNECTED)
+        try:
+            return operation(fs)
+        except TransferError:
+            if self._spec is None or fs.alive():
+                raise  # the session is fine; the operation itself was refused
+            return operation(self._revive())
+
+    def _ensure_session(self) -> RemoteFS | None:
+        """The navigation session, probed and revived before a queue starts.
+
+        Queue starts walk trees and create directories on this connection
+        before the pool takes over, so a dead session must be noticed now,
+        not as a wall of failures afterwards. One NOOP per batch is cheap.
+        """
+        fs = self._fs
+        if fs is None or self._spec is None or fs.alive():
+            return fs
+        try:
+            return self._revive()
+        except TransferError as exc:
+            self.op_failed.emit(str(exc))
+            return None
+        except Exception as exc:
+            self.op_failed.emit(str(exc) or exc.__class__.__name__)
+            return None
 
     # ----- operations -----------------------------------------------------
     @pyqtSlot(str)
     def list_dir(self, path: str) -> None:
-        fs = self._fs
-        if fs is None:
+        if self._fs is None:
             self.op_failed.emit(NOT_CONNECTED)
             return
         try:
-            entries = fs.listdir(path)
+            entries = self._with_session(lambda fs: fs.listdir(path))
         except TransferError as exc:
             self.op_failed.emit(str(exc))
             return
@@ -239,7 +295,7 @@ class TransferWorker(QObject):
             self.op_failed.emit(NOT_CONNECTED)
             return
         try:
-            fs.mkdir(path)
+            self._with_session(lambda fs: fs.mkdir(path))
         except TransferError as exc:
             self.op_failed.emit(str(exc))
             return
@@ -254,9 +310,9 @@ class TransferWorker(QObject):
             return
         try:
             if is_dir:
-                self._delete_tree(fs, path)
+                self._with_session(lambda fs: self._delete_tree(fs, path))
             else:
-                fs.remove(path)
+                self._with_session(lambda fs: fs.remove(path))
         except TransferError as exc:
             self.op_failed.emit(str(exc))
             return
@@ -290,7 +346,7 @@ class TransferWorker(QObject):
             self.op_failed.emit(NOT_CONNECTED)
             return
         try:
-            fs.rename(source, target)
+            self._with_session(lambda fs: fs.rename(source, target))
         except TransferError as exc:
             self.op_failed.emit(str(exc))
             return
@@ -385,6 +441,26 @@ class TransferWorker(QObject):
             return
         self.tool_result.emit("exec", result)
 
+    @pyqtSlot(str, str)
+    def fetch_for_edit(self, remote: str, local: str) -> None:
+        """Download one file so it can be edited locally.
+
+        Runs on the navigation connection - an edit begins from a click in the
+        listing, so the pane is idle at that moment anyway - and the tab keeps
+        watching the local copy afterwards to upload each save.
+        """
+        fs = self._fs
+        if fs is None:
+            self.op_failed.emit(NOT_CONNECTED)
+            return
+        try:
+            os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+            self._with_session(lambda fs: fs.download(remote, local))
+        except (TransferError, OSError) as exc:
+            self.op_failed.emit(f"{fs.basename(remote)}: {exc}")
+            return
+        self.edit_ready.emit(local, remote)
+
     @pyqtSlot(str)
     def request_undo(self, entry_id: str) -> None:
         if self._history is None:
@@ -459,7 +535,7 @@ class TransferWorker(QObject):
         by an IgnoreRules instance. Directories are walked here, on the
         navigation connection, because listing them needs a live session.
         """
-        fs = self._fs
+        fs = self._ensure_session()
         pool = self._ensure_pool()
         if fs is None or pool is None:
             self._fail_queue()
@@ -484,7 +560,41 @@ class TransferWorker(QObject):
     @pyqtSlot(object, str)
     def run_upload(self, items: object, remote_dir: str) -> None:
         """Upload files and folders into ``remote_dir``."""
-        fs = self._fs
+        fs = self._ensure_session()
+        pool = self._ensure_pool()
+        if fs is None or pool is None:
+            self._fail_queue()
+            return
+        sources, rules = _split_items(items)
+        self._cancelled = False
+        jobs, directories, skipped = expand_local(fs, sources, remote_dir, rules=rules)
+        if remote_dir and remote_dir != self._last_listing:
+            # A sync can aim single files at a directory that does not exist
+            # yet (a commit that adds a new folder); the directory on show
+            # obviously exists, so it is not paid for.
+            try:
+                fs.makedirs(remote_dir)
+            except TransferError:
+                pass  # a real problem surfaces when the first file lands
+        for path in directories:
+            try:
+                fs.mkdir(path)
+            except TransferError:
+                # Almost always "already exists", which is fine here. A real
+                # permission problem surfaces when the first file lands.
+                pass
+        self._last_listing = remote_dir
+        self._start_queue(pool, jobs, skipped)
+
+    @pyqtSlot(object, str)
+    def upload_quietly(self, items: object, remote_dir: str) -> None:
+        """Upload without adopting ``remote_dir`` as the directory on show.
+
+        Edit-in-place saves land wherever the edited file lives, which is not
+        necessarily where the user is browsing - the refresh after the queue
+        drains must not yank the remote pane over there.
+        """
+        fs = self._ensure_session()
         pool = self._ensure_pool()
         if fs is None or pool is None:
             self._fail_queue()
@@ -496,10 +606,7 @@ class TransferWorker(QObject):
             try:
                 fs.mkdir(path)
             except TransferError:
-                # Almost always "already exists", which is fine here. A real
-                # permission problem surfaces when the first file lands.
                 pass
-        self._last_listing = remote_dir
         self._start_queue(pool, jobs, skipped)
 
     def _start_queue(
@@ -520,6 +627,11 @@ class TransferWorker(QObject):
         if not jobs:
             self.queue_finished.emit(0, 0, False)
             return
+        # A new run starts from a clean slate: what the last one finished stays
+        # visible in the panel's history, but the pool - and so the counters -
+        # should speak about the work at hand, not everything since connecting.
+        # Failures stay, so "Retry failed" still has something to retry.
+        pool.clear_finished(keep_failed=True)
         pool.submit(jobs)
         self.queue_stats.emit(pool.stats())
 
@@ -560,6 +672,22 @@ class TransferWorker(QObject):
             self._pool.clear_finished()
             self.queue_stats.emit(self._pool.stats())
 
+    @pyqtSlot()
+    def retry_failed(self) -> None:
+        if self._pool is None:
+            return
+        count = self._pool.retry_failed()
+        if count:
+            self._queue_totals[0] += count
+            self.op_done.emit(f"Retrying {count} failed transfer(s).")
+            self.queue_stats.emit(self._pool.stats())
+
+    @pyqtSlot(str)
+    def retry_item(self, item_id: str) -> None:
+        if self._pool is not None and self._pool.retry(item_id):
+            self._queue_totals[0] += 1
+            self.queue_stats.emit(self._pool.stats())
+
     @pyqtSlot(int)
     def set_workers(self, count: int) -> None:
         self._options.workers = max(1, count)
@@ -577,10 +705,20 @@ class TransferWorker(QObject):
 
     # ----- tool jobs (their own connection, their own thread) -------------
     def _tool_connection(self) -> RemoteFS:
-        """The read-only connection the slow jobs use."""
+        """The read-only connection the slow jobs use.
+
+        It sits idle between jobs, which is exactly how connections get
+        dropped - so it is probed before being trusted and reopened when dead.
+        """
         with self._tool_lock:
             if self._tool_fs is not None:
-                return self._tool_fs
+                if self._tool_fs.alive():
+                    return self._tool_fs
+                try:
+                    self._tool_fs.close()
+                except Exception:
+                    pass
+                self._tool_fs = None
             spec = self._spec
             if spec is None:
                 raise TransferError(NOT_CONNECTED)
@@ -735,7 +873,7 @@ class TransferWorker(QObject):
         """
         if not isinstance(paths, list) or not paths:
             return
-        fs = self._fs
+        fs = self._ensure_session()
         if fs is None:
             self.op_failed.emit(NOT_CONNECTED)
             return

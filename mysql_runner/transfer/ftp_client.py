@@ -29,8 +29,10 @@ from mysql_runner.transfer.base import (
 #: Socket timeout for control-connection commands, in seconds.
 TIMEOUT = 20
 
-#: Read size for streaming downloads.
-CHUNK = 64 * 1024
+#: Block size for transfers in both directions. ftplib's default is 8 KB,
+#: which costs a socket call per 8 KB and made every transfer feel slow;
+#: 128 KB moves the same bytes in a fraction of the calls.
+CHUNK = 128 * 1024
 
 
 class FTPFileSystem(RemoteFS):
@@ -90,6 +92,16 @@ class FTPFileSystem(RemoteFS):
         if self._ftp is None:
             raise TransferError("Not connected.")
         return self._ftp
+
+    def alive(self) -> bool:
+        """NOOP is the protocol's own "are you still there?"."""
+        if self._ftp is None:
+            return False
+        try:
+            self._ftp.voidcmd("NOOP")
+        except Exception:
+            return False
+        return True
 
     # ----- capabilities ---------------------------------------------------
     def capabilities(self) -> frozenset[Capability]:
@@ -281,7 +293,7 @@ class FTPFileSystem(RemoteFS):
                     if progress is not None:
                         progress(transferred, total)
 
-                ftp.retrbinary(f"RETR {remote}", write)
+                ftp.retrbinary(f"RETR {remote}", write, blocksize=CHUNK)
         except ftplib.all_errors as exc:
             # Leave no half-written file behind.
             try:
@@ -308,7 +320,7 @@ class FTPFileSystem(RemoteFS):
 
         try:
             with open(local, "rb") as handle:
-                ftp.storbinary(f"STOR {remote}", handle, callback=sent)
+                ftp.storbinary(f"STOR {remote}", handle, blocksize=CHUNK, callback=sent)
         except ftplib.all_errors as exc:
             raise TransferError(_describe(exc)) from exc
 

@@ -215,6 +215,39 @@ to have the key sealed to your Windows account instead. Then:
 
 ---
 
+## Letting Claude use your servers (MCP)
+
+Sitekeeper ships an [MCP](https://modelcontextprotocol.io/) server, so Claude Code and
+Claude Desktop can browse, deploy to and query the same servers the app manages -
+against the same encrypted vault, with nothing re-configured. Register it once:
+
+```powershell
+cd mysql-runner
+claude mcp add sitekeeper -- python -m mysql_runner.mcp --allow-write
+```
+
+Claude then gets tools to list your profiles, read and list remote files, download,
+upload files and folders (`.deployignore`/`.gitignore` are honoured), and run MySQL
+queries with `mysql`-client-style output.
+
+**Everything is read-only until a flag grants more:**
+
+| Flag | Grants |
+| --- | --- |
+| *(none)* | listings, file reads, downloads, `SELECT`-style SQL |
+| `--allow-write` | uploads and creating remote directories |
+| `--allow-delete` | deleting remote files and directories |
+| `--allow-sql-write` | SQL that changes data |
+| `--allow-production` | lets the flags above touch profiles marked **PROD** |
+| `--profiles "A,B"` | restricts the server to the named profiles |
+
+The vault unlocks the way the app does: a password-free vault opens via Windows data
+protection, a password vault via the key cached at your last unlock (or the
+`SITEKEEPER_MASTER_PASSWORD` environment variable as a last resort). Credentials are
+never exposed through the tools.
+
+---
+
 ## Building a standalone `.exe`
 
 A [PyInstaller](https://pyinstaller.org/) spec is included that bundles the Qt WebEngine
@@ -253,7 +286,7 @@ installer once ended up wrapping a 1.1.0 exe.
 ```powershell
 .\build_release.ps1                  # -> dist_onefile_upx\Sitekeeper.exe + release\*.zip
 powershell -ExecutionPolicy Bypass -File installer\build.ps1
-                                     # -> installer\Sitekeeper-1.3.0-Setup.exe
+                                     # -> installer\Sitekeeper-1.5.2-Setup.exe
 ```
 
 It builds from the virtual environment at `%USERPROFILE%\.venvs\mysqlrunner`, which needs

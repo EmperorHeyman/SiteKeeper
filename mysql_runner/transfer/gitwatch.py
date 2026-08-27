@@ -116,6 +116,51 @@ def _looks_like_sha(text: str) -> bool:
     return len(text) >= 7 and all(char in "0123456789abcdef" for char in text.lower())
 
 
+def commit_changes(
+    repo_root: str, old: str, new: str
+) -> list[tuple[str, str]] | None:
+    """What one move of HEAD changed: (status, repo-relative path) pairs.
+
+    Watching never shells out, but *diffing* two commits has no sane
+    re-implementation, so this asks git itself - quietly, and with None as
+    the answer whenever git is missing, either commit is unknown, or the
+    command fails. Callers treat None as "compare everything instead".
+
+    Statuses are git's single letters: A(dded), M(odified), D(eleted),
+    T(ypechange). Renames are disabled so a rename arrives as its D and A.
+    """
+    if not repo_root or not old or not new:
+        return None
+    if not (_looks_like_sha(old) and _looks_like_sha(new)):
+        return None
+    import subprocess
+
+    creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", repo_root,
+                "diff", "--name-status", "--no-renames", "-z", old, new,
+            ],
+            capture_output=True,
+            timeout=30,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    tokens = result.stdout.decode("utf-8", errors="replace").split("\0")
+    changes: list[tuple[str, str]] = []
+    index = 0
+    while index + 1 < len(tokens):
+        status, path = tokens[index].strip(), tokens[index + 1]
+        index += 2
+        if status and path:
+            changes.append((status[0].upper(), path))
+    return changes
+
+
 def reflog_detail(gdir: str, commit: str) -> str:
     """What the reflog says about the move to ``commit`` ("commit: fix login").
 

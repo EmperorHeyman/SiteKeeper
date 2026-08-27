@@ -207,6 +207,16 @@ class SettingsDialog(QDialog):
         self._verify.setChecked(settings.verify_uploads)
         self._guard = QCheckBox("Ask before anything destructive on production")
         self._guard.setChecked(settings.production_guard)
+        silenced = len(settings.production_guard_off)
+        self._guard.setToolTip(
+            "Each warning can also be switched off for its own connection. "
+            + (
+                f"{silenced} connection(s) have done that; turning this off "
+                "and on again asks everywhere once more."
+                if silenced
+                else "None have done that so far."
+            )
+        )
         self._history_days = QSpinBox()
         self._history_days.setRange(0, 365)
         self._history_days.setValue(settings.history_days)

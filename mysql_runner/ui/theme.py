@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import QFrame, QSizePolicy, QWidget
 
@@ -50,44 +50,49 @@ class Palette:
     scrollbar: str
 
 
+# Graphite, both of them: every grey is a true neutral (equal RGB channels,
+# no blue cast) and the accent is monochrome - a light graphite in the dark
+# theme, a dark one in the light theme. Focus, selection and primary actions
+# read as brightness, not as a colour; the only colours left are the
+# semantic ones (green/amber/red) and they mean something every time.
 DARK = Palette(
-    bg="#0f1216",
-    panel="#14181e",
-    panel_alt="#1a1f27",
-    card="#1e242d",
-    border="#2b3240",
-    border_soft="#232935",
-    text="#e3e8ef",
-    text_dim="#9aa4b2",
-    text_faint="#6b7480",
-    accent="#4a9eff",
-    accent_soft="#1b2a3d",
-    accent_text="#ffffff",
-    selection="#24405f",
+    bg="#0e0e0f",
+    panel="#141415",
+    panel_alt="#1a1a1c",
+    card="#202023",
+    border="#333338",
+    border_soft="#28282c",
+    text="#e6e6e8",
+    text_dim="#a2a2a8",
+    text_faint="#6e6e74",
+    accent="#c9c9ce",
+    accent_soft="#2a2a2e",
+    accent_text="#141415",
+    selection="#36363c",
     green="#3ecf8e",
     amber="#f0a83c",
     red="#e5484d",
-    scrollbar="#39414f",
+    scrollbar="#3d3d42",
 )
 
 LIGHT = Palette(
-    bg="#f4f5f7",
+    bg="#f4f4f5",
     panel="#ffffff",
-    panel_alt="#f7f8fa",
+    panel_alt="#f7f7f8",
     card="#ffffff",
-    border="#d3d8e0",
-    border_soft="#e4e8ee",
-    text="#1c2028",
-    text_dim="#5b6472",
-    text_faint="#8a929e",
-    accent="#1f6feb",
-    accent_soft="#e8f0fe",
+    border="#d6d6d9",
+    border_soft="#e6e6e9",
+    text="#1b1b1d",
+    text_dim="#5f5f66",
+    text_faint="#8f8f96",
+    accent="#3a3a3f",
+    accent_soft="#e9e9eb",
     accent_text="#ffffff",
-    selection="#cfe1fb",
+    selection="#dddde0",
     green="#1a7f4b",
     amber="#a15c00",
     red="#c62828",
-    scrollbar="#c3c9d2",
+    scrollbar="#c6c6cb",
 )
 
 
@@ -178,6 +183,233 @@ def _paint_refresh(painter: "QPainter", box, colour: QColor, scale: int) -> None
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(colour)
     painter.drawPath(head)
+
+
+#: Painted listing icons are cached: a directory of a thousand rows must not
+#: paint a thousand pixmaps.
+_entry_icon_cache: dict[tuple[str, bool, int], QIcon] = {}
+
+
+def entry_icon(kind: str, dark: bool, *, size: int = 16) -> QIcon:
+    """A listing glyph: a folder, or a file tinted by what kind of file it is.
+
+    Painted for the same reason as :func:`nav_icon` - and because remote
+    entries have no real path on disk for the native icon provider to look at,
+    so painting is also what keeps the two panes looking the same.
+
+    Kinds: ``folder``, ``file``, ``file-code``, ``file-image``,
+    ``file-archive``.
+    """
+    key = (kind, dark, size)
+    cached = _entry_icon_cache.get(key)
+    if cached is not None:
+        return cached
+    c = palette(dark)
+    scale = 2  # draw at 2x so the edges stay crisp when scaled down
+    pixmap = QPixmap(size * scale, size * scale)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    box = QRectF(pixmap.rect().adjusted(scale, scale * 2, -scale, -scale * 2))
+    if kind == "folder":
+        _paint_folder(painter, box, QColor(c.amber))
+    else:
+        tint = {
+            # Steel rather than the accent: the accent is a grey now, and
+            # code files deserve to stand out from plain ones.
+            "file-code": "#7f9db8" if dark else "#4a6d8c",
+            "file-image": c.green,
+            "file-archive": c.amber,
+        }.get(kind, c.text_faint)
+        _paint_file(painter, box, QColor(c.text_dim), QColor(tint), scale)
+    painter.end()
+    icon = QIcon(pixmap)
+    _entry_icon_cache[key] = icon
+    return icon
+
+
+def _paint_folder(painter: "QPainter", box: QRectF, colour: QColor) -> None:
+    """A filled folder: the tab on top of the body, drawn as one shape."""
+    radius = box.height() * 0.14
+    tab = QRectF(box.left(), box.top(), box.width() * 0.44, box.height() * 0.40)
+    body = QRectF(
+        box.left(), box.top() + box.height() * 0.18,
+        box.width(), box.height() * 0.82,
+    )
+    shape = QPainterPath()
+    shape.addRoundedRect(tab, radius, radius)
+    shape.addRoundedRect(body, radius, radius)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(colour)
+    painter.drawPath(shape.simplified())
+
+
+def _paint_file(
+    painter: "QPainter", box: QRectF, outline: QColor, tint: QColor, scale: int
+) -> None:
+    """A page with a folded corner and two content lines in the type's tint."""
+    inset = box.width() * 0.12  # pages are taller than wide
+    left, right = box.left() + inset, box.right() - inset
+    fold = (right - left) * 0.38
+    page = QPainterPath()
+    page.moveTo(left, box.top())
+    page.lineTo(right - fold, box.top())
+    page.lineTo(right, box.top() + fold)
+    page.lineTo(right, box.bottom())
+    page.lineTo(left, box.bottom())
+    page.closeSubpath()
+    pen = QPen(outline)
+    pen.setWidthF(1.3 * scale)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(page)
+    painter.drawLine(
+        QPointF(right - fold, box.top()), QPointF(right - fold, box.top() + fold)
+    )
+    painter.drawLine(
+        QPointF(right - fold, box.top() + fold), QPointF(right, box.top() + fold)
+    )
+    lines = QPen(tint)
+    lines.setWidthF(1.6 * scale)
+    lines.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(lines)
+    text_left = left + (right - left) * 0.22
+    text_right = right - (right - left) * 0.22
+    for fraction in (0.58, 0.78):
+        y = box.top() + box.height() * fraction
+        painter.drawLine(QPointF(text_left, y), QPointF(text_right, y))
+
+
+#: Connection-kind glyphs are cached like the listing icons.
+_kind_icon_cache: dict[tuple[str, bool, int], QIcon] = {}
+
+
+def kind_icon(kind: str, dark: bool, *, size: int = 16) -> QIcon:
+    """The glyph for one connection kind, painted like every other icon.
+
+    ``phpmyadmin`` is a globe (it is a website), ``mysql`` a database
+    cylinder, ``ftp`` a pair of transfer arrows, and ``ftps``/``sftp`` the
+    same arrows carrying a green padlock - encryption being the difference
+    worth seeing at a glance.
+    """
+    key = (kind, dark, size)
+    cached = _kind_icon_cache.get(key)
+    if cached is not None:
+        return cached
+    c = palette(dark)
+    scale = 2  # draw at 2x so the edges stay crisp when scaled down
+    pixmap = QPixmap(size * scale, size * scale)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    box = QRectF(pixmap.rect().adjusted(scale * 2, scale * 2, -scale * 2, -scale * 2))
+    colour = QColor(c.text_dim)
+    if kind == "phpmyadmin":
+        _paint_globe(painter, box, colour, scale)
+    elif kind == "mysql":
+        _paint_database(painter, box, colour, scale)
+    else:
+        _paint_transfer(
+            painter, box, colour, scale,
+            lock=QColor(c.green) if kind in ("ftps", "sftp") else None,
+        )
+    painter.end()
+    icon = QIcon(pixmap)
+    _kind_icon_cache[key] = icon
+    return icon
+
+
+def _paint_globe(painter: "QPainter", box: QRectF, colour: QColor, scale: int) -> None:
+    """A globe: the circle, the equator, and one vertical meridian."""
+    pen = QPen(colour)
+    pen.setWidthF(1.5 * scale)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(box)
+    middle_y = box.center().y()
+    painter.drawLine(QPointF(box.left(), middle_y), QPointF(box.right(), middle_y))
+    meridian = QRectF(
+        box.center().x() - box.width() * 0.19, box.top(),
+        box.width() * 0.38, box.height(),
+    )
+    painter.drawEllipse(meridian)
+
+
+def _paint_database(painter: "QPainter", box: QRectF, colour: QColor, scale: int) -> None:
+    """A database cylinder: top ellipse, sides, and two belly arcs."""
+    pen = QPen(colour)
+    pen.setWidthF(1.5 * scale)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    lid_height = box.height() * 0.30
+    inset = box.width() * 0.08
+    left, right = box.left() + inset, box.right() - inset
+    lid = QRectF(left, box.top(), right - left, lid_height)
+    painter.drawEllipse(lid)
+    bottom_arc = QRectF(left, box.bottom() - lid_height, right - left, lid_height)
+    painter.drawLine(QPointF(left, lid.center().y()),
+                     QPointF(left, bottom_arc.center().y()))
+    painter.drawLine(QPointF(right, lid.center().y()),
+                     QPointF(right, bottom_arc.center().y()))
+    # Belly and base arcs: the lower half of an ellipse each.
+    middle_arc = QRectF(left, box.center().y() - lid_height * 0.75,
+                        right - left, lid_height)
+    for rect in (middle_arc, bottom_arc):
+        painter.drawArc(rect, 180 * 16, 180 * 16)
+
+
+def _paint_transfer(
+    painter: "QPainter", box: QRectF, colour: QColor, scale: int,
+    *, lock: QColor | None = None,
+) -> None:
+    """Two arrows passing each other: up on the left, down on the right."""
+    pen = QPen(colour)
+    pen.setWidthF(1.8 * scale)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    head = box.width() * 0.17
+    up_x = box.left() + box.width() * 0.30
+    down_x = box.left() + box.width() * 0.70
+    top, bottom = box.top(), box.bottom()
+    painter.drawLine(QPointF(up_x, bottom), QPointF(up_x, top))
+    painter.drawLine(QPointF(up_x - head, top + head), QPointF(up_x, top))
+    painter.drawLine(QPointF(up_x + head, top + head), QPointF(up_x, top))
+    painter.drawLine(QPointF(down_x, top), QPointF(down_x, bottom))
+    painter.drawLine(QPointF(down_x - head, bottom - head), QPointF(down_x, bottom))
+    painter.drawLine(QPointF(down_x + head, bottom - head), QPointF(down_x, bottom))
+    if lock is None:
+        return
+    # A small padlock badges the lower-right corner on the encrypted kinds.
+    # A transparent knockout is punched behind it first, so the badge sits
+    # cleanly on the arrows whatever the background.
+    body_w = box.width() * 0.52
+    body_h = box.height() * 0.38
+    body = QRectF(box.right() - body_w, box.bottom() - body_h, body_w, body_h)
+    shackle = QRectF(
+        body.center().x() - body_w * 0.28, body.top() - body_h * 0.55,
+        body_w * 0.56, body_h * 0.80,
+    )
+    pad = 1.6 * scale
+    knockout = body.united(shackle).adjusted(-pad, -pad, pad, pad)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(0, 0, 0))
+    painter.drawRoundedRect(knockout, pad * 2, pad * 2)
+    painter.setCompositionMode(
+        QPainter.CompositionMode.CompositionMode_SourceOver
+    )
+    pen = QPen(lock)
+    pen.setWidthF(1.6 * scale)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawArc(shackle, 0, 180 * 16)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(lock)
+    radius = body_h * 0.25
+    painter.drawRoundedRect(body, radius, radius)
 
 
 def app_stylesheet(dark: bool) -> str:
@@ -529,6 +761,32 @@ QLineEdit {{
     padding: 4px 7px;
 }}
 QLineEdit:focus {{ border-color: {c.accent}; }}
+QWidget#notice {{
+    background: {c.card};
+    border: 1px solid {c.border};
+    border-left: 3px solid {c.amber};
+    border-radius: 8px;
+}}
+QWidget#notice QLabel {{ background: transparent; color: {c.text}; }}
+QWidget#notice QCheckBox {{ background: transparent; color: {c.text_dim}; }}
+QWidget#pathbar {{
+    background: {c.panel_alt};
+    border: 1px solid {c.border};
+    border-radius: 7px;
+}}
+QWidget#pathbar QToolButton {{
+    background: transparent;
+    color: {c.text};
+    border: 0;
+    border-radius: 5px;
+    padding: 2px 5px;
+}}
+QWidget#pathbar QToolButton:hover {{ background: {c.card}; color: {c.accent}; }}
+QWidget#pathbar QLabel {{
+    background: transparent;
+    color: {c.text_faint};
+    padding: 0 1px;
+}}
 """
 
 
@@ -538,7 +796,10 @@ def diff_colours(dark: bool) -> dict[str, str]:
     return {
         "same": c.green,
         "different": c.amber,
-        "local_only": c.accent,
+        # Deliberately not the accent: since the palette went monochrome the
+        # accent is a grey, and a grey verdict mark would vanish among the
+        # text. A muted steel stays legible without shouting.
+        "local_only": "#7f9db8" if dark else "#4a6d8c",
         "remote_only": "#a06bd0" if dark else "#75507b",
         "unknown": c.text_faint,
     }

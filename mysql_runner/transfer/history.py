@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -33,6 +34,22 @@ MAX_AGE_DAYS = 30
 #: Files bigger than this are journalled but not copied - the backup would cost
 #: more than it is worth. The entry records that, so the UI can say so.
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
+
+#: One lock per journal file, shared by every store in this process. The
+#: transfer pool records from several worker threads at once - and every open
+#: tab has its own store pointing at the same journal - so unguarded writes
+#: collided on the temp file and surfaced as failed transfers.
+_journal_locks: dict[str, threading.RLock] = {}
+_journal_locks_guard = threading.Lock()
+
+
+def _lock_for(journal: str) -> threading.RLock:
+    key = os.path.normcase(os.path.abspath(journal))
+    with _journal_locks_guard:
+        lock = _journal_locks.get(key)
+        if lock is None:
+            lock = _journal_locks[key] = threading.RLock()
+        return lock
 
 
 class Action(str, Enum):
@@ -111,6 +128,7 @@ class HistoryStore:
         self._journal = os.path.join(self._root, "journal.json")
         self._entries: list[HistoryEntry] = []
         self._loaded = False
+        self._lock = _lock_for(self._journal)
 
     # ----- persistence ----------------------------------------------------
     @property
@@ -118,35 +136,55 @@ class HistoryStore:
         return self._root
 
     def load(self) -> list[HistoryEntry]:
-        if self._loaded:
+        with self._lock:
+            if self._loaded:
+                return self._entries
+            self._loaded = True
+            try:
+                raw = json.loads(open(self._journal, encoding="utf-8").read())
+            except (OSError, ValueError):
+                self._entries = []
+                return self._entries
+            if not isinstance(raw, list):
+                self._entries = []
+                return self._entries
+            entries: list[HistoryEntry] = []
+            for item in raw:
+                if isinstance(item, dict):
+                    try:
+                        entries.append(HistoryEntry.from_dict(item))
+                    except (ValueError, KeyError):
+                        continue
+            entries.sort(key=lambda e: e.when, reverse=True)
+            self._entries = entries
             return self._entries
-        self._loaded = True
-        try:
-            raw = json.loads(open(self._journal, encoding="utf-8").read())
-        except (OSError, ValueError):
-            self._entries = []
-            return self._entries
-        if not isinstance(raw, list):
-            self._entries = []
-            return self._entries
-        entries: list[HistoryEntry] = []
-        for item in raw:
-            if isinstance(item, dict):
-                try:
-                    entries.append(HistoryEntry.from_dict(item))
-                except (ValueError, KeyError):
-                    continue
-        entries.sort(key=lambda e: e.when, reverse=True)
-        self._entries = entries
-        return self._entries
+
+    def _reload(self) -> list[HistoryEntry]:
+        """Read the journal fresh, picking up what other stores wrote."""
+        with self._lock:
+            self._loaded = False
+            return self.load()
 
     def save(self) -> None:
-        os.makedirs(self._root, exist_ok=True)
-        payload = json.dumps([entry.to_dict() for entry in self._entries], indent=2)
-        temp = self._journal + ".tmp"
-        with open(temp, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        os.replace(temp, self._journal)
+        with self._lock:
+            os.makedirs(self._root, exist_ok=True)
+            payload = json.dumps(
+                [entry.to_dict() for entry in self._entries], indent=2
+            )
+            # A name of its own per write: the lock covers this process, but a
+            # fixed name would still collide with anything else holding the
+            # file open, and Windows turns that into a sharing violation.
+            temp = f"{self._journal}.{uuid.uuid4().hex[:8]}.tmp"
+            try:
+                with open(temp, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                os.replace(temp, self._journal)
+            except OSError:
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+                raise
 
     # ----- queries --------------------------------------------------------
     def entries(self, *, profile_id: str = "", limit: int = 200) -> list[HistoryEntry]:
@@ -169,11 +207,14 @@ class HistoryStore:
 
     # ----- recording ------------------------------------------------------
     def record(self, entry: HistoryEntry) -> HistoryEntry:
-        self.load()
-        self._entries.insert(0, entry)
-        self.prune(save=False)
-        self.save()
-        return entry
+        with self._lock:
+            # Re-read first: another tab's store may have recorded since this
+            # one loaded, and saving a stale list would silently drop those.
+            self._reload()
+            self._entries.insert(0, entry)
+            self.prune(save=False)
+            self.save()
+            return entry
 
     def backup_slot(self, name: str) -> str:
         """A fresh path inside the cache for one saved file."""
@@ -216,7 +257,7 @@ class HistoryStore:
     # ----- undo -----------------------------------------------------------
     def undo(self, entry_id: str, fs: RemoteFS | None = None) -> str:
         """Put one saved copy back. Returns a message for the status line."""
-        self.load()
+        self._reload()
         entry = next((item for item in self._entries if item.id == entry_id), None)
         if entry is None:
             raise TransferError("That history entry is gone.")
@@ -234,8 +275,16 @@ class HistoryStore:
         else:
             self._restore_local(entry)
             where = "locally"
-        entry.undone = True
-        self.save()
+        with self._lock:
+            # The restore ran without the lock (it can take a while); find the
+            # entry again in case a record() replaced the list meanwhile.
+            self._reload()
+            fresh = next(
+                (item for item in self._entries if item.id == entry_id), None
+            )
+            if fresh is not None:
+                fresh.undone = True
+                self.save()
         return f"Restored {entry.name} {where}."
 
     def _restore_remote(self, fs: RemoteFS, entry: HistoryEntry) -> None:
@@ -276,36 +325,38 @@ class HistoryStore:
         save: bool = True,
     ) -> int:
         """Drop entries past the retention limits. Returns how many went."""
-        self.load()
-        cutoff = time.time() - max_age_days * 86400
-        keep: list[HistoryEntry] = []
-        dropped: list[HistoryEntry] = []
-        running = 0
-        for entry in self._entries:  # newest first
-            too_old = entry.when < cutoff
-            too_many = len(keep) >= max_entries
-            running += entry.size if entry.backup else 0
-            too_big = running > max_bytes
-            if too_old or too_many or too_big:
-                dropped.append(entry)
-                continue
-            keep.append(entry)
-        for entry in dropped:
-            self._discard_backup(entry)
-        self._entries = keep
-        if dropped and save:
-            self.save()
-        return len(dropped)
+        with self._lock:
+            self.load()
+            cutoff = time.time() - max_age_days * 86400
+            keep: list[HistoryEntry] = []
+            dropped: list[HistoryEntry] = []
+            running = 0
+            for entry in self._entries:  # newest first
+                too_old = entry.when < cutoff
+                too_many = len(keep) >= max_entries
+                running += entry.size if entry.backup else 0
+                too_big = running > max_bytes
+                if too_old or too_many or too_big:
+                    dropped.append(entry)
+                    continue
+                keep.append(entry)
+            for entry in dropped:
+                self._discard_backup(entry)
+            self._entries = keep
+            if dropped and save:
+                self.save()
+            return len(dropped)
 
     def clear(self) -> int:
         """Forget everything and delete every cached copy."""
-        self.load()
-        count = len(self._entries)
-        for entry in self._entries:
-            self._discard_backup(entry)
-        self._entries = []
-        self.save()
-        return count
+        with self._lock:
+            self._reload()
+            count = len(self._entries)
+            for entry in self._entries:
+                self._discard_backup(entry)
+            self._entries = []
+            self.save()
+            return count
 
     def _discard_backup(self, entry: HistoryEntry) -> None:
         if not entry.backup:

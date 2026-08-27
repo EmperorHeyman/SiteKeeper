@@ -6,7 +6,7 @@ SetCompressor /SOLID lzma
 
 !define APP_NAME        "Sitekeeper"
 !define APP_EXE         "Sitekeeper.exe"
-!define APP_VERSION     "1.3.0"
+!define APP_VERSION     "1.5.2"
 !define APP_PUBLISHER   "RAPL Group"
 !define APP_ID          "Sitekeeper"
 !define APP_REGKEY      "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
@@ -20,7 +20,7 @@ RequestExecutionLevel admin
 ShowInstDetails show
 ShowUnInstDetails show
 
-VIProductVersion "1.3.0.0"
+VIProductVersion "1.5.2.0"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} Setup"
 VIAddVersionKey "CompanyName"     "${APP_PUBLISHER}"
@@ -36,8 +36,18 @@ VIAddVersionKey "ProductVersion"  "${APP_VERSION}.0"
 !define MUI_UNICON "payload\icon.ico"
 !define MUI_ABORTWARNING
 
-!define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
+; Launching straight from here would hand the app this installer's elevated
+; token, and Windows hides mapped network drives (Z:, Y: ...) from elevated
+; programs - the app would start blind to every network share while Explorer
+; still showed them. Going through Explorer, which runs as the logged-in user,
+; starts the app unelevated like a Start-menu click does.
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchAsUser
 !define MUI_FINISHPAGE_RUN_TEXT "Launch ${APP_NAME}"
+
+Function LaunchAsUser
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\${APP_EXE}"'
+FunctionEnd
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "LICENSE.txt"
