@@ -43,4 +43,15 @@ Write-Host "Compiling installer with $MakeNsis ..."
 if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
 
 $out = Join-Path $PSScriptRoot "Sitekeeper-$version-Setup.exe"
+
+# The repo lives on an SMB share whose create mask drops the execute bit, so a
+# setup.exe written there cannot be launched from it - "Access is denied", from
+# a file that looks perfectly normal - until it is granted read+execute. The
+# recursive icacls form reports success but the ACE does not stick; per file
+# does. build_release.ps1 does the same for the app exe it produces.
+if ($out -match '^[A-Za-z]:' -and (Get-Item $out).PSDrive.DisplayRoot) {
+    & icacls $out /grant "Everyone:(RX)" | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host "Granted RX on the installer (network share)" }
+}
+
 Write-Host "Built: $out ($([math]::Round((Get-Item $out).Length/1MB)) MB)"

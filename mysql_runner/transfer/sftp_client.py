@@ -469,9 +469,20 @@ class SFTPFileSystem(RemoteFS):
     def upload(
         self, local: str, remote: str, progress: ProgressCallback | None = None
     ) -> None:
+        """Send one file.
+
+        ``confirm=False`` deliberately: Paramiko's default follows every upload
+        with a stat to compare the size, which is a whole round trip per file
+        for something the write already reports. On a tree of small files that
+        stat was a seventh of the entire deploy - the bytes are not what such a
+        deploy spends its time on, the round trips are. A short write still
+        raises, because closing the handle reports the server's status; and
+        anyone who wants the file read back and compared has *Verify uploads*,
+        which is a real check rather than a size that matches by luck.
+        """
         sftp = self._require()
         try:
-            sftp.put(local, remote, callback=_adapt(progress))
+            sftp.put(local, remote, callback=_adapt(progress), confirm=False)
         except Exception as exc:
             raise TransferError(_describe(exc)) from exc
 

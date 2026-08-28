@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from mysql_runner.storage.models import AuthType, ServerProfile
+from mysql_runner.ui import theme
 from mysql_runner.web.autologin import (
     build_dark_mode_script,
     build_login_script,
@@ -58,6 +60,20 @@ class BrowserTab(QWidget):
 
         self._page = QWebEnginePage(self._engine_profile, self)
         self._view = QWebEngineView(self)
+        # A web view is the one widget here that needs a real window handle of
+        # its own, and Qt's default answer is to give one to every ancestor as
+        # well - which recreates them, and reads as the whole application
+        # blinking the first time a phpMyAdmin tab is opened. This keeps the
+        # handle to the view itself, where it is actually needed.
+        self._view.setAttribute(
+            Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True
+        )
+        # Chromium paints white until the page has something to show, which on
+        # a dark window is a flash of white the size of the tab. Starting it on
+        # the application's own background makes the hand-over invisible.
+        self._page.setBackgroundColor(
+            QColor(theme.palette(dark_mode).bg)
+        )
         self._view.setPage(self._page)
         layout.addWidget(self._view)
 
@@ -90,6 +106,9 @@ class BrowserTab(QWidget):
     def set_dark_mode(self, enable: bool) -> None:
         self._dark_mode = enable
         if self._page is not None:
+            # Keep the colour behind the page in step too, or the next reload
+            # flashes the old theme's background before painting.
+            self._page.setBackgroundColor(QColor(theme.palette(enable).bg))
             self._page.runJavaScript(build_dark_mode_script(enable))
 
     # ----- auth handlers -------------------------------------------------

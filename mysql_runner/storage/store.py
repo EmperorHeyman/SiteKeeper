@@ -93,6 +93,29 @@ class ServerStore:
                 return
         raise KeyError(profile.id)
 
+    def reorder(self, positions: dict[str, tuple[str, int]]) -> int:
+        """Apply a hand-made arrangement: id -> (group, position within it).
+
+        One write for the whole list rather than one per moved row, because a
+        drag can change the group and the position of everything below it in
+        two lists at once, and saving that a row at a time would leave the
+        vault briefly describing an order nobody asked for.
+        """
+        changed = 0
+        for profile in self._profiles:
+            found = positions.get(profile.id)
+            if found is None:
+                continue
+            group, order = found
+            if profile.group == group and profile.order == order:
+                continue
+            profile.group = group
+            profile.order = order
+            changed += 1
+        if changed:
+            self.save()
+        return changed
+
     def delete(self, profile_id: str) -> None:
         self._profiles = [p for p in self._profiles if p.id != profile_id]
         self.save()

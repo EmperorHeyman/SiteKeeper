@@ -74,25 +74,51 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
   view. Browse both sides, transfer whole folders in either direction (recursively), create
   directories, rename and delete, and watch a per-file progress bar you can cancel. SFTP
   checks host keys on a trust-on-first-use basis. In detail:
-  - **Several files at once** - the queue runs on a handful of separate connections
-    (configurable), which is the difference between minutes and seconds on a tree of small
-    files. Browsing keeps its own connection, so a running queue never blocks the panes.
+  - **Several files at once** - the queue runs on six separate connections by default
+    (configurable, up to 16), which is the difference between minutes and seconds on a tree
+    of small files. A deploy of small files is limited by *round trips*, not bandwidth -
+    each file costs an open, a write, a close and a rename however small it is - so the time
+    divides almost exactly by the number of connections. Ask for more than the server
+    allows and Sitekeeper finds the ceiling and settles there instead of failing the
+    transfers into it. Browsing keeps its own connection, so a running queue never blocks
+    the panes.
+  - **One obvious action at a time** - Upload and Download sit in the same place always,
+    and whichever pane you are working in decides which of them is *the* action: that one
+    is filled blue and says what pressing it would do ("▲ Upload 12", with the destination
+    named), the other stays quiet. The server pane carries the same blue on its edge, so
+    the button and the folder it feeds are visibly a pair - red instead on a production
+    connection. A pill in the corner is amber while connecting, green when connected, red
+    when not.
+  - **"Start here next time"** - right-click any folder in either pane to make it where
+    this connection opens. The two sides are remembered separately.
   - **A controllable queue** - pause and resume mid-file, cancel one item or all of them,
     drag rows into the order you want, or push one to the front.
   - **Safe deploys** - uploads land on a scratch name and are renamed into place (atomically,
     where the server supports `posix-rename`), so a live request never sees a half-written
-    file. Timestamps are preserved so comparisons stay meaningful.
+    file. Uploaded files are given your local modified date, which can be switched off in
+    *Settings ▸ Transfers* - it costs a round trip per file, and syncs compare content
+    rather than timestamps now, so it is only about how the dates read on the server.
   - **Undo an overwrite** - whatever a transfer is about to replace is copied into a local
     cache first, and "Undo replace" (`Ctrl+Z`) puts it back. The History window lists
-    everything that was overwritten, with a Restore button per entry.
-  - **Compare by hash** (`F9`) - digests both sides, rolls folders up from their contents,
-    and marks every row `=`, `≠`, `→` or `←`. The result window can upload or download
-    exactly the files you tick. On SFTP the hashing happens on the server.
+    everything that was overwritten, with a Restore button per entry. Keeping the previous
+    version means *downloading* it before the new one goes up, which roughly doubles the
+    time a redeploy takes; it is worth having, and worth knowing about before a large one
+    (*Settings ▸ Transfers*).
+  - **Compare by hash** (`F9`, *Sync ▾*, or either pane's context menu) - digests both
+    sides, rolls folders up from their contents, and marks every row `=`, `≠`, `→` or `←`.
+    The result window can upload or download exactly the files you tick. On SFTP the
+    hashing happens on the server.
   - **Honest folder dates and sizes** - a folder shows the newest timestamp anywhere below it
     and the real total size, instead of the server's own (meaningless) directory mtime.
+    Sorting by *Modified* asks for that walk even where the automatic pass is off, so
+    folders - which stay above files - are ordered by a date worth ordering by.
   - **Deploy-ignore rules** - `.deployignore` or `.gitignore`, full gitignore syntax, plus a
     built-in list (`node_modules`, `vendor`, `.git`, caches, `.env`). Applied to batch
-    transfers, comparisons and the watcher.
+    transfers, comparisons and the watcher. Right-click a file or folder ▸ *Never deploy*
+    writes the rule for you, anchored to that exact path (a folder's rule takes everything
+    below it), into the `.deployignore` your transfers actually read - and anything already
+    watching re-reads it at once. `.gitignore` is never written to: what you deploy is not
+    what git tracks.
   - **Watch a folder** - the tab notices files as your editor saves them, and can upload each
     one straight away. A file is only sent once its size and timestamp have settled, so a
     half-written save never goes up.
@@ -114,9 +140,19 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
     Removals are mirrored - deleting a file locally deletes it on the server - but only ever
     inside a folder that has a rule, and never below its scope, and a full sync shows you
     what only the server has before touching it (put `uploads/`, `logs/` and the like in `.deployignore` and no sync
-    will go near them). A comparison uses size and timestamp where the server accepts
-    timestamps on upload, which is what keeps a commit-triggered sync of a large tree quick,
-    and falls back to hashes where it does not.
+    will go near them). A comparison is by **content**, not by timestamp: a modified time
+    says when git wrote the file, not when its contents were written, so after a clone, a
+    pull or a checkout - or with two people deploying one repository from two machines -
+    identical files look newer than the copies already on the server and every sync
+    re-uploads the whole tree. On a server with a shell the whole remote side is hashed by
+    one command. *Settings ▸ Transfers* has the old size-and-timestamp behaviour for the
+    case where hashing is too slow and the timestamps can be trusted.
+  - **Publish from git history** - *Sync ▾ ▸ Git history…* reads the repository's log and
+    sends any file **as it was at any commit**: what one commit changed, for putting a
+    single file back the way it was before a bad change, or every file at that commit, for
+    rolling a folder back to a known-good release. Nothing is checked out to do it - the
+    old bytes are extracted to a scratch folder and uploaded from there, so HEAD never
+    moves and your working copy is untouched.
   - **Drag and drop, both ways** - drag rows from one pane to the other to copy them, and drop
     them **on a folder** to land inside it rather than in whichever directory is open; the
     target folder tints as you hover. Hold a drag near the top or bottom edge and the
@@ -286,7 +322,7 @@ installer once ended up wrapping a 1.1.0 exe.
 ```powershell
 .\build_release.ps1                  # -> dist_onefile_upx\Sitekeeper.exe + release\*.zip
 powershell -ExecutionPolicy Bypass -File installer\build.ps1
-                                     # -> installer\Sitekeeper-1.7.0-Setup.exe
+                                     # -> installer\Sitekeeper-1.8.0-Setup.exe
 ```
 
 It builds from the virtual environment at `%USERPROFILE%\.venvs\mysqlrunner`, which needs
@@ -321,6 +357,7 @@ mysql_runner/
   ui/file_manager_tab.py         Dual-pane transfer tab
   ui/transfer_queue_panel.py     The queue: pause, reorder, cancel per item
   ui/compare_dialog.py           What differs, and sending it either way
+  ui/git_history_dialog.py       The commit log, and publishing out of it
   ui/history_dialog.py           Overwrites, and restoring one
   ui/sync_dialog.py              Synced folders: trigger, scope, removals
   ui/permissions_dialog.py       chmod presets, checkbox grid, octal box
@@ -346,6 +383,7 @@ mysql_runner/
   transfer/watcher.py            Polling watcher for local edits
   transfer/syncrules.py          Synced folders: local/remote pairs and triggers
   transfer/gitwatch.py           Commit detection from HEAD, refs and the reflog
+  transfer/githistory.py         Reading the log, and a file as it was at a commit
   transfer/connstr.py            Connection strings and WinSCP.ini import/export
   transfer/spawn.py              PuTTY / Windows Terminal / ssh.exe launcher
   web/profile_factory.py         Isolated in-memory profile per tab

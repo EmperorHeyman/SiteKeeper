@@ -110,11 +110,6 @@ class SqlConsoleTab(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        if self._profile.environment == Environment.PROD:
-            banner = QLabel("PRODUCTION — statements run against the live database.")
-            banner.setObjectName("banner")
-            layout.addWidget(banner)
-
         self._transcript = QPlainTextEdit()
         self._transcript.setReadOnly(True)
         self._transcript.setMaximumBlockCount(_MAX_BLOCKS)
@@ -123,6 +118,14 @@ class SqlConsoleTab(QWidget):
         layout.addWidget(self._transcript, 1)
 
         prompt_row = QHBoxLayout()
+        if self._profile.environment == Environment.PROD:
+            # Beside the prompt rather than above the transcript: this is the
+            # spot you look at while typing the statement it is warning about.
+            prompt_row.addWidget(
+                theme.production_badge(
+                    "Statements run against the live database."
+                )
+            )
         self._prompt_label = QLabel(_PROMPT.strip())
         self._prompt_label.setObjectName("prompt")
         self._prompt_label.setFont(_mono_font())

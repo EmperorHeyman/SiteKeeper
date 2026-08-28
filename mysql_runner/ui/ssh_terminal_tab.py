@@ -189,11 +189,6 @@ class SshTerminalTab(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        if self._profile.environment == Environment.PROD:
-            banner = QLabel("PRODUCTION — this shell runs on the live server.")
-            banner.setObjectName("banner")
-            layout.addWidget(banner)
-
         self._transcript = QPlainTextEdit()
         self._transcript.setReadOnly(True)
         self._transcript.setMaximumBlockCount(MAX_BLOCKS)
@@ -202,6 +197,11 @@ class SshTerminalTab(QWidget):
         layout.addWidget(self._transcript, 1)
 
         row = QHBoxLayout()
+        if self._profile.environment == Environment.PROD:
+            # Beside the command line, where it is in view while you type.
+            row.addWidget(
+                theme.production_badge("This shell runs on the live server.")
+            )
         self._input = _CommandLine()
         self._input.setFont(_mono_font())
         self._input.setPlaceholderText("Connecting…")

@@ -153,6 +153,67 @@ class IgnoreRules:
         return len(self.rules)
 
 
+# ----- writing ------------------------------------------------------------
+#: Header written above the first rule this app adds, so a hand-edited file
+#: still says where the machine-written half came from.
+_ADDED_HEADER = "# Added from Sitekeeper"
+
+
+def pattern_for(root: str, path: str, *, is_dir: bool) -> str:
+    """The rule that excludes exactly ``path`` and nothing else.
+
+    Anchored with a leading ``/`` so ``/config/db.php`` does not also silence
+    a ``db.php`` three folders down, and given a trailing ``/`` for a folder,
+    which is what makes the rule take everything below it as well.
+    """
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    rel = rel.replace("\\", "/").strip("/")
+    if not rel or rel.startswith(".."):
+        return ""
+    return f"/{rel}/" if is_dir else f"/{rel}"
+
+
+def ignore_file_path(directory: str) -> str:
+    """Where a rule added to ``directory`` goes: its ``.deployignore``.
+
+    Deliberately never ``.gitignore``: this app reads that file when there is
+    no ``.deployignore``, but writing to it would put a deploy decision into
+    the repository's own ignore list, where it changes what git tracks.
+    """
+    return os.path.join(directory, IGNORE_FILES[0])
+
+
+def add_patterns(directory: str, patterns) -> tuple[str, list[str]]:
+    """Append rules to ``directory``'s .deployignore, creating it if need be.
+
+    Returns the file written and the patterns that were actually new; one
+    already in the file is not added twice, so right-clicking the same folder
+    again is harmless rather than a growing pile of duplicates.
+    """
+    path = ignore_file_path(directory)
+    try:
+        existing = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        existing = ""
+    present = {line.strip() for line in existing.splitlines() if line.strip()}
+    fresh = []
+    for pattern in patterns:
+        pattern = str(pattern).strip()
+        if pattern and pattern not in present and pattern not in fresh:
+            fresh.append(pattern)
+    if not fresh:
+        return path, []
+    body = existing
+    if body and not body.endswith("\n"):
+        body += "\n"
+    if _ADDED_HEADER not in existing:
+        body += f"\n{_ADDED_HEADER}\n" if body else f"{_ADDED_HEADER}\n"
+    body += "\n".join(fresh) + "\n"
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(body)
+    return path, fresh
+
+
 # ----- compilation --------------------------------------------------------
 def _compile_all(lines) -> list[Rule]:
     rules: list[Rule] = []

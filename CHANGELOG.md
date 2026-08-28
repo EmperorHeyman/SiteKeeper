@@ -6,6 +6,257 @@ All notable changes to Sitekeeper are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-08-28
+
+### Added
+- **Git history, and publishing out of it.** *Sync ▾ → Git history…* (also on
+  the local pane's context menu) reads the repository's log and lets you send
+  any file as it was at any commit. Two views of a commit answer the two
+  different questions: **what this commit changed**, for putting one file back
+  the way it was before a bad change, and **every file at this commit**, for
+  rolling a folder back to a known-good release. Nothing is checked out to get
+  there - the old bytes are extracted to a scratch folder and uploaded from
+  *that*, so HEAD never moves, your working copy is untouched, and there is
+  nothing to put back afterwards. Files the commit deleted are listed but
+  cannot be ticked; they have no contents to publish. Where the files land is
+  the sync rule that owns the folder on the left, or the two panes when there
+  is no rule, and the window says which before you press anything.
+- **"Never deploy this" on the right-click menu.** Right-click a file or a
+  folder in the local pane → *Never deploy* writes the matching rule into that
+  folder's `.deployignore`, creating the file if it is not there. A folder's
+  rule takes everything below it. Rules are anchored to the exact path, so
+  excluding `/config/db.php` does not silence a `db.php` three folders down -
+  and for a file there is a second entry that deliberately does the opposite
+  ("every file named `.env`", anywhere). The rules are written to the folder
+  whose `.deployignore` your transfers actually read - the sync rule's folder
+  when one owns this one - and anything already watching re-reads them
+  immediately, so the next save is filtered without re-arming anything.
+  `.gitignore` is never written to: what you deploy is not what git tracks.
+- **Connections can be dragged into the order you want.** The list was
+  alphabetical and nothing else, so the three servers you touch daily sat
+  wherever their names put them. Drag a connection to move it; drag it onto
+  another heading to move it into that group, and onto a default heading
+  ("phpMyAdmin", "MySQL", "Other (FTP/SFTP)") to take it out of a group
+  altogether. A group nobody has dragged stays alphabetical, so arranging one
+  does not scramble the rest. Headings cannot be dragged - a heading is a
+  place, not a thing.
+- **"Start here next time" on any folder.** Right-click a folder in either
+  pane and this connection will open there from now on - the server side and
+  your side are remembered separately. Every session with a server used to
+  begin with the same four clicks to the same two folders.
+- **The queue says what started a batch.** A headline now reads
+  `14:32 — 7 file(s) · git sync`, so an upload nobody pressed a button for can
+  be told from one you did. The trigger travels with the transfer: git sync,
+  folder sync, watched save, edit in place, compare, published from git.
+
+### Changed
+- **Deploys of many files are about twice as fast, and can be made four times
+  faster.** A deploy is not one big file, it is a thousand small ones, and the
+  thing that had been quietly costing all the time was round trips rather than
+  bandwidth. Measured over an emulated 100 Mbit/s link with a 40 ms round trip,
+  150 files of 24 KB carry 0.29 seconds of data and took **12.8 seconds** -
+  2.3% of the link. Each file was spending seven round trips: a stat, the open,
+  the write, the close, a stat Paramiko adds to confirm the size, the rename
+  that makes the upload atomic, and a utime to preserve the timestamp. Three
+  things changed:
+  - the default number of transfer connections went from **3 to 6**. The cost
+    is latency, so it divides almost exactly by this number. A settings file
+    still holding exactly the old default of three is treated as never having
+    chosen and gets the new one - otherwise the people who already noticed
+    this would be the only ones who never saw the fix. Any other value, three
+    included once you set it deliberately, is left alone;
+  - **Paramiko's confirming stat is gone** - it re-checked a size the write had
+    already reported, and *Verify uploads* is there for anyone who wants the
+    file genuinely read back and compared;
+  - **preserving the modified time is now optional** (*Settings ▸ Transfers*).
+    It was load-bearing while syncs compared timestamps; now that they compare
+    content it only buys server dates that match yours, for a round trip per
+    file.
+
+  The same 150 files now take **5.5 seconds** by default, 4.5 with timestamps
+  off, and 2.5 on twelve connections. On a **redeploy** the numbers are 24.2
+  seconds before and 12.2 after - and 4.5 with shadow backups off, because
+  keeping the previous version of a file means downloading it first, which is
+  worth knowing before turning it off.
+- **A refused connection could still fail transfers, or hang the queue.**
+  Introduced with the connection-cap handling in this same release and found by
+  stress-testing it. The cause was the order the worker did two things in: it
+  claimed a file from the queue and *then* opened its connection. Ask a server
+  that allows three sessions for sixteen and thirteen files were held hostage
+  by workers waiting on a handshake - so the three workers that were connected
+  saw an empty queue, retired, and closed the only working connections, and the
+  thirteen then woke to find nothing left to hand their files back to and
+  failed them. Two rounds of patching the symptom did not fix it; the order
+  did. A worker now opens its connection before it claims anything, so one that
+  cannot connect retires holding nothing, which is all "one connection too
+  many" should ever mean. Just under two hundred randomised runs - caps of 0 to
+  7, up to 16 workers, queues of 3 to 40 files - now come back clean, with an
+  unreachable server still failing honestly rather than hanging.
+- **Asking for more connections than a server allows no longer fails
+  transfers.** Shared hosting commonly caps one account at four to ten
+  simultaneous sessions. A refused connection used to be reported as a failed
+  file, so raising the connection count on such a server produced a wall of
+  failures; and if every worker was refused, whatever was left in the queue sat
+  there forever, reporting nothing. A refused connection is now understood as
+  one connection too many: the file goes back in the queue for a worker that is
+  connected, the pool remembers the server's real ceiling and stops asking for
+  more, and it says so once. If nothing can connect at all, the queue fails
+  honestly instead of hanging.
+- **Synced folders are compared by content, not by timestamp.** The old
+  comparison trusted the local modified time, on the reasoning that uploads
+  carry that timestamp over to the server, so equal timestamps mean equal
+  bytes. That has one hole and it is a big one: a timestamp says when git
+  *wrote* the file, not when its contents were written. After a clone, a pull
+  or a checkout every file is stamped with the current time, so a colleague
+  who pulls the very same commit gets timestamps hours newer than the
+  identical bytes already on the server - and two people deploying one
+  repository from two machines make the timestamps ping-pong forever. Every
+  sync then re-uploads the whole tree, and nothing about it looks like a bug
+  from the inside. Content is now the default. On a server with a shell the
+  whole remote side is digested by one command; without one it does mean
+  reading every remote file, which is still cheaper than the alternative,
+  because a file that only *looks* changed costs an upload **and** the
+  download that shadow backups make before replacing it. The old behaviour is
+  a switch in *Settings → Transfers* ("Compare synced folders by content, not
+  by timestamp"), and the status line now says which comparison is running
+  before it starts.
+- **The transfer queue is newest-first and grouped by the minute.** New
+  batches arrive at the top instead of the bottom of an afternoon of finished
+  ones, headlines show `14:32` rather than `14:32:05`, and two runs from the
+  same trigger inside the same minute fold into one entry - a commit sync that
+  touches six subfolders is one event, not six.
+- **Compare is no longer a permanent button.** It was in the toolbar all the
+  time for something you ask now and then. It lives on F9, in *Sync ▾*, and on
+  both panes' context menus; nothing about the comparison itself changed.
+
+- **The interface says which action it is for.** Sitekeeper's palette went
+  monochrome a while back, and it took *actions* with it: the primary button
+  was a grey, so a toolbar offered eight identical rectangles and nothing on
+  screen said which one you came to press. People click the first word they
+  recognise, which is how a new user's first act on a production server turned
+  out to be *Compare*. Exactly one hue is allowed back in, spent only on the
+  action a screen is for:
+  - **Upload and Download are one question with one answer.** They stay in the
+    same place, and whichever pane you are working in decides which of them is
+    *the* action - that one is filled blue, the other is quiet. The loud one
+    says what pressing it would do: "▲ Upload 12" with the destination folder
+    named in the tooltip, or, when it cannot be pressed, why not ("Pick files
+    on the left to upload"). A disabled primary keeps its place and its
+    outline rather than vanishing, so the row never moves under anyone.
+  - **The server pane carries the same colour as the button that feeds it**, so
+    the loud control and the place it aims at are visibly one pair - and on a
+    production connection that edge is red instead, because "which pane is
+    live?" should not depend on reading anything.
+  - **Destructive things look destructive before you hover them**, not after.
+  - **A connection pill** sits in one fixed spot and is amber while connecting,
+    green when connected, red when not. That state used to exist only in the
+    status line, where the next message overwrote it.
+
+  The test all of this has to pass is the one an ATM passes: cover the text and
+  the screen should still tell you where to press.
+- **"PRODUCTION" is a badge, not a banner.** It was a full-width red bar
+  above everything, spending a whole row and a great deal of colour restating
+  something that does not change while you look at it. It is now a small filled
+  chip beside the connection state - the only filled red in the window - with
+  what it means in the tooltip. On a SQL console or an SSH shell it sits beside
+  the prompt instead, which is the spot you are looking at while typing the
+  thing it is warning about, and costs no row at all. The red edge down the
+  server pane already says the same thing a second way.
+- **The window opens at a size that suits the monitor.** It was a fixed
+  1200x800 - generous on the laptop it was written on, a postage stamp on the
+  1440p and 4K screens it is actually used on, and this window has two file
+  panes, a sidebar and a queue to fit. It now takes most of the available work
+  area, keeps that floor for small displays, and opens centred.
+- **A number field no longer hides its unit inside itself.** "Keep those copies
+  for" was a box containing the words `30 days`, which raises a question nobody
+  should have to ask: is `1 week` allowed? Is `7` enough, or does it need the
+  word? The box now holds a number and only a number, with the unit printed
+  beside it where it plainly cannot be typed into, and it is sized like a
+  number rather than stretched across the dialog like somewhere to write a
+  sentence. Spin boxes also have visible steppers again - hiding them was what
+  made one look like a free-text field in the first place. Same treatment for
+  *Files at once*, which now reads "6 connections".
+- **The settings that were not self-explanatory now explain themselves.**
+  *"While watching a folder, upload changes at once"* said what it was called
+  and nothing about what it does; it is now *"Upload files as soon as you save
+  them"*, with a paragraph saying that it applies to the **Watch** switch above
+  the file panes, that Watch alone only tells you what changed, that the files
+  go to the folder open on the right, and that off is the safer default.
+  Mirroring and the two ignore-rule options gained explanations too.
+- **The whole stylesheet was rewritten around three rules.** One radius scale
+  (6px on anything you click or type into, 10px on anything that contains other
+  things); colour as a signal rather than decoration; and state shown by weight
+  on a box whose size never changes, so nothing under the pointer shifts. Mixed
+  radii and eight-outlined-rectangles-per-row were most of why the window read
+  as assembled rather than designed. In detail:
+  - **Toolbar, footer and sidebar controls keep a surface but lose their
+    outline** - still visibly pressable, no longer competing - so the one
+    filled button is the only thing on screen with a hard edge.
+  - **The sidebar was the least designed thing in the window** and is the first
+    thing anyone sees: a bordered tree with cramped rows and a grey band for
+    the selection. It is a list of places you go, so it is laid out like one -
+    room to read, a rounded highlight that does not touch the edges, and group
+    headings that look like headings rather than like the connections under
+    them. Its six identical buttons said that opening a connection was exactly
+    as important as locking the vault; **Connect** now leads and wears the
+    action colour, **Delete** is red, and the three that need something
+    selected go quiet and say so until it is.
+  - **Tabs lost their little boxes.** A tab strip is a row of labels with one
+    of them current; an underline says which.
+  - **Tables lost their zebra striping**, which banded every row whether or not
+    anything was happening in it and competed with the row actually selected.
+    Rows gained height instead.
+  - **A dialog's accept button is the action that dialog is for**, so it now
+    takes the action colour automatically - scoped to the button box, because
+    Qt hands plain buttons `autoDefault` inside a dialog and a looser rule
+    painted whichever one Qt happened to pick.
+  - **Focus is visible.** It was a grey among greys; on a form you need to see
+    where the keyboard is without hunting for it.
+  - **Labels and tick-boxes no longer paint a background.** The base rule
+    applies to every widget, which includes them, so each one drew a band of
+    window background across whatever it sat on - a stripe behind every row of
+    a settings page.
+  - The light theme gained a chip colour of its own, because `card` and `panel`
+    are both white there and a chip painted in it was invisible.
+
+### Fixed
+- **Opening a phpMyAdmin tab no longer makes the whole window blink.** Your
+  instinct was right - a web view really does start another process, and Qt
+  gives it a native window handle by promoting every ancestor widget to a
+  native window too, which recreates them and reads as the application
+  restarting. The handle now stops at the view itself. The page also starts on
+  the application's own background colour rather than Chromium's white, so the
+  moment before phpMyAdmin paints is no longer a white flash the size of the
+  tab.
+- **Closing a tab while it was still connecting crashed the whole app.** The
+  worker sits inside a blocking connect - a host that does not answer takes as
+  long as the TCP timeout - so the quit posted to its event loop was not
+  looked at until that returned, and the three-second wait gave up. What
+  happened next was fatal rather than untidy: the worker thread is parented to
+  the tab, so deleting the tab deleted a *running* `QThread`, which Qt answers
+  by aborting the process. The stuck thread is now cut loose instead -
+  reparented out of the widget and kept alive until it really does finish, at
+  which point its connection is closed and both objects are dropped. The tab
+  closes at once, the abandoned connect runs out its timeout on a thread
+  nobody is waiting for, and nothing crashes.
+- **A grey tab floated beside the selected connection.** Qt paints a tree
+  row's selection across the expander column as a rectangle of its own, so the
+  sidebar's rounded highlight arrived with a small detached block to its left,
+  belonging to nothing. Styling that column would not stop it, and the
+  highlight is meant to be one shape - so the column is gone. This list is two
+  levels deep, its headings are unmistakably headings, and every connection
+  carries an icon saying what it is.
+- **Sorting by Modified now puts a real date on folders.** Folders stay above
+  files, as they should, but they were ordered by a date worth nothing: a
+  directory's own timestamp moves only when something is created or deleted
+  directly inside it, so a file edited three levels down left every parent
+  looking untouched, and folders whose date was unknown all piled up as though
+  they were from 1970. Clicking *Modified* now asks for the folder walk that
+  works out the newest thing below each folder - even where the automatic pass
+  is switched off - and a folder whose date genuinely cannot be worked out
+  sorts to the bottom of the folder block instead of pretending to be the
+  oldest thing there.
+
 ## [1.7.0] - 2026-08-27
 
 ### Added

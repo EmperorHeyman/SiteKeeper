@@ -5,11 +5,14 @@ file in the queue is a row you can cancel on its own, push to the front, or
 drag into the order you actually want, and the whole queue can be paused
 mid-file and resumed later.
 
-Each run of the queue is one timestamped batch. When a new batch starts, the
-previous ones fold up into their headline - "14:32:05 — 7 file(s)" with the
-outcome alongside - so an afternoon of deploys stays one screen tall while
-every failure is still one click away. Old batches with nothing unfinished in
-them are dropped once enough newer ones exist.
+Each run of the queue is one timestamped batch, newest at the top - the thing
+that just happened is the thing being looked for, and it should never be at the
+bottom of a scroll. Batches are grouped by the minute rather than the second,
+and everything started by one trigger inside that minute folds into a single
+headline: "14:32 — 7 file(s) · git sync" with the outcome alongside. That last
+part matters most on a busy afternoon, because "why is it uploading?" is
+answered by *what started it*, not by how many files it is. Old batches with
+nothing unfinished in them are dropped once enough newer ones exist.
 """
 
 from __future__ import annotations
@@ -47,6 +50,19 @@ _STATE_ROLE = Qt.ItemDataRole.UserRole + 1
 #: Queue runs starting within this window join the previous batch: one sync
 #: that touches several subfolders arrives as several submissions.
 _BATCH_JOIN_SECONDS = 2.0
+
+#: What started a batch -> how the headline says so. The key travels with the
+#: queue from whichever part of the app submitted it (see TransferWorker).
+_ORIGINS = {
+    "git": "git sync",
+    "save": "save",
+    "watch": "watched save",
+    "edit": "edit in place",
+    "sync": "folder sync",
+    "compare": "compare",
+    "publish": "published from git",
+    "manual": "",
+}
 
 _FINISHED = frozenset(
     (
@@ -90,6 +106,10 @@ class TransferQueuePanel(QWidget):
         self._batch: QTreeWidgetItem | None = None
         self._batch_started = 0.0
         self._batch_total = 0
+        #: Clock minute and trigger of the batch on top, so the next
+        #: submission can tell whether it belongs to the same headline.
+        self._batch_minute = ""
+        self._batch_origin = ""
         self._paused = False
         self._dark = True
         self._colours = _state_colours(True)
@@ -161,28 +181,40 @@ class TransferQueuePanel(QWidget):
         self._show_placeholder()
 
     # ----- batches ----------------------------------------------------------
-    def start_batch(self, total: int) -> None:
-        """A new queue run: fold the previous batches up, group what is coming."""
+    def start_batch(self, total: int, origin: str = "") -> None:
+        """A new queue run: fold the previous batches up, group what is coming.
+
+        ``origin`` names the trigger - see ``_ORIGINS``. Two runs join into one
+        headline when they fall in the same clock minute *and* came from the
+        same trigger: a commit sync that touches six subfolders arrives as six
+        submissions and is one event, while a file dragged in by hand half a
+        minute later is not, and must not be filed under the sync.
+        """
         if total <= 0:
             return
         now = time.monotonic()
-        if (
-            self._batch is not None
-            and now - self._batch_started < _BATCH_JOIN_SECONDS
-        ):
+        minute = datetime.now().strftime("%H:%M")
+        joins = self._batch is not None and (
+            now - self._batch_started < _BATCH_JOIN_SECONDS
+            or (minute == self._batch_minute and origin == self._batch_origin)
+        )
+        if joins:
             # The same action, arriving in pieces: extend rather than split.
             self._batch_total += total
-            self._batch.setText(
-                0, f"{self._batch.text(0).split(' — ')[0]} — {self._batch_total} file(s)"
-            )
+            self._batch.setText(0, self._headline(self._batch_total))
             return
         self._clear_placeholder()
         for group in self._groups():
             group.setExpanded(False)
         self._prune_batches()
-        batch = QTreeWidgetItem(self._tree)
-        stamp = datetime.now().strftime("%H:%M:%S")
-        batch.setText(0, f"{stamp} — {total} file(s)")
+        # Newest first: index 0, not the end. What just started is what
+        # somebody is looking at, so it must not arrive below an afternoon of
+        # finished batches.
+        batch = QTreeWidgetItem()
+        self._tree.insertTopLevelItem(0, batch)
+        self._batch_minute = minute
+        self._batch_origin = origin
+        batch.setText(0, self._headline(total))
         batch.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
         font = batch.font(0)
         font.setBold(True)
@@ -193,6 +225,12 @@ class TransferQueuePanel(QWidget):
         self._batch_started = now
         self._batch_total = total
 
+    def _headline(self, total: int) -> str:
+        """"14:32 — 7 file(s) · git sync"."""
+        text = f"{self._batch_minute} — {total} file(s)"
+        label = _ORIGINS.get(self._batch_origin, self._batch_origin)
+        return f"{text}  ·  {label}" if label else text
+
     def _groups(self) -> list[QTreeWidgetItem]:
         found = []
         for index in range(self._tree.topLevelItemCount()):
@@ -202,8 +240,12 @@ class TransferQueuePanel(QWidget):
         return found
 
     def _prune_batches(self, *, keep: int = _KEEP_BATCHES) -> None:
-        """Drop the oldest fully-finished batches beyond ``keep``."""
-        groups = self._groups()
+        """Drop the oldest fully-finished batches beyond ``keep``.
+
+        The tree is newest-first, so the oldest are at the bottom - walking it
+        the other way would throw away the batches worth keeping.
+        """
+        groups = list(reversed(self._groups()))
         excess = len(groups) - keep
         for group in groups:
             if excess <= 0:
@@ -333,6 +375,8 @@ class TransferQueuePanel(QWidget):
         self._rows.clear()
         self._placeholder = None
         self._batch = None
+        self._batch_minute = ""
+        self._batch_origin = ""
         self._summary.setText("Nothing queued")
         self._show_placeholder()
 

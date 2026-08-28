@@ -70,6 +70,11 @@ class ServerProfile:
     local_dir: str = ""
     private_key_path: str = ""   # SFTP key-based auth (optional).
     passive: bool = True         # FTP/FTPS passive mode.
+    #: Where this sits in its group when the list has been arranged by hand.
+    #: Zero means "never dragged", and a group whose members are all zero is
+    #: still listed alphabetically - so arranging one group by hand does not
+    #: scramble the order of every other one.
+    order: int = 0
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
@@ -117,4 +122,5 @@ class ServerProfile:
             local_dir=data.get("local_dir", ""),
             private_key_path=data.get("private_key_path", ""),
             passive=bool(data.get("passive", True)),
+            order=int(data.get("order", 0) or 0),
         )

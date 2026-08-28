@@ -17,7 +17,12 @@ DEFAULT_SIDEBAR_WIDTH = 280
 #: Narrowest remembered sidebar width, so it can always be grabbed again.
 MIN_SIDEBAR_WIDTH = 140
 #: Parallel transfer connections per tab, and the ceiling the UI allows.
-DEFAULT_TRANSFER_WORKERS = 3
+#: See pool.DEFAULT_WORKERS for why six: a deploy of small files is limited by
+#: round trips, not bandwidth, so its time divides by this number.
+DEFAULT_TRANSFER_WORKERS = 6
+#: What that default used to be. A settings file still holding exactly this is
+#: treated as never having chosen - see _sane_workers.
+PREVIOUS_TRANSFER_WORKERS = 3
 MAX_TRANSFER_WORKERS = 16
 
 
@@ -65,12 +70,25 @@ class Settings:
     history_days: int = 30
     # Re-read each upload and compare digests. Slow, and sometimes worth it.
     verify_uploads: bool = False
+    # Give each uploaded file the local file's modified time. One round trip
+    # per file - a seventh of a small-file deploy - for dates on the server
+    # that match the ones on this machine. It is no longer needed for
+    # correctness now that syncs compare content rather than timestamps.
+    preserve_times: bool = True
     # Apply .deployignore / .gitignore to batch transfers and comparisons.
     use_ignore_rules: bool = True
     # Add the built-in list (node_modules, vendor, .git, ...) to those rules.
     ignore_defaults: bool = True
     # Walk folders to show their real size and newest content date.
     folder_stats: bool = True
+    # Compare synced folders by content rather than by size and timestamp.
+    # A local timestamp only means "when this content was written" until git
+    # touches the file: a clone, a pull or a checkout stamps everything it
+    # writes with the current time, so identical bytes read as changed and
+    # every sync re-uploads the whole tree. Hashing is slower - though on a
+    # server with a shell the whole remote side is one command - and it is
+    # the only answer that is true on every machine.
+    sync_compare_hashes: bool = True
     # Keep both panes on matching directories.
     mirror_navigation: bool = False
     # Ask twice before anything destructive on a production connection.
@@ -122,9 +140,11 @@ class Settings:
             shadow_backups=bool(data.get("shadow_backups", True)),
             history_days=max(0, int(data.get("history_days", 30) or 0)),
             verify_uploads=bool(data.get("verify_uploads", False)),
+            preserve_times=bool(data.get("preserve_times", True)),
             use_ignore_rules=bool(data.get("use_ignore_rules", True)),
             ignore_defaults=bool(data.get("ignore_defaults", True)),
             folder_stats=bool(data.get("folder_stats", True)),
+            sync_compare_hashes=bool(data.get("sync_compare_hashes", True)),
             mirror_navigation=bool(data.get("mirror_navigation", False)),
             production_guard=bool(data.get("production_guard", True)),
             production_guard_off=cls._sane_ids(data.get("production_guard_off")),
@@ -145,10 +165,22 @@ class Settings:
 
     @staticmethod
     def _sane_workers(value: object) -> int:
-        """Clamp the connection count; zero or nonsense means the default."""
+        """Clamp the connection count; zero or nonsense means the default.
+
+        A file holding exactly the *old* default gets the new one. There is no
+        way to tell a deliberate three from an untouched three, and the number
+        was only ever three because it was cautious - it is the single biggest
+        thing deciding how long a deploy of small files takes, and leaving
+        every existing installation on the slow value would mean the people
+        who already noticed the problem are the ones who never see the fix.
+        Anyone who really wants three sets it again and it sticks, because
+        what is saved after this is no longer the old default.
+        """
         try:
             count = int(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
+            return DEFAULT_TRANSFER_WORKERS
+        if count == PREVIOUS_TRANSFER_WORKERS:
             return DEFAULT_TRANSFER_WORKERS
         return max(1, min(MAX_TRANSFER_WORKERS, count))
 

@@ -47,9 +47,22 @@ PRIORITY_HIGH = 0
 PRIORITY_NORMAL = 5
 PRIORITY_LOW = 9
 
-#: Default number of parallel connections. Three is polite to shared hosting
-#: and still roughly triples throughput on small files.
-DEFAULT_WORKERS = 3
+#: Default number of parallel connections.
+#:
+#: A deploy is not one big file, it is a thousand small ones, and each one
+#: costs several round trips on top of its bytes - open, write, close, rename,
+#: timestamp. On a link with any real latency that is what the time goes on:
+#: measured over a 100 Mbit/s link with a 40 ms round trip, 150 files of 24 KB
+#: carry 0.3 seconds of data and took 12.8 seconds on three connections. The
+#: cost is latency, not bandwidth, so it divides almost exactly by the number
+#: of connections - the same files took 6.6 seconds on six.
+#:
+#: Six is where politeness stops it. Shared hosting commonly caps a single
+#: account at somewhere between four and ten simultaneous sessions, and the
+#: pool now discovers that cap instead of failing transfers into it (see
+#: _note_ceiling), so the number above the cap costs nothing but is not free
+#: to assume either.
+DEFAULT_WORKERS = 6
 MAX_WORKERS = 16
 
 #: Progress is reported at most this often per file, to keep the UI cheap.
@@ -160,6 +173,12 @@ class PoolOptions:
     overwrite: Overwrite = Overwrite.ALWAYS
     #: Re-read the file after uploading and compare digests.
     verify: bool = False
+    #: Give the uploaded copy the local file's modified time. One extra round
+    #: trip per file, which on a tree of small files is a seventh of the
+    #: deploy. It used to earn that back by making timestamp comparisons
+    #: possible; now that syncs compare content it buys only honest-looking
+    #: dates on the server, so it is worth being able to decline.
+    preserve_times: bool = True
 
     def sane(self) -> "PoolOptions":
         self.workers = max(1, min(MAX_WORKERS, int(self.workers or 1)))
@@ -228,6 +247,20 @@ class TransferPool:
         # Worker ids never repeat: a retired worker's slot must not be handed
         # to a new thread while another thread is still using that connection.
         self._next_worker = 0
+        # How many connections this server turned out to allow. Lowered the
+        # first time one is refused while others are working; never raised
+        # again on this pool, so the discovery is paid for once.
+        self._ceiling = MAX_WORKERS
+        # Workers currently inside the factory. Opening a connection happens
+        # outside the lock - it is a network round trip and must not hold
+        # every other worker up - so "nobody is connected" is not the same
+        # question as "nobody is getting connected", and a worker deciding
+        # whether it is surplus has to ask the second one.
+        self._connecting = 0
+        # Why the last connection attempt failed, for the items that end up
+        # with nothing able to carry them.
+        self._connect_error = "Could not open a connection."
+
 
     # ----- queue ----------------------------------------------------------
     def submit(self, items: list[TransferItem]) -> list[str]:
@@ -249,7 +282,9 @@ class TransferPool:
         with self._lock:
             if self._stopping:
                 return
-            wanted = min(self._options.workers, max(1, self._queued_count()))
+            wanted = min(
+                self._options.workers, self._ceiling, max(1, self._queued_count())
+            )
             while len(self._threads) < wanted:
                 index = self._next_worker
                 self._next_worker += 1
@@ -444,17 +479,28 @@ class TransferPool:
 
     # ----- the worker loop ------------------------------------------------
     def _worker(self, index: int) -> None:
+        """One connection, serving the queue until it is empty.
+
+        The connection is opened *before* an item is claimed, and that order
+        matters more than it looks. Claiming first meant a worker still dialling
+        was holding a file nobody else could take: ask a server that allows
+        three sessions for sixteen, and thirteen files were held hostage by
+        workers waiting on a handshake, while the three that were connected saw
+        an empty queue, retired, and closed the only working connections. The
+        thirteen then woke up with nothing left to hand their files back to and
+        failed them. A worker that cannot connect now simply retires holding
+        nothing, which is the whole of what "one connection too many" should
+        mean.
+        """
         try:
+            try:
+                connection = self._connection_for(index)
+            except TransferError as exc:
+                self._note_ceiling(exc, index)
+                return
             while True:
                 item = self._next_item()
                 if item is None:
-                    return
-                try:
-                    connection = self._connection_for(index)
-                except TransferError as exc:
-                    self._finish(item, JobState.FAILED, error=str(exc))
-                    self._events.message(f"Connection {index + 1}: {exc}")
-                    # Without a connection this worker can do nothing useful.
                     return
                 error = self._run_item(connection, item)
                 if error is None:
@@ -480,6 +526,64 @@ class TransferPool:
         finally:
             self._retire()
             self._close_connection(index)
+            # Every way out of this loop ends here, which is the only place
+            # that can tell whether the last worker has just gone.
+            self._abandon_queue()
+
+    def _note_ceiling(self, exc: TransferError, index: int) -> None:
+        """Record what a refused connection tells us about this server.
+
+        Refusing the surplus session is the server working correctly, so it is
+        not reported as a failure while others are carrying files - it is a
+        ceiling, remembered so the pool stops asking for more. With nothing
+        connected and nothing connecting it is a real problem, and the queue is
+        told on the way out (see _abandon_queue).
+        """
+        with self._condition:
+            self._connect_error = str(exc) or "Could not open a connection."
+            live = len(self._connections)
+            working = live or self._connecting
+            if not working:
+                self._events.message(f"Connection {index + 1}: {exc}")
+                return
+            settled = max(1, min(self._ceiling, live or self._ceiling))
+            announce = settled < self._ceiling
+            self._ceiling = settled
+            self._condition.notify_all()
+        if announce:
+            self._events.message(
+                f"This server allows {settled} transfer connection(s) at once; "
+                "using that many."
+            )
+
+    def _abandon_queue(self) -> None:
+        """Fail whatever is still waiting when nothing is left to carry it.
+
+        A worker that cannot open a connection retires. If it was the last one,
+        every item still queued has nobody to transfer it - and a queue that
+        never drains reports nothing, shows no failure, and simply sits there
+        looking as though it is working. Better to say so; *Retry failed* is
+        one click, and it is the honest state.
+        """
+        with self._condition:
+            if self._threads or self._connections or self._connecting:
+                return  # somebody is still working, connected, or connecting
+            error = self._connect_error
+            stranded = [
+                item for item in self._items if item.state == JobState.QUEUED
+            ]
+            for item in stranded:
+                item.state = JobState.FAILED
+                item.error = error
+                item.finished_at = time.monotonic()
+            self._condition.notify_all()
+        for item in stranded:
+            self._events.item(item)
+        if stranded:
+            self._events.message(
+                f"{len(stranded)} transfer(s) could not start: {error}"
+            )
+            self._events.idle(self.stats())
 
     def _retire(self) -> None:
         """Take this thread off the roster so a later submit can start a fresh one."""
@@ -518,9 +622,26 @@ class TransferPool:
             existing = self._connections.get(index)
             if existing is not None:
                 return existing
-        connection = self._factory()
+            self._connecting += 1
+        # The count is only given up once the connection is *visible* to
+        # everyone else, not merely once the factory has returned. Dropping it
+        # first leaves a window in which a worker that has succeeded is
+        # neither connecting nor connected, and another worker checking in
+        # exactly that window concludes the server is unreachable and fails a
+        # perfectly good transfer.
+        try:
+            connection = self._factory()
+        except BaseException as exc:
+            with self._lock:
+                self._connecting -= 1
+                if isinstance(exc, TransferError):
+                    self._connect_error = (
+                        str(exc) or "Could not open a connection."
+                    )
+            raise
         with self._lock:
             self._connections[index] = connection
+            self._connecting -= 1
         return connection
 
     def _close_connection(self, index: int) -> None:
@@ -718,9 +839,15 @@ class TransferPool:
     def _preserve_mtime(self, fs: RemoteFS, item: TransferItem) -> None:
         """Give the uploaded copy the local file's timestamp, when possible.
 
-        Without this every deploy looks like it changed every file, which makes
-        timestamp comparisons useless.
+        This used to be load-bearing: without it every deploy looked like it
+        changed every file, and the sync comparison was by timestamp. The
+        comparison is by content now, so what this buys is dates on the server
+        that match the dates on your machine - worth having, worth a round trip
+        per file, and worth being able to turn off when a deploy of ten
+        thousand small files is waiting on exactly that round trip.
         """
+        if not self._options.preserve_times:
+            return
         if not fs.supports(Capability.SET_MTIME):
             return
         try:
@@ -750,9 +877,15 @@ class TransferPool:
         state = {"last": 0.0}
 
         def report(transferred: int, total: int) -> None:
+            # This runs once per 32 KB on every worker at once, so it reads
+            # _paused directly rather than through the locked property: taking
+            # the pool's lock thousands of times a second makes the workers
+            # queue up behind each other for a flag that is only ever a bool.
+            # A read that is one chunk stale is harmless - the pause takes
+            # effect 32 KB later.
             if item._cancel or self._stopping:
                 raise _Cancelled()
-            while self.paused:
+            while self._paused:
                 if item._cancel or self._stopping:
                     raise _Cancelled()
                 time.sleep(0.1)

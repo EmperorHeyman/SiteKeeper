@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -9,6 +10,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QPushButton,
     QSpinBox,
@@ -161,6 +163,39 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
 
+    @staticmethod
+    def _with_unit(spin: QSpinBox, unit: str, *, width: int = 78) -> QWidget:
+        """A number box with its unit printed beside it, not inside it.
+
+        A spin box whose unit lives in its own suffix reads as a text field
+        containing the words "30 days", which raises a question nobody should
+        have to ask: is "1 week" allowed? Is "7" enough, or does it need the
+        word? The box holds a number and only a number; the unit is a label
+        next to it that plainly cannot be typed into. It is also given a width
+        that suits a number, because a field stretched across the dialog looks
+        like somewhere to write a sentence.
+        """
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(7)
+        spin.setFixedWidth(width)
+        spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        label = QLabel(unit)
+        label.setObjectName(_HINT_ROLE)
+        layout.addWidget(spin)
+        layout.addWidget(label)
+        layout.addStretch(1)
+        # A special value ("Don't keep any") replaces the number entirely, so
+        # the unit beside it would read as "Don't keep any days".
+        if spin.specialValueText():
+            def toggle(value: int, _label=label, _spin=spin) -> None:
+                _label.setVisible(value != _spin.minimum())
+
+            spin.valueChanged.connect(toggle)
+            toggle(spin.value())
+        return row
+
     # ----- file transfer --------------------------------------------------
     def _build_transfer_tab(self, settings: Settings) -> QWidget:
         page = QWidget()
@@ -175,10 +210,15 @@ class SettingsDialog(QDialog):
             "Each one is a separate connection. Three is a good default; shared "
             "hosting sometimes limits how many you may open."
         )
-        speed_form.addRow("Files at once:", self._workers)
+        speed_form.addRow(
+            "Files at once:", self._with_unit(self._workers, "connections")
+        )
         speed_note = QLabel(
             "Browsing always uses its own connection, so a running queue never "
-            "blocks the file panes."
+            "blocks the file panes. A deploy of many small files is limited by "
+            "round trips rather than bandwidth, so its time divides almost "
+            "exactly by this number - raise it if your server allows it, and "
+            "Sitekeeper will quietly settle for fewer if it does not."
         )
         speed_note.setWordWrap(True)
         speed_note.setObjectName(_HINT_ROLE)
@@ -192,6 +232,20 @@ class SettingsDialog(QDialog):
             "when a file inside it does. This walks the folder instead."
         )
         speed_form.addRow(self._folder_stats)
+        self._sync_hashes = QCheckBox(
+            "Compare synced folders by content, not by timestamp"
+        )
+        self._sync_hashes.setChecked(settings.sync_compare_hashes)
+        self._sync_hashes.setToolTip(
+            "A file's timestamp says when git wrote it, not when its contents "
+            "were written: after a clone, a pull or a checkout, identical "
+            "files look newer than the copies already on the server and every "
+            "sync re-uploads the whole tree. Comparing content is slower - on "
+            "a server with a shell, one command for the whole remote side - "
+            "and it is right on every machine. Turn this off only where "
+            "hashing is too slow and the timestamps can be trusted."
+        )
+        speed_form.addRow(self._sync_hashes)
         page_layout.addWidget(speed)
 
         safety = QGroupBox("Safety")
@@ -205,6 +259,17 @@ class SettingsDialog(QDialog):
         self._shadow.setChecked(settings.shadow_backups)
         self._verify = QCheckBox("Check each upload by comparing digests afterwards")
         self._verify.setChecked(settings.verify_uploads)
+        self._preserve_times = QCheckBox(
+            "Give uploaded files the same modified date as your local copy"
+        )
+        self._preserve_times.setChecked(settings.preserve_times)
+        self._preserve_times.setToolTip(
+            "Costs one round trip per file. On a deploy of thousands of small "
+            "files that is roughly a seventh of the whole thing, because such "
+            "a deploy is limited by round trips rather than by bandwidth. "
+            "Syncs compare content now, so turning this off changes nothing "
+            "except the dates shown on the server."
+        )
         self._guard = QCheckBox("Ask before anything destructive on production")
         self._guard.setChecked(settings.production_guard)
         silenced = len(settings.production_guard_off)
@@ -220,12 +285,14 @@ class SettingsDialog(QDialog):
         self._history_days = QSpinBox()
         self._history_days.setRange(0, 365)
         self._history_days.setValue(settings.history_days)
-        self._history_days.setSuffix(" days")
         self._history_days.setSpecialValueText("Don't keep any")
         safety_form.addRow(self._atomic)
         safety_form.addRow(self._shadow)
-        safety_form.addRow("Keep those copies for:", self._history_days)
+        # The unit label belongs to the field, so it greys out with it.
+        self._history_row = self._with_unit(self._history_days, "days")
+        safety_form.addRow("Keep those copies for:", self._history_row)
         safety_form.addRow(self._verify)
+        safety_form.addRow(self._preserve_times)
         safety_form.addRow(self._guard)
         page_layout.addWidget(safety)
 
@@ -239,12 +306,40 @@ class SettingsDialog(QDialog):
         self._ignore_defaults.setChecked(settings.ignore_defaults)
         self._mirror = QCheckBox("Mirror navigation between the two panes")
         self._mirror.setChecked(settings.mirror_navigation)
-        self._autosync = QCheckBox("While watching a folder, upload changes at once")
+        self._autosync = QCheckBox("Upload files as soon as you save them")
         self._autosync.setChecked(settings.watch_autosync)
+        self._autosync.setToolTip(
+            "Applies to the Watch switch above the file panes, not to synced "
+            "folders, which have their own trigger."
+        )
+        autosync_note = QLabel(
+            "Turning on Watch in a tab makes Sitekeeper notice files as your "
+            "editor writes them. On its own it only tells you what changed; "
+            "with this ticked it also sends each file to the folder open on "
+            "the right, as soon as the file stops changing. Off is the safer "
+            "default - nothing leaves this machine until you press Upload."
+        )
+        autosync_note.setWordWrap(True)
+        autosync_note.setObjectName(_HINT_ROLE)
+
+        self._mirror.setToolTip(
+            "Entering a folder on one side opens the folder of the same name "
+            "on the other, when there is one."
+        )
+        self._ignore_rules.setToolTip(
+            "The rules in a .deployignore beside your files - or a .gitignore "
+            "when there is no .deployignore - decide what batch uploads, "
+            "synced folders and comparisons leave alone."
+        )
+        self._ignore_defaults.setToolTip(
+            "A built-in list on top of your own rules, for the folders nobody "
+            "means to deploy."
+        )
         behaviour_form.addRow(self._ignore_rules)
         behaviour_form.addRow(self._ignore_defaults)
         behaviour_form.addRow(self._mirror)
         behaviour_form.addRow(self._autosync)
+        behaviour_form.addRow(autosync_note)
         page_layout.addWidget(behaviour)
 
         terminal = QGroupBox("External terminal")
@@ -275,8 +370,8 @@ class SettingsDialog(QDialog):
         page_layout.addStretch(1)
         self._ignore_rules.toggled.connect(self._ignore_defaults.setEnabled)
         self._ignore_defaults.setEnabled(self._ignore_rules.isChecked())
-        self._shadow.toggled.connect(self._history_days.setEnabled)
-        self._history_days.setEnabled(self._shadow.isChecked())
+        self._shadow.toggled.connect(self._history_row.setEnabled)
+        self._history_row.setEnabled(self._shadow.isChecked())
         return page
 
     # ----- helpers --------------------------------------------------------
@@ -361,6 +456,9 @@ class SettingsDialog(QDialog):
     def verify_uploads(self) -> bool:
         return self._verify.isChecked()
 
+    def preserve_times(self) -> bool:
+        return self._preserve_times.isChecked()
+
     def use_ignore_rules(self) -> bool:
         return self._ignore_rules.isChecked()
 
@@ -369,6 +467,9 @@ class SettingsDialog(QDialog):
 
     def folder_stats(self) -> bool:
         return self._folder_stats.isChecked()
+
+    def sync_compare_hashes(self) -> bool:
+        return self._sync_hashes.isChecked()
 
     def mirror_navigation(self) -> bool:
         return self._mirror.isChecked()

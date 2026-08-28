@@ -115,8 +115,10 @@ class TransferWorker(QObject):
     op_failed = pyqtSignal(str)
     #: An operation succeeded, with a message for the status line.
     op_done = pyqtSignal(str)
-    #: A queue is about to run, with the number of files in it.
-    queue_started = pyqtSignal(int)
+    #: A queue is about to run: (number of files, what triggered it).
+    #: The trigger is a short key the queue panel turns into a label, so
+    #: a batch that appeared on its own can say why.
+    queue_started = pyqtSignal(int, str)
     #: Transfer progress: (filename, transferred_bytes, total_bytes).
     progress = pyqtSignal(str, int, int)
     #: One file of the queue finished copying.
@@ -553,7 +555,7 @@ class TransferWorker(QObject):
         if fs is None or pool is None:
             self._fail_queue()
             return
-        sources, rules = _split_items(items)
+        sources, rules, origin = _split_items(items)
         self._cancelled = False
         try:
             jobs, directories, skipped = expand_remote(
@@ -568,7 +570,7 @@ class TransferWorker(QObject):
                 os.makedirs(path, exist_ok=True)
             except OSError as exc:
                 self.op_failed.emit(f"{path}: {exc}")
-        self._start_queue(pool, jobs, skipped)
+        self._start_queue(pool, jobs, skipped, origin)
 
     @pyqtSlot(object, str)
     def run_upload(self, items: object, remote_dir: str) -> None:
@@ -578,7 +580,7 @@ class TransferWorker(QObject):
         if fs is None or pool is None:
             self._fail_queue()
             return
-        sources, rules = _split_items(items)
+        sources, rules, origin = _split_items(items)
         self._cancelled = False
         jobs, directories, skipped = expand_local(fs, sources, remote_dir, rules=rules)
         if remote_dir and remote_dir != self._last_listing:
@@ -597,7 +599,7 @@ class TransferWorker(QObject):
                 # permission problem surfaces when the first file lands.
                 pass
         self._last_listing = remote_dir
-        self._start_queue(pool, jobs, skipped)
+        self._start_queue(pool, jobs, skipped, origin)
 
     @pyqtSlot(object, str, bool)
     def upload_quietly(
@@ -621,7 +623,7 @@ class TransferWorker(QObject):
         if fs is None or pool is None:
             self._fail_queue()
             return
-        sources, rules = _split_items(items)
+        sources, rules, origin = _split_items(items)
         self._cancelled = False
         jobs, directories, skipped = expand_local(fs, sources, remote_dir, rules=rules)
         if create and remote_dir and remote_dir != self._last_listing:
@@ -638,21 +640,25 @@ class TransferWorker(QObject):
                 fs.mkdir(path)
             except TransferError:
                 pass
-        self._start_queue(pool, jobs, skipped)
+        self._start_queue(pool, jobs, skipped, origin)
 
     def _start_queue(
-        self, pool: TransferPool, jobs: list[TransferItem], skipped: list[str]
+        self,
+        pool: TransferPool,
+        jobs: list[TransferItem],
+        skipped: list[str],
+        origin: str = "",
     ) -> None:
         if self._cancelled:
             # Cancel was pressed while the tree was still being walked. The
             # queue does not exist yet, so there is nothing for the pool to
             # stop - it must simply never be submitted.
-            self.queue_started.emit(0)
+            self.queue_started.emit(0, origin)
             self.queue_finished.emit(0, 0, True)
             self._cancelled = False
             return
         self._queue_totals = [len(jobs), 0, 0]
-        self.queue_started.emit(len(jobs))
+        self.queue_started.emit(len(jobs), origin)
         if skipped:
             self.op_done.emit(f"{len(skipped)} item(s) skipped by the ignore rules.")
         if not jobs:
@@ -1036,10 +1042,22 @@ class TransferWorker(QObject):
             self.run_upload(items, remote_dir)
 
 
-def _split_items(items: object) -> tuple[list[tuple[str, bool]], IgnoreRules | None]:
-    """Accept either a plain list of sources or (sources, rules)."""
-    if isinstance(items, tuple) and len(items) == 2:
-        sources, rules = items
-        return list(sources), rules if isinstance(rules, IgnoreRules) else None
+def _split_items(
+    items: object,
+) -> tuple[list[tuple[str, bool]], IgnoreRules | None, str]:
+    """Accept a plain list of sources, (sources, rules), or (sources, rules, origin).
+
+    ``origin`` is the short key naming whatever started the transfer ("git",
+    "save", ...). It rides along with the sources rather than as a slot
+    argument so that adding it did not have to change every signal in the tab.
+    """
+    if isinstance(items, tuple) and len(items) in (2, 3):
+        sources, rules = items[0], items[1]
+        origin = str(items[2]) if len(items) == 3 else ""
+        return (
+            list(sources),
+            rules if isinstance(rules, IgnoreRules) else None,
+            origin,
+        )
     assert isinstance(items, list)
-    return list(items), None
+    return list(items), None, ""

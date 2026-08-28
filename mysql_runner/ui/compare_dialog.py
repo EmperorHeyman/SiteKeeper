@@ -81,10 +81,15 @@ class CompareDialog(QDialog):
         layout.addLayout(options)
 
         actions = QHBoxLayout()
+        # Same language as the main window: sending is what this dialog is
+        # for, so it is the one loud control, and receiving is its quieter pair.
         upload = QPushButton("▲ Upload ticked")
+        upload.setObjectName("primary")
         upload.setToolTip("Send the ticked files to the server")
         upload.clicked.connect(self._on_upload)
         download = QPushButton("▼ Download ticked")
+        download.setObjectName("secondary")
+        download.setToolTip("Bring the ticked files down from the server")
         download.clicked.connect(self._on_download)
         rehash = QPushButton("Compare again")
         rehash.clicked.connect(lambda: self.refresh_requested.emit(True))

@@ -67,6 +67,7 @@ from mysql_runner.transfer.base import (
     RemoteFS,
     local_relative,
 )
+from mysql_runner.transfer.githistory import Export, export_files
 from mysql_runner.transfer.gitwatch import (
     CommitEvent,
     GitCommitWatcher,
@@ -76,7 +77,12 @@ from mysql_runner.transfer.gitwatch import (
 )
 from mysql_runner.transfer.hashing import DiffStatus
 from mysql_runner.transfer.history import HistoryStore
-from mysql_runner.transfer.ignore import IgnoreRules
+from mysql_runner.transfer.ignore import (
+    IgnoreRules,
+    add_patterns,
+    ignore_file_path,
+    pattern_for,
+)
 from mysql_runner.transfer.navhistory import NavHistory, mirror_path
 from mysql_runner.transfer.pool import Overwrite, PoolOptions
 from mysql_runner.transfer.snippets import SnippetLibrary
@@ -92,6 +98,7 @@ from mysql_runner.transfer.worker import ConnectionSpec, TransferWorker
 from mysql_runner.ui import theme
 from mysql_runner.ui.commit_plan_dialog import CommitPlanDialog
 from mysql_runner.ui.compare_dialog import CompareDialog
+from mysql_runner.ui.git_history_dialog import GitHistoryDialog
 from mysql_runner.ui.history_dialog import HistoryDialog
 from mysql_runner.ui.sync_activity_dialog import SyncActivityDialog
 from mysql_runner.ui.log_viewer import LogViewerDialog
@@ -429,6 +436,18 @@ class _PathBar(QWidget):
         layout.addWidget(self._browse)
         self._show_crumbs()
 
+    def mark_side(self, *, remote: bool, live: bool = False) -> None:
+        """Tint the crumb strip by which side of the transfer this is.
+
+        The strip carrying ``#pathbar`` is the one inside the bar, not the bar
+        itself, so the property has to go on that or the rule matches nothing.
+        """
+        strip = self._crumbs
+        strip.setProperty("side", "remote" if remote else "local")
+        strip.setProperty("live", "true" if live else "false")
+        strip.style().unpolish(strip)
+        strip.style().polish(strip)
+
     # ----- state ------------------------------------------------------------
     def set_path(self, path: str) -> None:
         self._path = path
@@ -573,6 +592,13 @@ class _FilePane(QWidget):
     #: Rows dragged in from the other pane:
     #: {"remote": bool, "base": str, "items": [[name, is_dir]], "target": str}.
     transfer_dropped = pyqtSignal(object)
+    #: The listing was re-sorted by hand: (column, descending). Sorting by
+    #: Modified is worth a folder-statistics pass the listing did not pay for
+    #: on its own, so the owner hears about it.
+    sort_changed = pyqtSignal(int, bool)
+    #: Rows were selected or deselected. The transfer buttons say how many
+    #: items they are about to move and where to, so they need to hear this.
+    selection_changed = pyqtSignal()
 
     def __init__(self, title: str, parent: QWidget | None = None, *, posix: bool = False) -> None:
         super().__init__(parent)
@@ -669,8 +695,8 @@ class _FilePane(QWidget):
         # Qt's own sorting cannot be used: it sorts the text ("1.2 MB"), and
         # the ".." row must stay on top. _sorted() does it properly instead.
         self._table.setSortingEnabled(False)
-        self._table.setAlternatingRowColors(True)
-        self._table.verticalHeader().setDefaultSectionSize(22)
+        self._table.setAlternatingRowColors(False)
+        self._table.verticalHeader().setDefaultSectionSize(25)
         self._table.setIconSize(QSize(16, 16))
         header = self._table.horizontalHeader()
         header.setDefaultAlignment(
@@ -755,10 +781,30 @@ class _FilePane(QWidget):
         )
         self._table.horizontalHeader().setSortIndicator(column, order)
         self._render()
+        self.sort_changed.emit(self._sort_column, self._sort_desc)
+
+    @property
+    def sort_column(self) -> int:
+        return self._sort_column
 
     def _sorted(self) -> list[RemoteEntry]:
-        """The listing in display order: folders first, then the chosen column."""
+        """The listing in display order: folders first, then the chosen column.
+
+        Folders keep the top of the list whichever column is sorted - that is
+        what a file manager does - so the date they are ordered by has to be a
+        date worth ordering by. A directory's own mtime is not: it moves only
+        when something is created or deleted directly inside it, so a file
+        edited three levels down leaves every parent looking untouched. The
+        listing therefore sorts on the *newest thing below* a folder, which is
+        what ``treestat`` fills in a moment after the rows appear (see
+        ``FileManagerTab._request_local_stats``).
+
+        Until it does - and on a connection where it cannot be worked out at
+        all - a folder has no date, and an unknown date sorts to the bottom of
+        the folder block in both directions rather than pretending to be 1970.
+        """
         column = self._sort_column
+        descending = self._sort_desc
 
         def key(entry: RemoteEntry):
             if column == _SIZE:
@@ -772,8 +818,18 @@ class _FilePane(QWidget):
                 )
             return entry.name.lower()
 
-        ordered = sorted(self._entries, key=key, reverse=self._sort_desc)
-        ordered.sort(key=lambda e: not e.is_dir)  # stable: folders stay on top
+        def unknown(entry: RemoteEntry) -> bool:
+            if column == _MODIFIED:
+                return entry.modified is None
+            if column == _MODE:
+                return entry.mode is None
+            return False
+
+        ordered = sorted(self._entries, key=key, reverse=descending)
+        # Two stable passes: what has no value goes last, then folders go
+        # first. Both keep the ordering the sort above worked out.
+        ordered.sort(key=unknown)
+        ordered.sort(key=lambda e: not e.is_dir)
         if self._filter:
             ordered = [e for e in ordered if self._filter in e.name.lower()]
         return ordered
@@ -804,6 +860,7 @@ class _FilePane(QWidget):
     def _update_count(self, shown: list[RemoteEntry] | None = None) -> None:
         """The little truth next to the title: what is here, or what is picked."""
         selected = self.selected_entries()
+        self.selection_changed.emit()
         if selected:
             size = sum(entry.size for entry in selected)
             self._count.setText(
@@ -929,6 +986,10 @@ class _FilePane(QWidget):
             return
         self._sync_marks = dict(marks)
         self._render()
+
+    def mark_side(self, *, remote: bool, live: bool = False) -> None:
+        """Colour this pane's path bar by what it is: yours, or the server's."""
+        self._path_bar.mark_side(remote=remote, live=live)
 
     def set_theme(self, dark: bool) -> None:
         """Repaint the navigation and listing glyphs for the current theme."""
@@ -1207,6 +1268,8 @@ class FileManagerTab(QWidget):
     title_changed = pyqtSignal(str)
     #: Asks the window to open a shell tab for (profile, spec, directory).
     shell_requested = pyqtSignal(object, object, str)
+    #: This connection's saved settings changed and want writing to disk.
+    profile_changed = pyqtSignal(object)
 
     # Requests handed to the worker thread.
     _open_requested = pyqtSignal(object)
@@ -1263,6 +1326,9 @@ class FileManagerTab(QWidget):
     _pane_commit_diff = pyqtSignal(str, object, object)
     #: Marshals background local folder statistics onto the GUI thread.
     _local_stats_ready = pyqtSignal(str, object)
+    #: An old version of some files has been extracted from git and is
+    #: ready to upload: (commit sha, rule id, repository root, Export).
+    _commit_export_ready = pyqtSignal(str, str, str, object)
 
     def __init__(
         self,
@@ -1322,6 +1388,14 @@ class FileManagerTab(QWidget):
         self._edit_root = os.path.join(
             tempfile.gettempdir(), "Sitekeeper", "edit", uuid.uuid4().hex[:8]
         )
+        #: Where files pulled out of git's history are written before being
+        #: uploaded. Never inside the working tree: publishing an old version
+        #: must not put an old version back on disk.
+        self._export_root = os.path.join(
+            tempfile.gettempdir(), "Sitekeeper", "publish", uuid.uuid4().hex[:8]
+        )
+        #: Per commit being published, the activity-log entry waiting for it.
+        self._publish_events: dict[str, object] = {}
         self._edit_timer = QTimer(self)
         self._edit_timer.setInterval(1500)
         self._edit_timer.timeout.connect(self._poll_edits)
@@ -1336,6 +1410,7 @@ class FileManagerTab(QWidget):
         self._spec = _spec_for(profile)
 
         self._build_ui()
+        self._refresh_actions()
         self.set_dark_mode(dark_mode)
         self._start_worker()
         self._install_shortcuts()
@@ -1348,15 +1423,6 @@ class FileManagerTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        if self._is_production:
-            banner = QLabel("PRODUCTION — files here are live.")
-            banner.setObjectName("banner")
-            wrapper = QWidget()
-            wrapper_layout = QHBoxLayout(wrapper)
-            wrapper_layout.setContentsMargins(10, 7, 10, 0)
-            wrapper_layout.addWidget(banner)
-            layout.addWidget(wrapper)
 
         layout.addWidget(self._build_header())
 
@@ -1380,6 +1446,10 @@ class FileManagerTab(QWidget):
         self._local.paths_dropped.connect(self._on_local_drop)
         self._local.transfer_dropped.connect(self._on_pane_drop)
         self._local.browse.connect(self._on_browse_local)
+        self._local.sort_changed.connect(
+            lambda column, _desc: self._on_sort_changed(column, remote=False)
+        )
+        self._local.selection_changed.connect(self._refresh_actions)
 
         self._remote = _FilePane(f"Remote — {self._profile.label}", posix=True)
         self._remote.bind_paths(self._remote_child, self._remote_parent)
@@ -1391,6 +1461,12 @@ class FileManagerTab(QWidget):
         self._remote.paths_dropped.connect(self._on_remote_drop)
         self._remote.transfer_dropped.connect(self._on_pane_drop)
         self._remote.browse.connect(self._on_browse_remote)
+        self._remote.sort_changed.connect(
+            lambda column, _desc: self._on_sort_changed(column, remote=True)
+        )
+        self._remote.selection_changed.connect(self._refresh_actions)
+        self._remote.mark_side(remote=True, live=self._is_production)
+        self._local.mark_side(remote=False)
 
         panes = QSplitter(Qt.Orientation.Horizontal)
         panes.addWidget(self._local)
@@ -1442,6 +1518,16 @@ class FileManagerTab(QWidget):
         row.setContentsMargins(10, 7, 10, 7)
         row.setSpacing(6)
 
+        self._state_pill = QLabel("Connecting…")
+        self._state_pill.setObjectName("pill")
+        self._state_pill.setProperty("state", "busy")
+        row.addWidget(self._state_pill)
+        if self._is_production:
+            row.addWidget(
+                theme.production_badge("Files here are live. Uploads take effect at once.")
+            )
+        row.addSpacing(10)
+
         self._mirror_box = QCheckBox("Mirror")
         self._mirror_box.setToolTip(
             "Keep both panes in step: entering a folder on one side enters the "
@@ -1458,11 +1544,9 @@ class FileManagerTab(QWidget):
 
         row.addSpacing(12)
 
-        compare_btn = QPushButton("Compare")
-        compare_btn.setToolTip("Hash both sides and show exactly what differs (F9)")
-        compare_btn.clicked.connect(lambda: self._on_compare(with_hashes=True))
-        row.addWidget(compare_btn)
-
+        # Comparing is occasional - a question you ask now and then, not a
+        # mode you sit in - so it lives in the Sync menu, on F9, and in both
+        # context menus rather than taking permanent space in the bar.
         self._sync_btn = QToolButton()
         self._sync_btn.setObjectName("menubutton")
         self._sync_btn.setText("Sync  ▾")
@@ -1530,12 +1614,15 @@ class FileManagerTab(QWidget):
         row.setContentsMargins(10, 7, 10, 7)
         row.setSpacing(6)
 
+        # Upload and Download are the same pair of buttons in the same place
+        # always - what changes is which of them is *the* action right now,
+        # and that follows the pane you are working in. Two loud buttons would
+        # be no louder than none; see _refresh_actions.
         self._upload_btn = QPushButton("▲ Upload")
         self._upload_btn.setObjectName("primary")
-        self._upload_btn.setToolTip("Copy the local selection to the remote directory")
         self._upload_btn.clicked.connect(self._on_upload)
         self._download_btn = QPushButton("▼ Download")
-        self._download_btn.setToolTip("Copy the remote selection to the local directory")
+        self._download_btn.setObjectName("secondary")
         self._download_btn.clicked.connect(self._on_download)
         row.addWidget(self._upload_btn)
         row.addWidget(self._download_btn)
@@ -1648,6 +1735,7 @@ class FileManagerTab(QWidget):
             keep_backups=settings.shadow_backups,
             overwrite=Overwrite.ALWAYS,
             verify=settings.verify_uploads,
+            preserve_times=settings.preserve_times,
         ).sane()
 
     def _ignore_rules(self) -> IgnoreRules:
@@ -1742,16 +1830,20 @@ class FileManagerTab(QWidget):
         self._pane_commit.connect(self._on_pane_commit)
         self._pane_commit_diff.connect(self._on_pane_commit_diff)
         self._local_stats_ready.connect(self._on_local_stats)
+        self._commit_export_ready.connect(self._on_commit_export)
         self._thread.start()
 
     def _connect_to_server(self) -> None:
         profile = self._profile
+        self._set_connection_state("busy", f"Connecting to {profile.describe_target()}")
         self._set_status(f"Connecting to {profile.describe_target()} …")
         self._open_requested.emit(self._spec)
 
     # ----- worker callbacks -----------------------------------------------
     def _on_connected(self, banner: str) -> None:
         self._connected = True
+        self._set_connection_state("ok", banner)
+        self._refresh_actions()
         self._set_status(banner)
         self.status_message.emit(f"Connected to {self._profile.label}")
         self.title_changed.emit(self.current_title())
@@ -1779,6 +1871,8 @@ class FileManagerTab(QWidget):
         self._connected = False
         if self._closing:
             return
+        self._set_connection_state("fail", message)
+        self._refresh_actions()
         self._set_status(message)
         self.status_message.emit(f"{self._profile.label}: {message}")
         QMessageBox.warning(self, "Connection failed", message)
@@ -1787,6 +1881,7 @@ class FileManagerTab(QWidget):
         assert isinstance(entries, list)
         self._remote.set_listing(path, entries, at_root=path in ("/", ""))
         self._apply_diff_marks()
+        self._refresh_actions()  # the folder the buttons name just changed
         self._request_remote_stats(path, entries)
         if self._mirror_box.isChecked():
             self._mirror_to_local(path)
@@ -1804,10 +1899,10 @@ class FileManagerTab(QWidget):
             dialog.refresh()
         self._sync_undo_button()
 
-    def _on_queue_started(self, total: int) -> None:
+    def _on_queue_started(self, total: int, origin: str = "") -> None:
         self._queue_total = total
         self._queue_done = 0
-        self._queue_panel.start_batch(total)
+        self._queue_panel.start_batch(total, origin)
         self._progress.setVisible(total > 0)
         self._cancel_btn.setVisible(total > 0)
         self._progress.setValue(0)
@@ -1849,6 +1944,10 @@ class FileManagerTab(QWidget):
 
     def _on_closed(self) -> None:
         self._connected = False
+        if self._closing:
+            return
+        self._set_connection_state("fail", "The connection was closed.")
+        self._refresh_actions()
         self._set_status("Disconnected.")
 
     # ----- tool results ---------------------------------------------------
@@ -1888,11 +1987,37 @@ class FileManagerTab(QWidget):
         self._set_status("Stopping…")
 
     # ----- folder statistics ---------------------------------------------
-    def _request_remote_stats(self, path: str, entries: list) -> None:
-        if not self._settings.folder_stats:
+    # A folder's own timestamp is not the date anybody means by "when did this
+    # change?" - it moves when an entry is added or removed directly inside,
+    # and not when a file three levels down is edited. So the listing shows,
+    # and sorts by, the newest thing *below* a folder, which costs a walk of
+    # the tree. That walk is paid for lazily: automatically while the setting
+    # is on, and on demand the moment somebody sorts by Modified, which is the
+    # one click that makes the difference visible.
+    def _on_sort_changed(self, column: int, *, remote: bool) -> None:
+        """Sorting by Modified is a request for real folder dates."""
+        if column != _MODIFIED:
+            return
+        pane = self._remote if remote else self._local
+        if not pane.path:
+            return
+        if remote:
+            self._request_remote_stats(pane.path, pane.entries, forced=True)
+        else:
+            self._request_local_stats(pane.path, pane.entries, forced=True)
+
+    def _request_remote_stats(
+        self, path: str, entries: list, *, forced: bool = False
+    ) -> None:
+        if not (self._settings.folder_stats or forced):
             return
         names = [entry.name for entry in entries if entry.is_dir and not entry.is_link]
         if not names or len(names) > _MAX_STAT_FOLDERS:
+            if names and forced:
+                self._set_status(
+                    f"{len(names)} folders here is too many to measure; their "
+                    "dates are the server's own."
+                )
             return
         cached = {
             name: self._stats_cache.get("remote", RemoteFS.join(path, name))
@@ -1917,11 +2042,18 @@ class FileManagerTab(QWidget):
         self._remote.update_entries(apply_folder_stats(self._remote.entries, stats))
         self._apply_diff_marks()
 
-    def _request_local_stats(self, path: str, entries: list) -> None:
-        if not self._settings.folder_stats:
+    def _request_local_stats(
+        self, path: str, entries: list, *, forced: bool = False
+    ) -> None:
+        if not (self._settings.folder_stats or forced):
             return
         names = [entry.name for entry in entries if entry.is_dir and not entry.is_link]
         if not names or len(names) > _MAX_STAT_FOLDERS:
+            if names and forced:
+                self._set_status(
+                    f"{len(names)} folders here is too many to measure; their "
+                    "dates are the folders' own."
+                )
             return
 
         def measure() -> None:
@@ -1962,6 +2094,7 @@ class FileManagerTab(QWidget):
         at_root = os.path.dirname(target) == target
         self._local.set_listing(target, entries, at_root=at_root)
         self._apply_diff_marks()
+        self._refresh_actions()
         self._request_local_stats(target, entries)
         if self._mirror_box.isChecked():
             self._mirror_to_remote(target)
@@ -2129,7 +2262,9 @@ class FileManagerTab(QWidget):
             self._set_status(f"{name} changed, but the connection is down.")
             return
         self._upload_quiet_requested.emit(
-            ([(local, False)], IgnoreRules.empty()), RemoteFS.parent(remote), False
+            ([(local, False)], IgnoreRules.empty(), "edit"),
+            RemoteFS.parent(remote),
+            False,
         )
         self._set_status(f"Uploading {name} → {remote}")
 
@@ -2208,7 +2343,12 @@ class FileManagerTab(QWidget):
             return
         if not self._confirm_production(f"replace {len(existing)} file(s) on"):
             return
-        self._upload_tree(existing, self._diff_remote or self._remote.path, flatten=base)
+        self._upload_tree(
+            existing,
+            self._diff_remote or self._remote.path,
+            flatten=base,
+            origin="compare",
+        )
 
     def _download_relative(self, relatives: object) -> None:
         if not isinstance(relatives, list) or not self._require_connection():
@@ -2219,7 +2359,7 @@ class FileManagerTab(QWidget):
 
     def _upload_tree(
         self, items, remote_dir: str, *, flatten: str = "", rules=None,
-        quiet: bool = False,
+        quiet: bool = False, origin: str = "",
     ) -> None:
         """Send items, keeping their layout relative to ``flatten`` if given.
 
@@ -2230,6 +2370,9 @@ class FileManagerTab(QWidget):
         ``/admin`` - and the next push, whose target is read off the pane,
         would aim inside it: ``/admin/admin/file``. The refresh when the queue
         drains still repaints whatever directory the user is actually in.
+
+        ``origin`` names the trigger, so the queue can group the batch under
+        it and say what started an upload nobody pressed a button for.
         """
         ignore = rules if rules is not None else self._ignore_rules()
 
@@ -2237,9 +2380,11 @@ class FileManagerTab(QWidget):
             if quiet:
                 # True: a trigger's target can be a folder the commit only
                 # just added, which the upload has to make for itself.
-                self._upload_quiet_requested.emit((group, ignore), target, True)
+                self._upload_quiet_requested.emit(
+                    (group, ignore, origin), target, True
+                )
             else:
-                self._upload_requested.emit((group, ignore), target)
+                self._upload_requested.emit((group, ignore, origin), target)
 
         if not flatten:
             send(items, remote_dir)
@@ -2340,7 +2485,7 @@ class FileManagerTab(QWidget):
             by_dir.setdefault(target, []).append((change.path, False))
         for target, group in by_dir.items():
             self._upload_quiet_requested.emit(
-                (group, self._ignore_rules()), target, True
+                (group, self._ignore_rules(), "watch"), target, True
             )
         self._set_status(f"Uploading {len(wanted)} changed file(s) from {base}.")
 
@@ -2373,12 +2518,31 @@ class FileManagerTab(QWidget):
     def _sync_with_hashes(self) -> bool:
         """Whether an automatic sync should hash both sides.
 
-        Uploads carry the local timestamp over wherever the server allows it, so
-        size and time is both accurate and enormously faster than reading every
-        byte of a tree. Where the server cannot be given a timestamp it stamps
-        its own upload time on everything, which would make every file look
-        changed on the next commit - there, hashes are the only honest answer.
+        The old answer was "only when the server refuses to be given a
+        timestamp", on the reasoning that uploads carry the local mtime over,
+        so a preserved timestamp is as good as a digest and enormously
+        cheaper. That reasoning has one hole, and it is a big one: it assumes
+        the local mtime means "when this content was written". After a clone,
+        a pull, a checkout or a fresh CI workspace it does not - git stamps
+        every file it writes with *now*, so a colleague who pulls the same
+        commit gets timestamps hours newer than the identical bytes on the
+        server. Everything then reads as changed, every sync re-uploads the
+        whole tree, and nothing about it looks like a bug from the inside.
+
+        So content is the default and the timestamp shortcut is opt-in.
+
+        The cost is smaller than it sounds even at its worst. With a shell the
+        whole remote tree is digested by one command (see
+        ``remote_exec.digest_tree``) - a round trip, not a download. Without
+        one, hashing does mean reading every remote file - but the alternative
+        is worse, not better: every file that only *looks* changed is uploaded,
+        and shadow backups download the copy being replaced first, so the
+        timestamp shortcut spends a download *and* an upload per file to avoid
+        spending one download. It is still switchable for the case where
+        neither is wanted and the timestamps really can be trusted.
         """
+        if self._settings.sync_compare_hashes:
+            return True
         return Capability.SET_MTIME not in self._capabilities
 
     # ----- arming and disarming -------------------------------------------
@@ -2687,12 +2851,22 @@ class FileManagerTab(QWidget):
         if rule.id in self._sync_running:
             return
         self._sync_running.add(rule.id)
+        hashes = self._sync_with_hashes()
         self._tool_progress.start(f"Syncing {rule.name}…")
-        self._set_status(f"{rule.name}: comparing with {rule.remote}…")
+        # Say which comparison is about to run, because the two feel completely
+        # different: on a server with no shell, hashing reads every remote file
+        # and a first sync of a big tree is not quick. Better said up front
+        # than diagnosed as a hang.
+        how = "by content"
+        if hashes and Capability.EXEC not in self._capabilities:
+            how = "by content (reading every file - this server cannot hash)"
+        elif not hashes:
+            how = "by size and time"
+        self._set_status(f"{rule.name}: comparing with {rule.remote}, {how}…")
         self._sync_scan_requested.emit(
             rule.local,
             rule.remote,
-            self._sync_with_hashes(),
+            hashes,
             self._rule_ignores(rule),
             rule.id,
             rule.recursive,
@@ -2768,6 +2942,7 @@ class FileManagerTab(QWidget):
                 flatten=rule.local,
                 rules=self._rule_ignores(rule),
                 quiet=True,
+                origin="sync",
             )
         gone = [rule.remote_for(change.path) for change in removals]
         gone = [path for path in gone if path and path != rule.remote]
@@ -2882,6 +3057,7 @@ class FileManagerTab(QWidget):
                 flatten=rule.local,
                 rules=ignores,
                 quiet=True,
+                origin="git",
             )
         if removals:
             shown = removals[:20]
@@ -3230,6 +3406,151 @@ class FileManagerTab(QWidget):
             return
         self._push_pane_commit(arm=False)
 
+    # ----- publishing out of history --------------------------------------
+    # Everything else this app deploys is whatever is on disk now, which is
+    # right until the moment it is badly wrong: the bad release is live, the
+    # fix is "put Friday's version back", and the working tree is three commits
+    # past Friday. Doing that with git means checkout, deploy, checkout back -
+    # three chances to leave the wrong thing somewhere. So the old bytes are
+    # extracted to a scratch folder and uploaded from there. HEAD never moves
+    # and the working tree is never touched.
+    def _open_git_history(self) -> None:
+        repo = find_repo(self._local.path)
+        if not repo:
+            self._set_status(
+                f"{self._local.path} is not inside a git repository, so there "
+                "is no history to read."
+            )
+            return
+        dialog = self._dialogs.get("git_history")
+        if isinstance(dialog, GitHistoryDialog):
+            try:
+                dialog.isVisible()
+                self._present(dialog)
+                return
+            except RuntimeError:
+                self._dialogs.pop("git_history", None)
+        dialog = GitHistoryDialog(
+            repo,
+            remote=self._publish_rule().remote,
+            dark=self._settings.dark_mode,
+            parent=self,
+        )
+        dialog.publish_requested.connect(
+            lambda sha, rels: self._publish_from_commit(repo, str(sha), rels)
+        )
+        self._dialogs["git_history"] = dialog
+        self._present(dialog)
+
+    def _publish_from_commit(self, repo: str, sha: str, rels: object) -> None:
+        """Send some files as they were at ``sha``, wherever they belong now."""
+        if not isinstance(rels, list) or not rels or not sha:
+            return
+        if not self._require_connection():
+            return
+        rule = self._publish_rule()
+        if not rule.local or not rule.remote:
+            self._set_status(
+                "Open the folder to publish into on the right first — that "
+                "pairing is where these files go."
+            )
+            return
+        # Which of them this pairing can actually place, worked out before
+        # anything is extracted: a file outside the folder on the left has
+        # nowhere to land, and saying so now beats a silent short delivery.
+        placeable = [
+            rel
+            for rel in rels
+            if rule.owns(os.path.join(repo, rel.replace("/", os.sep)))
+        ]
+        if not placeable:
+            self._set_status(
+                f"None of those {len(rels)} file(s) sit under {rule.local}, so "
+                "this folder pairing cannot place them."
+            )
+            return
+        if not self._confirm_production(
+            f"publish {len(placeable)} file(s) from commit {sha[:8]} to"
+        ):
+            return
+        short = sha[:8]
+        entry = self._activity().log_event(
+            f"Publish — commit {short}",
+            detail=f"{len(placeable)} file(s) from history → {rule.remote}",
+        )
+        self._publish_events[sha] = entry
+        self._tool_progress.start(f"Reading commit {short}…")
+        self._set_status(
+            f"Extracting {len(placeable)} file(s) from {short} — your working "
+            "copy is not touched."
+        )
+        dest = os.path.join(self._export_root, f"{short}-{uuid.uuid4().hex[:6]}")
+
+        def extract() -> None:
+            # git runs off the GUI thread: a big commit is several seconds.
+            try:
+                export = export_files(repo, sha, placeable, dest)
+            except OSError as exc:
+                export = Export(root=dest, files=[], failures=[("", str(exc))])
+            self._commit_export_ready.emit(sha, rule.id, repo, export)
+
+        threading.Thread(target=extract, name="git-export", daemon=True).start()
+
+    def _publish_rule(self) -> SyncRule:
+        """Where a file published from history lands.
+
+        The rule that owns the folder on the left if there is one, because that
+        is the pairing the user already configured; otherwise the two panes,
+        which is the only other honest answer.
+        """
+        rule = self._sync_store.owner(self._profile.id, self._local.path)
+        if rule is not None and rule.remote:
+            return rule
+        return self._pane_commit_rule()
+
+    def _on_commit_export(
+        self, sha: str, rule_id: str, repo: str, export: object
+    ) -> None:
+        """The old bytes are on disk; put them where the pairing says."""
+        self._tool_progress.stop()
+        if self._closing or not isinstance(export, Export):
+            return
+        log = self._activity()
+        entry = self._publish_events.pop(sha, None)
+        rule = self._rule(rule_id) or self._publish_rule()
+        if not export.ok:
+            reason = export.failures[0][1] if export.failures else "nothing to send"
+            if entry is not None:
+                log.set_outcome(entry, f"could not be read from git: {reason}")
+            self._set_status(f"Nothing was published from {sha[:8]}: {reason}")
+            return
+        # The scratch tree mirrors the repository, so the rule's own path
+        # arithmetic gives the right answer as long as it is asked about
+        # the repository path rather than the scratch one.
+        by_dir: dict[str, list[tuple[str, bool]]] = {}
+        for local_path, rel in export.files:
+            target = RemoteFS.parent(
+                rule.remote_for(os.path.join(repo, rel.replace("/", os.sep)))
+            )
+            by_dir.setdefault(target, []).append((local_path, False))
+        for target, group in by_dir.items():
+            self._upload_quiet_requested.emit(
+                (group, IgnoreRules.empty(), "publish"), target, True
+            )
+        if entry is not None:
+            log.add_files(entry, list(export.files))
+            if export.failures:
+                log.add_notes(
+                    entry,
+                    [f"{rel}: {why}" for rel, why in export.failures[:20]],
+                    outcome="not published",
+                )
+        missed = f", {len(export.failures)} skipped" if export.failures else ""
+        self._set_status(
+            f"Publishing {len(export.files)} file(s) from commit {sha[:8]} "
+            f"to {rule.remote}{missed}."
+        )
+
     def _on_sync_scan(self, payload: object) -> None:
         """A comparison for one synced folder came back: act on it."""
         if not isinstance(payload, dict):
@@ -3282,6 +3603,7 @@ class FileManagerTab(QWidget):
                 flatten=rule.local,
                 rules=self._rule_ignores(rule),
                 quiet=True,
+                origin="sync",
             )
         if removals:
             shown = removals[:20]
@@ -3445,6 +3767,16 @@ class FileManagerTab(QWidget):
             "Sync now (upload changes)", lambda: self._sync_folder_now(local)
         )
         sync_now.setEnabled(bool(local))
+        compare = menu.addAction(
+            "Compare with the server (F9)", lambda: self._on_compare()
+        )
+        compare.setToolTip("Hash both sides and show exactly what differs")
+        history = menu.addAction("Git history…", self._open_git_history)
+        history.setToolTip(
+            "Every commit in this repository, and the files from any of them - "
+            "published as they were, without touching your working copy"
+        )
+        history.setEnabled(bool(find_repo(self._local.path)))
         last = self._last_commit
         if last:
             # The offer a commit made survives being dismissed: the commit is
@@ -3586,6 +3918,8 @@ class FileManagerTab(QWidget):
     # ----- commands -------------------------------------------------------
     def _set_active(self, *, remote: bool) -> None:
         self._remote_active = remote
+        # Which pane you are in decides which transfer is the offered one.
+        self._refresh_actions()
 
     def _active_pane(self) -> _FilePane:
         return self._remote if self._remote_active else self._local
@@ -4182,6 +4516,15 @@ class FileManagerTab(QWidget):
             menu.addAction("Disk usage here…", self._on_disk_usage).setEnabled(has_shell)
             menu.addAction("Open a shell here", self._on_terminal).setEnabled(has_shell)
             menu.addAction("Copy remote path", self._copy_remote_path)
+            menu.addSeparator()
+            menu.addAction(
+                "Start here next time", lambda: self._set_default_folder(remote=True)
+            ).setToolTip(
+                "Open this folder automatically whenever this connection is "
+                "opened"
+            )
+            menu.addSeparator()
+            menu.addAction("Compare with the server (F9)", lambda: self._on_compare())
         else:
             folder = self._selected_local_dir()
             synced = self._sync_store.find(self._profile.id, folder)
@@ -4189,13 +4532,185 @@ class FileManagerTab(QWidget):
                 "Sync folder" if synced is None else f"Sync folder ({synced.mode.label})"
             )
             self._fill_sync_menu(sync_menu)
+            self._fill_ignore_menu(menu, selection)
             menu.addSeparator()
+            menu.addAction(
+                "Start here next time", lambda: self._set_default_folder(remote=False)
+            ).setToolTip(
+                "Open this folder automatically whenever this connection is "
+                "opened"
+            )
             menu.addAction("Open in Explorer", self._open_in_explorer)
             menu.addAction("Copy path", self._copy_local_path)
             menu.addSeparator()
-            menu.addAction("Compare with the server", lambda: self._on_compare())
+            menu.addAction("Compare with the server (F9)", lambda: self._on_compare())
+            git = menu.addAction("Git history…", self._open_git_history)
+            git.setEnabled(bool(find_repo(self._local.path)))
 
         menu.exec(position)
+
+    # ----- excluding things from deploys ----------------------------------
+    # The rules that keep node_modules and .env off a server are a text file
+    # everybody knows the syntax of and nobody wants to open mid-deploy. The
+    # decision, though, is always made *looking at the file* - "not that one" -
+    # so the menu on the file is where it belongs, and the rule it writes is
+    # anchored to the exact path rather than the bare name, so excluding
+    # /config/db.php does not also silence a db.php somewhere else.
+    def _ignore_root(self) -> str:
+        """The folder whose .deployignore governs what the local pane sends.
+
+        The rules that a transfer actually consults come from the folder the
+        sync rule names, or - with no rule - from the folder on show. Writing
+        anywhere else produces a file that looks right and changes nothing.
+        """
+        rule = self._sync_store.owner(self._profile.id, self._local.path)
+        if rule is not None and os.path.isdir(rule.local):
+            return rule.local
+        return self._local.path
+
+    def _fill_ignore_menu(self, menu, selection: list[tuple[str, bool]]) -> None:
+        """The "never deploy this" entries for the current local selection."""
+        root = self._ignore_root()
+        submenu = menu.addMenu("Never deploy")
+        if not selection:
+            submenu.setEnabled(False)
+            return
+        folders = sum(1 for _name, is_dir in selection if is_dir)
+        files = len(selection) - folders
+        if len(selection) == 1:
+            name, is_dir = selection[0]
+            what = f"“{name}” and everything in it" if is_dir else f"“{name}”"
+        else:
+            parts = []
+            if folders:
+                parts.append(f"{folders} folder(s) and everything in them")
+            if files:
+                parts.append(f"{files} file(s)")
+            what = " and ".join(parts)
+        exact = submenu.addAction(f"Add {what} to .deployignore")
+        exact.triggered.connect(lambda: self._ignore_selection(by_name=False))
+        if files:
+            names = submenu.addAction(
+                "Add by name, anywhere in the tree"
+                if len(selection) > 1
+                else f"Add every file named “{selection[0][0]}”"
+            )
+            names.triggered.connect(lambda: self._ignore_selection(by_name=True))
+            names.setToolTip(
+                "An unanchored rule: it also excludes files of that name in "
+                "any subfolder"
+            )
+        submenu.addSeparator()
+        show = submenu.addAction("Open .deployignore")
+        show.triggered.connect(self._open_ignore_file)
+        show.setToolTip(
+            f"{ignore_file_path(root)} — the rules this folder's transfers use"
+        )
+        if os.path.normcase(root) != os.path.normcase(self._local.path):
+            note = submenu.addAction(f"Rules live in {root}")
+            note.setEnabled(False)
+
+    def _ignore_selection(self, *, by_name: bool) -> None:
+        """Write rules for the selected rows into the governing .deployignore."""
+        selection = self._local.selection()
+        if not selection:
+            return
+        root = self._ignore_root()
+        if not root or not os.path.isdir(root):
+            self._set_status("There is no local folder to write rules for.")
+            return
+        patterns: list[str] = []
+        for name, is_dir in selection:
+            full = self._local_child(name)
+            if by_name and not is_dir:
+                patterns.append(name)
+                continue
+            pattern = pattern_for(root, full, is_dir=is_dir)
+            if pattern:
+                patterns.append(pattern)
+            else:
+                # Outside the folder the rules govern: an anchored rule for it
+                # would silently match nothing.
+                self._set_status(
+                    f"{full} is not inside {root}, so a rule there would not "
+                    "apply to it."
+                )
+        if not patterns:
+            return
+        try:
+            path, added = add_patterns(root, patterns)
+        except OSError as exc:
+            self._set_status(f"Could not write {root}\\.deployignore: {exc}")
+            return
+        if not added:
+            self._set_status(f"Already in {path}: {', '.join(patterns)}")
+            return
+        self._set_status(
+            f"Added {', '.join(added)} to {path}. "
+            "Syncs, batch uploads and comparisons skip them from now on."
+        )
+        # The watcher and any armed rule read the file when they start, so the
+        # ones running now have to be given the new rules.
+        self._restart_ignore_consumers()
+
+    def _restart_ignore_consumers(self) -> None:
+        """Re-read the ignore rules everything currently watching is using."""
+        if self._watcher is not None:
+            self._restart_watcher(self._local.path)
+        for rule_id in list(self._sync_watchers):
+            rule = self._rule(rule_id)
+            if rule is not None:
+                self._start_sync_rule(rule)
+
+    def _open_ignore_file(self) -> None:
+        """Show the rules themselves, creating the file if it is not there."""
+        root = self._ignore_root()
+        path = ignore_file_path(root) if root else ""
+        if not path:
+            return
+        if not os.path.exists(path):
+            try:
+                open(path, "a", encoding="utf-8").close()
+            except OSError as exc:
+                self._set_status(f"Could not create {path}: {exc}")
+                return
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self._set_status(f"Opened {path}")
+
+    def _set_default_folder(self, *, remote: bool) -> None:
+        """Remember the folder in view as where this connection opens.
+
+        Every session with a server starts in the same two places, and getting
+        there was four clicks that nobody should have to repeat. The folder a
+        single selected directory names wins over the one on show, because
+        right-clicking a folder and being sent to its parent would be a lie.
+        """
+        pane = self._remote if remote else self._local
+        selection = pane.selection()
+        if len(selection) == 1 and selection[0][1]:
+            target = (
+                self._remote_child(selection[0][0])
+                if remote
+                else self._local_child(selection[0][0])
+            )
+        else:
+            target = pane.path
+        if not target:
+            self._set_status("There is no folder here to remember.")
+            return
+        if remote:
+            self._profile.remote_dir = target
+            side = "The server side"
+        else:
+            self._profile.local_dir = target
+            side = "This machine's side"
+        self.profile_changed.emit(self._profile)
+        self._set_status(
+            f"{side} of {self._profile.label} will open at {target} from now on."
+        )
 
     def _on_digest_selected(self) -> None:
         selection = self._remote.selection()
@@ -4293,6 +4808,102 @@ class FileManagerTab(QWidget):
             )
         return confirmed
 
+    # ----- saying what will happen before it does --------------------------
+    # The hardest thing about a two-pane transfer window is that nothing on it
+    # says which way anything is about to go. Every control looks alike, so a
+    # new user presses whichever word they recognise - and on a production
+    # server the first word people recognise turns out to be "Compare".
+    #
+    # So the pair of transfer buttons is treated as one question with one
+    # answer: whichever pane you are working in decides which of them is *the*
+    # action, that one is the only loud control on screen, and it says out loud
+    # what pressing it would do - how many items, and into which folder. A
+    # button that cannot be pressed keeps its place and explains itself rather
+    # than disappearing, so the layout never moves under anyone.
+    def _refresh_actions(self) -> None:
+        """Point the transfer pair at what is actually selected, and say so."""
+        local = self._local.selection()
+        remote = self._remote.selection()
+        # The active pane decides, except when only the other one has anything
+        # picked - then the user has already answered by selecting.
+        uploading = not self._remote_active
+        if local and not remote:
+            uploading = True
+        elif remote and not local:
+            uploading = False
+        elif not local and not remote:
+            # Nothing picked anywhere, so nothing has been said yet. Offer
+            # uploading: this is a deployment tool, and the remote pane being
+            # the one that happens to hold focus at startup is not a reason to
+            # point the loud button at the user's own disk.
+            uploading = True
+
+        self._dress_action(
+            self._upload_btn,
+            primary=uploading,
+            count=len(local),
+            arrow="▲",
+            verb="Upload",
+            target=self._remote.path or "the server",
+            empty="Pick files on the left to upload",
+            blocked="" if self._connected else "Not connected yet",
+        )
+        self._dress_action(
+            self._download_btn,
+            primary=not uploading,
+            count=len(remote),
+            arrow="▼",
+            verb="Download",
+            target=self._local.path or "this machine",
+            empty="Pick files on the right to download",
+            blocked="" if self._connected else "Not connected yet",
+        )
+
+    def _dress_action(
+        self, button, *, primary: bool, count: int, arrow: str, verb: str,
+        target: str, empty: str, blocked: str,
+    ) -> None:
+        """Give one transfer button its label, its tooltip and its weight."""
+        role = "primary" if primary else "secondary"
+        if button.objectName() != role:
+            button.setObjectName(role)
+            # A stylesheet is matched when the name is set, so a widget that
+            # changes role has to be repolished or it keeps the old look.
+            button.style().unpolish(button)
+            button.style().polish(button)
+        enabled = bool(count) and not blocked
+        button.setEnabled(enabled)
+        if not count:
+            button.setText(f"{arrow} {verb}")
+            button.setToolTip(blocked or empty)
+            return
+        button.setText(f"{arrow} {verb} {count}")
+        button.setToolTip(
+            blocked
+            or f"{verb} {count} item(s) into {target}"
+        )
+
+    def _set_connection_state(self, state: str, text: str = "") -> None:
+        """The pill in the corner: connecting, connected, or not.
+
+        Connection state used to live only in the status line, mixed in with
+        every other message and overwritten by the next one - so "why is
+        nothing happening?" had no answer on screen. One pill, always in the
+        same place, in the one colour that says which of three things is true.
+        """
+        labels = {
+            "busy": "Connecting…",
+            "ok": "Connected",
+            "fail": "Not connected",
+        }
+        pill = self._state_pill
+        pill.setText(labels.get(state, state))
+        pill.setToolTip(text or labels.get(state, ""))
+        if pill.property("state") != state:
+            pill.setProperty("state", state)
+            pill.style().unpolish(pill)
+            pill.style().polish(pill)
+
     # ----- status ---------------------------------------------------------
     def _set_status(self, message: str) -> None:
         self._status.setText(message)
@@ -4306,6 +4917,7 @@ class FileManagerTab(QWidget):
         # Scratch copies of edited files; the editor may still hold one open,
         # in which case it stays until Windows cleans the temp directory.
         shutil.rmtree(self._edit_root, ignore_errors=True)
+        shutil.rmtree(self._export_root, ignore_errors=True)
         if self._watcher is not None:
             self._watcher.stop()
             self._watcher = None
@@ -4334,7 +4946,58 @@ class FileManagerTab(QWidget):
         except RuntimeError:
             pass
         self._thread.quit()
-        self._thread.wait(3000)
+        if not self._thread.wait(3000):
+            _abandon_thread(self._thread, self._worker)
+
+
+#: Worker threads that outlived the tab that owned them. See _abandon_thread.
+_ABANDONED: set = set()
+
+
+def _abandon_thread(thread, worker) -> None:
+    """Let a thread that will not stop finish in its own time, safely.
+
+    Closing a tab while it is still connecting is the case that matters. The
+    worker is inside a blocking connect - a wrong host takes as long as the TCP
+    timeout - so the quit posted to its event loop is not looked at until that
+    returns, and the three-second wait gives up. What happened next was fatal
+    rather than untidy: the QThread is parented to the tab, so deleting the tab
+    deleted a *running* QThread, and Qt answers that by aborting the process.
+    Dropping the last Python reference to the worker at the same moment did the
+    same thing to a QObject another thread was still executing.
+
+    So the pair is cut loose instead: reparented out of the widget, kept alive
+    here, and dropped once the thread really does finish. The connection
+    attempt runs to its timeout on a thread nobody is waiting for, which costs
+    one socket for a few seconds and crashes nothing.
+    """
+    try:
+        thread.setParent(None)
+    except RuntimeError:
+        return
+    pair = (thread, worker)
+    _ABANDONED.add(pair)
+
+    def done() -> None:
+        _ABANDONED.discard(pair)
+        try:
+            # The queued close never ran - quit() beat it to the event loop -
+            # so the socket the connect finally opened is closed from here.
+            # The worker's thread has finished, so nothing else is touching it.
+            worker.close_connection()
+        except Exception:
+            pass
+        try:
+            worker.deleteLater()
+            thread.deleteLater()
+        except RuntimeError:
+            pass
+
+    thread.finished.connect(done)
+    # It may have finished between the wait timing out and the connection
+    # above being made, in which case nothing would ever fire.
+    if thread.isFinished():
+        done()
 
 
 def _missing_local_reason(target: str) -> str:

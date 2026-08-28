@@ -11,8 +11,16 @@ from __future__ import annotations
 import os
 
 from PyQt6.QtCore import QSize, Qt, QUrl
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QShortcut
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QGuiApplication,
+    QKeySequence,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QHBoxLayout,
@@ -81,6 +89,10 @@ _CATEGORY_OF = {
 _CATEGORY_ORDER = {
     name: index for index, (name, _) in enumerate(_DEFAULT_CATEGORIES)
 }
+#: Where a heading keeps the category name it stands for, so a drop can
+#: tell which group the row landed in.
+_GROUP_ROLE = Qt.ItemDataRole.UserRole + 1
+
 #: Width of the collapsed sidebar rail, in pixels.
 _RAIL_WIDTH = 30
 
@@ -117,13 +129,36 @@ class MainWindow(QMainWindow):
         self._panes: list[QTabWidget] = []
         self._active_pane = 0
         self.setWindowTitle("Sitekeeper")
-        self.resize(1200, 800)
+        self._size_to_screen()
 
         self._build_ui()
         self._build_menus()
         self._build_shortcuts()
         self._refresh_server_list()
         self._apply_settings()
+
+    def _size_to_screen(self) -> None:
+        """Open at a size that suits the monitor, not a fixed 1200x800.
+
+        Two file panes, a sidebar and a queue want room, and a fixed size that
+        was generous on a laptop is a postage stamp on the 1440p and 4K screens
+        this is actually used on. Takes most of the available work area - which
+        already excludes the taskbar - keeps a sane floor for small displays,
+        and centres what it opens.
+        """
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(1440, 900)
+            return
+        available = screen.availableGeometry()
+        width = max(1200, int(available.width() * 0.82))
+        height = max(800, int(available.height() * 0.86))
+        width = min(width, available.width())
+        height = min(height, available.height())
+        self.resize(width, height)
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
 
     # ----- UI construction ----------------------------------------------
     def _build_ui(self) -> None:
@@ -195,29 +230,56 @@ class MainWindow(QMainWindow):
         # levels deep and every connection carries an icon that says what it
         # is, so the default spent a third of a narrow sidebar on empty space
         # to the left of every row.
-        self._tree.setIndentation(10)
+        # No indent and no expander column. Qt paints a row's selection across
+        # the branch column as a separate rectangle, which showed up as a small
+        # grey tab floating to the left of the current connection, detached
+        # from its own rounded highlight - and no amount of styling that column
+        # would stop it, because the highlight is supposed to be one shape.
+        # Removing the column removes the question: this tree is two levels
+        # deep, its headings are already unmistakably headings, and every
+        # connection carries an icon.
+        self._tree.setIndentation(0)
+        self._tree.setRootIsDecorated(False)
+        # Connections can be dragged into the order you want, and onto another
+        # heading to move them into that group. Nothing else in this list is
+        # draggable: a heading is a place, not a thing.
+        self._tree.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._tree.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._tree.setDragEnabled(True)
+        self._tree.viewport().setAcceptDrops(True)
+        self._tree.setDropIndicatorShown(True)
+        self._tree.model().rowsMoved.connect(self._on_rows_moved)
         self._tree.itemDoubleClicked.connect(self._on_item_activated)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_tree_menu)
         sidebar_layout.addWidget(self._tree)
 
+        # Six identical buttons in three rows said that opening a
+        # connection - the entire purpose of this list - was exactly as
+        # important as locking the vault. Connect leads, and the three that
+        # need something selected say so by going quiet until it is.
+        self._connect_btn = QPushButton("Connect")
+        self._connect_btn.setObjectName("primary")
+        self._connect_btn.setToolTip("Open the selected connection (Enter)")
+        self._connect_btn.clicked.connect(self._on_connect)
+        sidebar_layout.addWidget(self._connect_btn)
+
         button_row = QHBoxLayout()
+        button_row.setSpacing(4)
         add_btn = QPushButton("Add")
-        edit_btn = QPushButton("Edit")
-        delete_btn = QPushButton("Delete")
+        self._edit_btn = QPushButton("Edit")
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setObjectName("danger")
         add_btn.clicked.connect(self._on_add)
-        edit_btn.clicked.connect(self._on_edit)
-        delete_btn.clicked.connect(self._on_delete)
+        self._edit_btn.clicked.connect(self._on_edit)
+        self._delete_btn.clicked.connect(self._on_delete)
         button_row.addWidget(add_btn)
-        button_row.addWidget(edit_btn)
-        button_row.addWidget(delete_btn)
+        button_row.addWidget(self._edit_btn)
+        button_row.addWidget(self._delete_btn)
         sidebar_layout.addLayout(button_row)
 
-        open_btn = QPushButton("Connect")
-        open_btn.clicked.connect(self._on_connect)
-        sidebar_layout.addWidget(open_btn)
-
         bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(4)
         settings_btn = QPushButton("Settings…")
         settings_btn.clicked.connect(self._open_settings)
         lock_btn = QPushButton("Lock")
@@ -225,7 +287,26 @@ class MainWindow(QMainWindow):
         bottom_row.addWidget(settings_btn)
         bottom_row.addWidget(lock_btn)
         sidebar_layout.addLayout(bottom_row)
+
+        self._tree.itemSelectionChanged.connect(self._refresh_sidebar_actions)
+        self._refresh_sidebar_actions()
         return self._sidebar
+
+    def _refresh_sidebar_actions(self) -> None:
+        """Only offer what the current selection can actually do."""
+        chosen = self._selected_profile() is not None
+        for button, empty in (
+            (self._connect_btn, "Pick a connection in the list first"),
+            (self._edit_btn, "Pick a connection to edit"),
+            (self._delete_btn, "Pick a connection to delete"),
+        ):
+            button.setEnabled(chosen)
+            if not chosen:
+                button.setToolTip(empty)
+        if chosen:
+            self._connect_btn.setToolTip("Open the selected connection (Enter)")
+            self._edit_btn.setToolTip("Change this connection's settings")
+            self._delete_btn.setToolTip("Forget this connection")
 
     def _build_rail(self) -> QWidget:
         """The slim strip shown while the sidebar is collapsed."""
@@ -483,10 +564,20 @@ class MainWindow(QMainWindow):
         for profile in self._store.all():
             by_category.setdefault(_category_of(profile), []).append(profile)
         for name in sorted(by_category, key=_category_sort_key):
-            profiles = sorted(by_category[name], key=lambda p: p.label.lower())
+            # Hand-arranged groups keep the arrangement; the rest stay
+            # alphabetical, which is what a group nobody has dragged should
+            # look like.
+            profiles = sorted(
+                by_category[name], key=lambda p: (p.order or 0, p.label.lower())
+            )
             parent = QTreeWidgetItem([f"{name}  ({len(profiles)})"])
             parent.setFirstColumnSpanned(True)
-            parent.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            # A heading is a drop target and nothing else: it cannot be picked
+            # up, and it cannot be selected as though it were a connection.
+            parent.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled
+            )
+            parent.setData(0, _GROUP_ROLE, name)
             self._tree.addTopLevelItem(parent)
             parent.setExpanded(True)
             for profile in profiles:
@@ -495,6 +586,11 @@ class MainWindow(QMainWindow):
                     f"{profile.label}  ·  {badge}" if badge else profile.label
                 )
                 item = QTreeWidgetItem([label])
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                )
                 item.setData(0, Qt.ItemDataRole.UserRole, profile.id)
                 item.setIcon(
                     0, theme.kind_icon(profile.kind.value, self._settings.dark_mode)
@@ -505,6 +601,36 @@ class MainWindow(QMainWindow):
                     item.setForeground(0, color)
                 parent.addChild(item)
         self._apply_filter(self._search.text())
+
+    def _on_rows_moved(self, *_args) -> None:
+        """A drag finished: read the tree back and write down what it says.
+
+        Qt has already moved the row, so the tree is the truth. Every
+        connection under every heading is renumbered from one, and a
+        connection now sitting under a different heading is *in* that group -
+        which is how a drag onto a heading moves it there. Dropping onto one
+        of the default headings clears the group instead of storing its name,
+        so the connection goes back to being filed by what it is.
+        """
+        positions: dict[str, tuple[str, int]] = {}
+        for index in range(self._tree.topLevelItemCount()):
+            heading = self._tree.topLevelItem(index)
+            name = str(heading.data(0, _GROUP_ROLE) or "")
+            # A default heading is not a group anybody named.
+            group = "" if name in _CATEGORY_ORDER else name
+            for position in range(heading.childCount()):
+                child = heading.child(position)
+                profile_id = child.data(0, Qt.ItemDataRole.UserRole)
+                if profile_id:
+                    positions[str(profile_id)] = (group, position + 1)
+        if not positions:
+            return
+        changed = self._store.reorder(positions)
+        # Redraw either way: Qt's move left the counts in the headings stale,
+        # and a drop the store declined must not stay on screen.
+        self._refresh_server_list()
+        if changed:
+            self.statusBar().showMessage("Connection list rearranged", 3000)
 
     def _apply_filter(self, text: str) -> None:
         """Hide what does not match. Hostnames count, not just labels.
@@ -831,9 +957,16 @@ class MainWindow(QMainWindow):
                 return None
             tab = FileManagerTab(profile, dark_mode=dark, settings=self._settings)
             tab.shell_requested.connect(self._open_shell_tab)
+            tab.profile_changed.connect(self._on_profile_changed)
             return tab
         # A browser tab's "dark mode" means the page, not the app chrome.
         return BrowserTab(profile, dark_mode=self._settings.web_dark_mode)
+
+    def _on_profile_changed(self, profile: object) -> None:
+        """A tab changed something worth keeping - write it to the vault."""
+        if not isinstance(profile, ServerProfile):
+            return
+        self._store.update(profile)
 
     def _open_shell_tab(self, profile: object, spec: object, cwd: str) -> None:
         """Open an SSH shell beside the file manager that asked for it."""
@@ -1180,9 +1313,11 @@ class MainWindow(QMainWindow):
         settings.shadow_backups = dialog.shadow_backups()
         settings.history_days = dialog.history_days()
         settings.verify_uploads = dialog.verify_uploads()
+        settings.preserve_times = dialog.preserve_times()
         settings.use_ignore_rules = dialog.use_ignore_rules()
         settings.ignore_defaults = dialog.ignore_defaults()
         settings.folder_stats = dialog.folder_stats()
+        settings.sync_compare_hashes = dialog.sync_compare_hashes()
         settings.mirror_navigation = dialog.mirror_navigation()
         if dialog.production_guard() and not settings.production_guard:
             # Switching the guard back on is the way back for connections that
