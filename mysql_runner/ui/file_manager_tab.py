@@ -26,6 +26,8 @@ from datetime import datetime
 
 from PyQt6.QtCore import (
     QEvent,
+    QItemSelection,
+    QItemSelectionModel,
     QMimeData,
     QSize,
     QThread,
@@ -734,12 +736,17 @@ class _FilePane(QWidget):
 
     # ----- content --------------------------------------------------------
     def set_listing(self, path: str, entries: list[RemoteEntry], *, at_root: bool) -> None:
-        if path != self._path and self._filter:
-            # The filter belongs to the directory it was typed in.
-            self._filter_edit.blockSignals(True)
-            self._filter_edit.clear()
-            self._filter_edit.blockSignals(False)
-            self._filter = ""
+        if path != self._path:
+            if self._filter:
+                # The filter belongs to the directory it was typed in.
+                self._filter_edit.blockSignals(True)
+                self._filter_edit.clear()
+                self._filter_edit.blockSignals(False)
+                self._filter = ""
+            # Going somewhere else: what was picked in the old directory
+            # means nothing here, so the selection does not travel. Only
+            # a re-listing of the *same* directory keeps it (see _render).
+            self._table.clearSelection()
         self._path = path
         self._entries = list(entries)
         self._path_bar.set_path(path)
@@ -835,6 +842,19 @@ class _FilePane(QWidget):
         return ordered
 
     def _render(self) -> None:
+        # Rebuilding the rows drops whatever was picked, and a re-render is
+        # nearly always a refresh of the directory already on show: a sort
+        # click, a filter, folder statistics landing - and, the one that
+        # actually hurt, a background sync's queue draining. A commit-driven
+        # sync submits one batch per sub-directory, so the pool falls idle
+        # between them and both panes were being re-listed over and over
+        # while the user was trying to use them. Losing the selection there
+        # disarms every manual transfer at once: the buttons go dim, and a
+        # drag begun a moment later finds nothing to carry, so it never
+        # starts and nothing whatsoever appears to happen. Navigation clears
+        # the selection itself before getting here, so what survives is only
+        # ever a name in the directory it was picked in.
+        chosen = {name for name, _ in self.selection()}
         table = self._table
         table.setRowCount(0)
         self._hover_row = -1
@@ -856,6 +876,8 @@ class _FilePane(QWidget):
         # every render (each sort click renders) collapsed whatever the user
         # had dragged the columns to.
         self._update_count(shown)
+        if chosen:
+            self._reselect(chosen)
 
     def _update_count(self, shown: list[RemoteEntry] | None = None) -> None:
         """The little truth next to the title: what is here, or what is picked."""
@@ -930,23 +952,37 @@ class _FilePane(QWidget):
         """Replace the rows in place (used when folder statistics arrive).
 
         Whatever was selected stays selected: statistics landing a second later
-        must not throw away the selection the user just made.
+        must not throw away the selection the user just made. _render keeps it
+        for every caller now, so there is nothing extra to do here.
         """
-        chosen = {name for name, _ in self.selection()}
         self._entries = list(entries)
         self._render()
-        if chosen:
-            self._reselect(chosen)
 
     def _reselect(self, names: set[str]) -> None:
-        self._table.clearSelection()
+        """Pick these rows by name - all of them, in one go.
+
+        selectRow() cannot be used in a loop here. Under ExtendedSelection it
+        issues a ClearAndSelect, so each call threw away the last one and a
+        multi-row selection came back as whichever row happened to match
+        last: pick four files, let anything refresh the pane, and three of
+        them were quietly gone. Handing the selection model one range per row
+        keeps every one.
+        """
+        model = self._table.model()
+        last_column = max(0, model.columnCount() - 1)
+        wanted = QItemSelection()
         for row in range(self._table.rowCount()):
             item = self._table.item(row, _NAME)
             if item is None:
                 continue
             name, _is_dir, is_parent = item.data(Qt.ItemDataRole.UserRole)
             if not is_parent and name in names:
-                self._table.selectRow(row)
+                wanted.select(model.index(row, 0), model.index(row, last_column))
+        self._table.selectionModel().select(
+            wanted,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
 
     @property
     def entries(self) -> list[RemoteEntry]:
@@ -1276,10 +1312,16 @@ class FileManagerTab(QWidget):
     _list_requested = pyqtSignal(str)
     _home_requested = pyqtSignal()
     _mkdir_requested = pyqtSignal(str)
+    _mkfile_requested = pyqtSignal(str)
     _delete_requested = pyqtSignal(str, bool)
     _rename_requested = pyqtSignal(str, str)
     _download_requested = pyqtSignal(object, str)
+    #: A whole tree, grouped by destination folder, as one queue.
+    _download_groups_requested = pyqtSignal(object)
     _upload_requested = pyqtSignal(object, str)
+    #: A whole tree, grouped by sub-directory, as one queue: (payload,
+    #: base directory, quiet). See TransferWorker.upload_groups.
+    _upload_groups_requested = pyqtSignal(object, str, bool)
     _close_requested = pyqtSignal()
     _chmod_requested = pyqtSignal(str, int, bool, str)
     _symlink_requested = pyqtSignal(str, str)
@@ -1630,13 +1672,21 @@ class FileManagerTab(QWidget):
         row.addSpacing(12)
 
         mkdir_btn = QPushButton("New folder")
+        mkdir_btn.setToolTip(
+            "F7. A path makes every folder in it: releases/2026/08"
+        )
         mkdir_btn.clicked.connect(self._on_mkdir)
+        mkfile_btn = QPushButton("New file")
+        mkfile_btn.setToolTip(
+            "Shift+F4. Creates it empty; an existing file is left alone"
+        )
+        mkfile_btn.clicked.connect(self._on_mkfile)
         rename_btn = QPushButton("Rename")
         rename_btn.clicked.connect(self._on_rename)
         delete_btn = QPushButton("Delete")
         delete_btn.setObjectName("danger")
         delete_btn.clicked.connect(self._on_delete)
-        for button in (mkdir_btn, rename_btn, delete_btn):
+        for button in (mkdir_btn, mkfile_btn, rename_btn, delete_btn):
             row.addWidget(button)
 
         row.addSpacing(12)
@@ -1684,6 +1734,7 @@ class FileManagerTab(QWidget):
             ("Ctrl+F", lambda: self._active_pane().focus_filter()),
             ("F2", self._on_rename),
             ("F7", self._on_mkdir),
+            ("Shift+F4", self._on_mkfile),
             ("F9", lambda: self._on_compare(with_hashes=True)),
             ("Ctrl+T", self._on_terminal),
             ("Ctrl+P", self._on_command_bar),
@@ -1762,10 +1813,13 @@ class FileManagerTab(QWidget):
             (self._list_requested, self._worker.list_dir),
             (self._home_requested, self._worker.request_home),
             (self._mkdir_requested, self._worker.make_dir),
+            (self._mkfile_requested, self._worker.make_file),
             (self._delete_requested, self._worker.delete_entry),
             (self._rename_requested, self._worker.rename_entry),
             (self._download_requested, self._worker.run_download),
+            (self._download_groups_requested, self._worker.download_groups),
             (self._upload_requested, self._worker.run_upload),
+            (self._upload_groups_requested, self._worker.upload_groups),
             (self._close_requested, self._worker.close_connection),
             (self._chmod_requested, self._worker.request_chmod),
             (self._symlink_requested, self._worker.request_symlink),
@@ -2364,53 +2418,58 @@ class FileManagerTab(QWidget):
         """Send items, keeping their layout relative to ``flatten`` if given.
 
         ``quiet`` sends them without the remote pane following the transfer.
-        Anything a trigger starts has to be quiet. A push is split into one
-        batch per sub-directory, so the pane would otherwise be left in
-        whichever of them happened to go up last - an arbitrary folder like
-        ``/admin`` - and the next push, whose target is read off the pane,
-        would aim inside it: ``/admin/admin/file``. The refresh when the queue
-        drains still repaints whatever directory the user is actually in.
+        Anything a trigger starts has to be quiet: nobody asked to be taken
+        anywhere. The refresh when the queue drains still repaints whatever
+        directory the user is actually in.
 
         ``origin`` names the trigger, so the queue can group the batch under
         it and say what started an upload nobody pressed a button for.
         """
         ignore = rules if rules is not None else self._ignore_rules()
-
-        def send(group, target: str) -> None:
+        if not flatten:
             if quiet:
                 # True: a trigger's target can be a folder the commit only
                 # just added, which the upload has to make for itself.
                 self._upload_quiet_requested.emit(
-                    (group, ignore, origin), target, True
+                    (items, ignore, origin), remote_dir, True
                 )
             else:
-                self._upload_requested.emit((group, ignore, origin), target)
-
-        if not flatten:
-            send(items, remote_dir)
+                self._upload_requested.emit((items, ignore, origin), remote_dir)
             return
-        # Group by their sub-directory so nested files land in the right place.
+        # Group by their sub-directory so nested files land in the right
+        # place - but hand the lot over in one go. Sending a group at a time
+        # made each its own queue, and a sync of a twenty-folder site then
+        # started, drained and reported twenty separate batches, re-listing
+        # the server and reloading the local pane after every one.
         by_dir: dict[str, list[tuple[str, bool]]] = {}
         for path, is_dir in items:
             rel_dir = os.path.dirname(os.path.relpath(path, flatten))
             target = RemoteFS.join(remote_dir, rel_dir.replace("\\", "/")) if rel_dir else remote_dir
             by_dir.setdefault(target, []).append((path, is_dir))
-        for target, group in by_dir.items():
-            send(group, target)
+        if not by_dir:
+            return
+        self._upload_groups_requested.emit(
+            (list(by_dir.items()), ignore, origin), remote_dir, quiet
+        )
 
     def _download_tree(self, items, local_dir: str, *, flatten: str = "") -> None:
         if not flatten:
             self._download_requested.emit((items, self._ignore_rules()), local_dir)
             return
+        # Grouped by destination folder, then sent as one queue - see
+        # _upload_tree for why a group at a time was the wrong shape. The
+        # folders themselves are made on the worker thread with the rest.
         by_dir: dict[str, list[tuple[str, bool]]] = {}
         for path, is_dir in items:
             rel = path[len(flatten.rstrip("/")) + 1:] if path.startswith(flatten) else ""
             rel_dir = os.path.dirname(rel)
             target = os.path.join(local_dir, rel_dir.replace("/", os.sep)) if rel_dir else local_dir
             by_dir.setdefault(target, []).append((path, is_dir))
-        for target, group in by_dir.items():
-            os.makedirs(target, exist_ok=True)
-            self._download_requested.emit((group, self._ignore_rules()), target)
+        if not by_dir:
+            return
+        self._download_groups_requested.emit(
+            (list(by_dir.items()), self._ignore_rules(), "compare")
+        )
 
     # ----- the watcher ---------------------------------------------------
     def _on_watch_toggled(self, watching: bool) -> None:
@@ -4018,7 +4077,8 @@ class FileManagerTab(QWidget):
             return
         if not self._confirm_production(f"upload {len(items)} item(s) to"):
             return
-        self._upload_requested.emit((items, self._ignore_rules()), target)
+        rules = self._manual_rules(items)
+        self._upload_requested.emit((items, rules), target)
 
     def _on_pane_drop(self, payload: object) -> None:
         """Rows dragged from one pane and dropped on the other."""
@@ -4044,8 +4104,8 @@ class FileManagerTab(QWidget):
             return
         if not self._confirm_production(f"upload {len(items)} item(s) to"):
             return
-        self._upload_requested.emit((items, self._ignore_rules()), target)
-        self._set_status(f"Uploading {len(items)} item(s) to {target}.")
+        rules = self._manual_rules(items)
+        self._upload_requested.emit((items, rules), target)
 
     def _on_upload(self) -> None:
         if not self._require_connection():
@@ -4057,7 +4117,8 @@ class FileManagerTab(QWidget):
         if not self._confirm_production(f"upload {len(selection)} item(s) to"):
             return
         items = [(self._local_child(name), is_dir) for name, is_dir in selection]
-        self._upload_requested.emit((items, self._ignore_rules()), self._remote.path or "/")
+        rules = self._manual_rules(items)
+        self._upload_requested.emit((items, rules), self._remote.path or "/")
 
     def _on_download(self) -> None:
         if not self._require_connection():
@@ -4088,6 +4149,40 @@ class FileManagerTab(QWidget):
                 QMessageBox.warning(self, "Could not create folder", str(exc))
                 return
             self._load_local(self._local.path)
+
+    def _on_mkfile(self) -> None:
+        """Create an empty file in whichever pane is active."""
+        side = "remote" if self._remote_active else "local"
+        name, ok = QInputDialog.getText(
+            self, "New file", f"Name of the new {side} file:"
+        )
+        name = name.strip().replace("\\", "/").strip("/")
+        if not ok or not name:
+            return
+        if self._remote_active:
+            if not self._require_connection():
+                return
+            if not self._confirm_production(f"create {name} on"):
+                return
+            self._mkfile_requested.emit(
+                RemoteFS.join(self._remote.path or "/", name)
+            )
+            return
+        target = os.path.join(self._local.path, name.replace("/", os.sep))
+        try:
+            os.makedirs(os.path.dirname(target) or self._local.path, exist_ok=True)
+            # "x": never truncate a file that is already there. Creating one
+            # is not the same request as emptying one.
+            with open(target, "x"):
+                pass
+        except FileExistsError:
+            self._set_status(f"{name} is already there; it was left alone.")
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not create file", str(exc))
+            return
+        self._load_local(self._local.path)
+        self._set_status(f"Created {name}.")
 
     def _on_rename(self) -> None:
         pane = self._active_pane()
@@ -4491,6 +4586,7 @@ class FileManagerTab(QWidget):
             menu.addSeparator()
 
         menu.addAction("New folder (F7)", self._on_mkdir)
+        menu.addAction("New file (Shift+F4)", self._on_mkfile)
         menu.addAction("Rename (F2)", self._on_rename).setEnabled(len(selection) == 1)
         menu.addAction("Delete (Del)", self._on_delete).setEnabled(bool(selection))
         menu.addAction("Refresh", pane.refresh)
@@ -4768,6 +4864,46 @@ class FileManagerTab(QWidget):
             "anything in. Connect over SFTP for the server-side tools.",
         )
         return False
+
+    def _manual_rules(self, items) -> IgnoreRules:
+        """The ignore rules to use for an upload somebody picked by hand.
+
+        The ignore list keeps junk out of a bulk push - node_modules, caches,
+        build output, and .env, which usually holds secrets that should not be
+        copied over a server's own. For anything automatic that is right, and a
+        commit-driven sync must go on obeying it: quietly overwriting a live
+        .env with a developer's local one is a genuinely bad afternoon.
+
+        Applied to a file someone selected and pressed Upload on, it is simply
+        wrong. Picking the file *is* the decision, and there is nobody else to
+        ask. It also failed in the worst possible way - filtered out before a
+        queue was ever built, so there was no queue entry, no warning and no
+        error, and .env just never went anywhere.
+
+        So every entry named here goes, whatever the rules say. Walking *into*
+        a selected folder still filters, so dragging a project folder across
+        does not drag node_modules with it.
+        """
+        rules = self._ignore_rules()
+        names = [
+            os.path.basename(path.rstrip("\\/")) or path for path, _ in items
+        ]
+        held = [
+            name
+            for name, (_path, is_dir) in zip(names, items)
+            if rules.is_ignored(name, is_dir=is_dir)
+        ]
+        if held:
+            # Worth saying out loud - not worth a dialog in the way.
+            shown = ", ".join(held[:4])
+            if len(held) > 4:
+                shown += f", and {len(held) - 4} more"
+            subject = "is" if len(held) == 1 else "are"
+            self._set_status(
+                f"Sending {shown} — normally {subject} held back by the ignore "
+                "rules, but you picked it."
+            )
+        return rules.allowing(names)
 
     def _confirm_production(self, action: str) -> bool:
         """Ask before anything destructive on a production connection.

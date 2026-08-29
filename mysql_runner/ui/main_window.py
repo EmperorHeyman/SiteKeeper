@@ -1159,62 +1159,12 @@ class MainWindow(QMainWindow):
 
     # ----- Claude / MCP ----------------------------------------------------
     def _show_mcp_hint(self) -> None:
-        """How to hand these connections to Claude - said inside the app,
-        because the app is where anyone would go looking for it."""
-        import sys
-        from pathlib import Path
+        """Hand these connections to Claude - said inside the app, because the
+        app is where anyone would go looking for it."""
+        from mysql_runner.ui.mcp_dialog import MCPDialog
 
-        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+        MCPDialog(self._store.all(), self).exec()
 
-        command = "claude mcp add sitekeeper -- python -m mysql_runner.mcp --allow-write"
-        frozen = bool(getattr(sys, "frozen", False))
-        if frozen:
-            where = (
-                "Run it inside your Sitekeeper source checkout - the MCP "
-                "server runs from source, not from this installed build."
-            )
-        else:
-            root = Path(__file__).resolve().parents[2]
-            where = f"Run it in {root}."
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Connect Claude")
-        layout = QVBoxLayout(dialog)
-        intro = QLabel(
-            "Sitekeeper ships an MCP server, so Claude Code and Claude "
-            "Desktop can use these connections themselves: browse and read "
-            "remote files, push files and folders, and run MySQL queries - "
-            "against this same vault. Register it once:"
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-        command_edit = QLineEdit(command)
-        command_edit.setReadOnly(True)
-        layout.addWidget(command_edit)
-        note = QLabel(
-            f"{where}\n\n"
-            "It is read-only until a flag grants more: --allow-write "
-            "(uploads), --allow-delete, --allow-sql-write, and "
-            "--allow-production for servers marked PROD. --profiles \"A,B\" "
-            "restricts which connections Claude sees. Details are in the "
-            "README."
-        )
-        note.setWordWrap(True)
-        note.setObjectName("hint")
-        layout.addWidget(note)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        copy_btn = buttons.addButton(
-            "Copy command", QDialogButtonBox.ButtonRole.ActionRole
-        )
-        copy_btn.clicked.connect(
-            lambda: QApplication.clipboard().setText(command)
-        )
-        buttons.rejected.connect(dialog.close)
-        layout.addWidget(buttons)
-        dialog.resize(560, dialog.sizeHint().height())
-        dialog.exec()
-
-    # ----- view toggles --------------------------------------------------
     def _toggle_dark_mode(self) -> None:
         """The application's own chrome."""
         enabled = self._dark_action.isChecked()

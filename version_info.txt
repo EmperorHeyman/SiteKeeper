@@ -5,8 +5,8 @@
 #
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 8, 0, 0),
-        prodvers=(1, 8, 0, 0),
+        filevers=(1, 8, 2, 0),
+        prodvers=(1, 8, 2, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -20,17 +20,17 @@ VSVersionInfo(
                 StringTable(
                     "040904B0",
                     [
-                        StringStruct("CompanyName", "RAPL Group"),
+                        StringStruct("CompanyName", "RAPL Group, s.r.o."),
                         StringStruct("FileDescription", "Sitekeeper"),
-                        StringStruct("FileVersion", "1.8.0.0"),
+                        StringStruct("FileVersion", "1.8.2.0"),
                         StringStruct("InternalName", "Sitekeeper"),
                         StringStruct(
                             "LegalCopyright",
-                            "Copyright (c) 2026 RAPL Group. Author: Lukáš Peterek.",
+                            "Copyright (c) 2026 RAPL Group, s.r.o. Author: Lukáš Peterek.",
                         ),
                         StringStruct("OriginalFilename", "Sitekeeper.exe"),
                         StringStruct("ProductName", "Sitekeeper"),
-                        StringStruct("ProductVersion", "1.8.0.0"),
+                        StringStruct("ProductVersion", "1.8.2.0"),
                         StringStruct("Author", "Lukáš Peterek"),
                     ],
                 )

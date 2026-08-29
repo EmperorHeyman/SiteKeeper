@@ -19,10 +19,11 @@ are looking at, and why a running queue does not stop you browsing.
 from __future__ import annotations
 
 import os
+import tempfile
 import threading
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from mysql_runner.storage.models import ConnectionKind
 from mysql_runner.transfer.base import RemoteFS, TransferError, Unsupported
@@ -111,6 +112,11 @@ class TransferWorker(QObject):
     failed = pyqtSignal(str)
     #: A directory listing completed: (path, list[RemoteEntry]).
     listing = pyqtSignal(str, object)
+    #: Internal: re-list a directory once the queue has drained. The pool
+    #: signals idle from one of its *own* threads, which must not be the
+    #: thread that talks on the navigation connection - hence a signal
+    #: rather than a call. See _on_pool_idle.
+    _refresh_listing = pyqtSignal(str)
     #: A single operation failed (non-fatal).
     op_failed = pyqtSignal(str)
     #: An operation succeeded, with a message for the status line.
@@ -169,6 +175,11 @@ class TransferWorker(QObject):
         self._browse_lock = threading.Lock()
         self._queue_totals = [0, 0, 0]  # queued, completed, failed
         self._last_listing = ""        # refreshed after a queue drains
+        # Queued explicitly: the emit comes from a pool thread and the
+        # listing has to happen on the thread this object lives on.
+        self._refresh_listing.connect(
+            self.list_dir, Qt.ConnectionType.QueuedConnection
+        )
 
     # ----- cancellation ---------------------------------------------------
     def cancel(self) -> None:
@@ -305,13 +316,57 @@ class TransferWorker(QObject):
 
     @pyqtSlot(str)
     def make_dir(self, path: str) -> None:
+        """Create a folder, including any parents it needs.
+
+        makedirs rather than mkdir: typing a path into the New folder box -
+        ``releases/2026/08`` - is the obvious thing to do and used to fail
+        with whatever the server says about a missing parent, which reads
+        like the whole feature is broken rather than like a hint to make
+        three folders one at a time.
+        """
         fs = self._fs
         if fs is None:
             self.op_failed.emit(NOT_CONNECTED)
             return
         try:
-            self._with_session(lambda fs: fs.mkdir(path))
+            self._with_session(lambda fs: fs.makedirs(path))
         except TransferError as exc:
+            self.op_failed.emit(str(exc))
+            return
+        self.op_done.emit(f"Created {path}")
+        self.list_dir(fs.parent(path))
+
+    @pyqtSlot(str)
+    def make_file(self, path: str) -> None:
+        """Create an empty file on the server.
+
+        There is no "touch" in either protocol, so an empty local file is
+        uploaded instead - which also makes the parent folders on the way,
+        the same as New folder does.
+
+        An existing file is never overwritten. Creating one is not the same
+        request as emptying one, and a New file box that silently truncated
+        a config nobody meant to touch would be a genuinely dangerous way to
+        find that out.
+        """
+        fs = self._fs
+        if fs is None:
+            self.op_failed.emit(NOT_CONNECTED)
+            return
+        try:
+            if self._with_session(lambda fs: fs.exists(path)):
+                self.op_failed.emit(
+                    f"{fs.basename(path)} is already there; it was left alone."
+                )
+                return
+            parent = fs.parent(path)
+            if parent:
+                self._with_session(lambda fs: fs.makedirs(parent))
+            blank = os.path.join(tempfile.gettempdir(), "sitekeeper-new-file")
+            with open(blank, "wb"):
+                pass
+            self._with_session(lambda fs: fs.upload(blank, path))
+        except (TransferError, OSError) as exc:
             self.op_failed.emit(str(exc))
             return
         self.op_done.emit(f"Created {path}")
@@ -531,6 +586,27 @@ class TransferWorker(QObject):
         self.progress.emit(item.name, item.transferred, item.size)
 
     def _on_pool_idle(self, stats: dict) -> None:
+        """The queue drained. Runs on whichever pool thread finished last.
+
+        Everything here must therefore be thread-safe, and one thing here
+        very much was not: the refresh below used to be a direct call, so a
+        pool thread ran a listing on the *navigation* connection while the
+        worker thread was quite possibly using it too. Two threads on one
+        FTP control socket - or one paramiko SFTP channel - interleave their
+        requests and the session never recovers: replies are read by the
+        wrong caller, and the next operation blocks on a response that is
+        never coming. paramiko sets no read timeout, so 'blocks' means
+        forever, and the worker thread stops returning to its event loop.
+        Every later upload, listing or drop then sat in the queue unread -
+        no error, no queue entry, nothing happening at all, until the tab
+        was reopened.
+
+        A commit-driven sync is what made it likely: it submits one batch
+        per sub-directory, so the pool falls idle again and again while the
+        worker thread is still working through the next batch - or, with
+        delete_remote on, still walking a tree of removals on that same
+        connection. Signals cross threads safely; calls do not.
+        """
         self.queue_stats.emit(stats)
         counts = stats.get("counts", {})
         cancelled = bool(counts.get("cancelled"))
@@ -538,9 +614,10 @@ class TransferWorker(QObject):
             self._queue_totals[1], self._queue_totals[2], cancelled
         )
         self._queue_totals = [0, 0, 0]
-        # Refresh whatever directory the transfers landed in.
+        # Refresh whatever directory the transfers landed in - on the
+        # worker thread, once it is free.
         if self._last_listing:
-            self.list_dir(self._last_listing)
+            self._refresh_listing.emit(self._last_listing)
 
     @pyqtSlot(object, str)
     def run_download(self, items: object, local_dir: str) -> None:
@@ -570,6 +647,49 @@ class TransferWorker(QObject):
                 os.makedirs(path, exist_ok=True)
             except OSError as exc:
                 self.op_failed.emit(f"{path}: {exc}")
+        self._start_queue(pool, jobs, skipped, origin)
+
+    @pyqtSlot(object)
+    def download_groups(self, payload: object) -> None:
+        """Fetch several directories' worth of files as one queue.
+
+        The mirror of upload_groups, and it had the same problem: a tree
+        pulled down was handed over one destination folder at a time, so
+        each became its own queue and the pool drained between every one.
+
+        ``payload`` is (groups, rules, origin), where groups is a list of
+        (local directory, [(remote path, is_dir), ...]).
+        """
+        fs = self._ensure_session()
+        pool = self._ensure_pool()
+        if fs is None or pool is None:
+            self._fail_queue()
+            return
+        groups, rules, origin = _split_groups(payload)
+        self._cancelled = False
+        jobs: list[TransferItem] = []
+        skipped: list[str] = []
+        made: set[str] = set()
+        for target, sources in groups:
+            try:
+                batch, directories, missed = expand_remote(
+                    fs, sources, target, rules=rules
+                )
+            except TransferError as exc:
+                # One unreadable folder must not take the rest of the pull
+                # down with it, the way a single queue per group used to.
+                self.op_failed.emit(str(exc))
+                continue
+            jobs.extend(batch)
+            skipped.extend(missed)
+            for directory in [target, *directories]:
+                if not directory or directory in made:
+                    continue
+                made.add(directory)
+                try:
+                    os.makedirs(directory, exist_ok=True)
+                except OSError as exc:
+                    self.op_failed.emit(f"{directory}: {exc}")
         self._start_queue(pool, jobs, skipped, origin)
 
     @pyqtSlot(object, str)
@@ -642,6 +762,69 @@ class TransferWorker(QObject):
                 pass
         self._start_queue(pool, jobs, skipped, origin)
 
+    @pyqtSlot(object, str, bool)
+    def upload_groups(self, payload: object, remote_dir: str, quiet: bool) -> None:
+        """Send several sub-directories' worth of files as one queue.
+
+        A tree push is grouped by sub-directory, because each group lands
+        somewhere different. It used to be handed over one group at a time,
+        which meant one *queue* each: the pool drained and restarted between
+        them, so the panel's batch counter reset over and over, the queue's
+        history filled with a dozen batches nobody asked for, and every one
+        of those drains re-listed the directory on show and made the tab
+        reload its local pane. A sync of a site with twenty folders paid all
+        of that twenty times. One queue instead: the pool falls idle once,
+        at the end, which is the only moment any of it is worth doing.
+
+        ``payload`` is (groups, rules, origin), where groups is a list of
+        (remote directory, [(local path, is_dir), ...]).
+
+        ``quiet`` leaves the remote pane where it is. Anything a trigger
+        started - a save, a commit, a comparison - has to be quiet: nobody
+        asked to be taken anywhere.
+        """
+        fs = self._ensure_session()
+        pool = self._ensure_pool()
+        if fs is None or pool is None:
+            self._fail_queue()
+            return
+        groups, rules, origin = _split_groups(payload)
+        self._cancelled = False
+        jobs: list[TransferItem] = []
+        skipped: list[str] = []
+        # One attempt per directory across the whole push. Sibling groups
+        # share every parent above them, and makedirs walks that chain.
+        made: set[str] = set()
+        for target, sources in groups:
+            batch, directories, missed = expand_local(
+                fs, sources, target, rules=rules
+            )
+            jobs.extend(batch)
+            skipped.extend(missed)
+            # A sync can aim files at a directory that does not exist yet -
+            # a commit that adds a folder. The directory on show obviously
+            # exists, so it is not paid for.
+            if target and target not in made and target != self._last_listing:
+                made.add(target)
+                try:
+                    fs.makedirs(target)
+                except TransferError:
+                    pass  # a real problem surfaces when the first file lands
+            for path in directories:
+                if path in made:
+                    continue
+                made.add(path)
+                try:
+                    fs.mkdir(path)
+                except TransferError:
+                    pass  # almost always "already exists"
+        if not quiet and remote_dir:
+            # The base of the push, not whichever sub-directory happened to
+            # go up last: that used to leave the pane inside an arbitrary
+            # folder, and the next push aimed at /admin/admin/file.
+            self._last_listing = remote_dir
+        self._start_queue(pool, jobs, skipped, origin)
+
     def _start_queue(
         self,
         pool: TransferPool,
@@ -659,11 +842,18 @@ class TransferWorker(QObject):
             return
         self._queue_totals = [len(jobs), 0, 0]
         self.queue_started.emit(len(jobs), origin)
-        if skipped:
-            self.op_done.emit(f"{len(skipped)} item(s) skipped by the ignore rules.")
         if not jobs:
+            # Order matters: the status line keeps the last thing said, and
+            # queue_finished says "0 file(s) transferred", which is true and
+            # useless. It used to land *after* the reason and bury it, so a
+            # push that was filtered out entirely looked like nothing had
+            # happened at all. The reason goes last, and names names.
             self.queue_finished.emit(0, 0, False)
+            if skipped:
+                self.op_failed.emit(_skip_reason(skipped))
             return
+        if skipped:
+            self.op_done.emit(_skip_reason(skipped))
         # A new run starts from a clean slate: what the last one finished stays
         # visible in the panel's history, but the pool - and so the counters -
         # should speak about the work at hand, not everything since connecting.
@@ -1040,6 +1230,38 @@ class TransferWorker(QObject):
         items = [(path, os.path.isdir(path)) for path in paths if os.path.exists(path)]
         if items:
             self.run_upload(items, remote_dir)
+
+
+def _skip_reason(skipped: list[str]) -> str:
+    """Say which files the ignore rules held back, by name.
+
+    A count on its own ("3 item(s) skipped") does not let anyone work out
+    which three, and for the single-file case - the one that actually
+    happens, someone sending .env - it is no help whatsoever.
+    """
+    names = [os.path.basename(path.rstrip("\\/")) or path for path in skipped]
+    shown = ", ".join(names[:4])
+    if len(names) > 4:
+        shown += f", and {len(names) - 4} more"
+    subject = "it matches" if len(names) == 1 else "they match"
+    return f"Not sent: {shown} - {subject} the ignore rules."
+
+
+def _split_groups(
+    payload: object,
+) -> tuple[list[tuple[str, list[tuple[str, bool]]]], IgnoreRules | None, str]:
+    """Unpack (groups, rules, origin) for upload_groups.
+
+    ``groups`` arrives as (remote directory, sources) pairs; the rest is
+    read exactly as _split_items reads it.
+    """
+    assert isinstance(payload, tuple) and len(payload) == 3
+    groups, rules, origin = payload
+    return (
+        [(str(target), list(sources)) for target, sources in groups],
+        rules if isinstance(rules, IgnoreRules) else None,
+        str(origin),
+    )
 
 
 def _split_items(

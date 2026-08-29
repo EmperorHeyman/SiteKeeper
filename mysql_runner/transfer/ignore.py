@@ -70,6 +70,11 @@ class IgnoreRules:
     """An ordered rule set; later rules win, exactly like gitignore."""
 
     rules: list[Rule] = field(default_factory=list)
+    #: Exact relative paths to let through whatever the rules say. This is
+    #: not a pattern and deliberately not one: it records a decision the
+    #: user has already been asked about by name ("send .env anyway"), and
+    #: a name full of glob characters must not quietly widen it.
+    allowed: frozenset = frozenset()
 
     # ----- construction ---------------------------------------------------
     @classmethod
@@ -107,7 +112,24 @@ class IgnoreRules:
 
     def extend(self, other: "IgnoreRules") -> "IgnoreRules":
         """A new rule set with ``other``'s rules applied after this one's."""
-        return IgnoreRules(list(self.rules) + list(other.rules))
+        return IgnoreRules(
+            list(self.rules) + list(other.rules), self.allowed | other.allowed
+        )
+
+    def allowing(self, names) -> "IgnoreRules":
+        """A copy that lets these exact entries through.
+
+        The rules exist to stop a bulk push carrying things nobody meant to
+        deploy, which is the right default for anything automatic. It is the
+        wrong answer to someone who has selected one file and pressed Upload:
+        ``.env`` is on the built-in list, so picking it did nothing at all and
+        said nothing about why. This is how the caller records "yes, that one,
+        I meant it" without switching the rules off for everything else.
+        """
+        clean = {_normalize(name) for name in names}
+        return IgnoreRules(
+            list(self.rules), self.allowed | {name for name in clean if name}
+        )
 
     # ----- matching -------------------------------------------------------
     def is_ignored(self, relpath: str, *, is_dir: bool = False) -> bool:
@@ -119,6 +141,8 @@ class IgnoreRules:
         """
         clean = _normalize(relpath)
         if not clean:
+            return False
+        if clean in self.allowed:
             return False
         parts = clean.split("/")
         for depth in range(1, len(parts) + 1):

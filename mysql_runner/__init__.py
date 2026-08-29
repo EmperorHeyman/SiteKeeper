@@ -17,4 +17,10 @@ what ``mysql_runner.app`` does - import ``PyQt6.QtWebEngineWidgets`` (or set
 will fail to import.
 """
 
-__all__: list[str] = []
+#: The one place the Python side states its version. Everything else that
+#: carries it - the exe resource, the installer, the frontend manifests -
+#: is a build artefact; this is what the running code can actually read,
+#: which is why the MCP server no longer hard-codes a number of its own.
+__version__ = "1.8.2"
+
+__all__ = ["__version__"]

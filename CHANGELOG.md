@@ -6,6 +6,119 @@ All notable changes to Sitekeeper are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-08-29
+
+### Added
+- **The MCP server is now something an installed build can actually run.** It
+  shipped as `python -m mysql_runner.mcp`, which needs a source checkout - so
+  for anyone who installed Sitekeeper there was no working command at all, and
+  the dialog offering it said as much. It could not simply point at the
+  application either: that is built windowed, so it has no console and
+  `sys.stdout` is None, and MCP is a protocol spoken over stdin and stdout.
+  There is now a second console executable, `sitekeeper-mcp.exe`, installed
+  beside the app and built by the same release script. It imports no Qt, so it
+  costs 13 MB rather than repeating the 190 the application spends on WebEngine.
+- **Tools ▸ Connect Claude picks the servers and writes the command.** Tick the
+  connections Claude may reach and what it may do; the command updates as you
+  tick and copies in one press. Scoping to particular servers was always
+  possible - `--profiles "A,B"` - but you had to know the flag existed and type
+  the labels exactly, so in practice every registration handed Claude the whole
+  vault. It also warns when a PRODUCTION server is picked without the flag that
+  lets anything act on it, and when nothing is ticked at all.
+
+- **New file, on the server or on this machine.** *Shift+F4*, a button next to
+  *New folder*, and an entry on both context menus. It creates the file empty
+  and never touches one that is already there - creating a file is not the same
+  request as emptying one, and a box that silently truncated a config would be a
+  nasty way to discover the difference.
+- **New folder takes a path.** Typing `releases/2026/08` now makes all three.
+  It used to call mkdir once and fail on the missing parent, which reads like
+  the feature is broken rather than like an instruction to do it three times.
+
+### Fixed
+- **`.env` could not be uploaded, and nothing said why.** `.env` is on the
+  built-in ignore list - sensibly, since it usually holds secrets - but those
+  rules were applied to hand-picked files exactly as they are to an automatic
+  sync. Selecting it and pressing Upload filtered it out before a queue was
+  built: no queue entry, no warning, no error, nothing on screen at all.
+  Dragging it across did the same nothing. Anything you pick yourself is now
+  checked first, and if the rules would drop it you are told which files and
+  asked. *Send anyway* exempts those exact entries and nothing else - not
+  nested files of the same name, not anything else the rules cover.
+- **"0 file(s) transferred" was burying the reason.** A push filtered out
+  entirely said why and then immediately overwrote it with a message that was
+  true and useless. The reason goes last now, and names the files rather than
+  counting them.
+- **The MCP server could not start.** It was registered as
+  `python -m mysql_runner.mcp` with no path to the package, so it failed with
+  `ModuleNotFoundError` before the handshake and the client reported `-32000`.
+  Fixed in the client configuration by setting `PYTHONPATH`; the server itself
+  also stopped claiming to be version 1.5.2 - it reads the real one from the
+  package now, via a new `mysql_runner.__version__`.
+
+## [1.8.1] - 2026-08-29
+
+### Fixed
+- **A sync could leave the connection unable to do anything else.** After a
+  commit-driven sync, uploads stopped working entirely and stayed that way:
+  pressing *Upload* did nothing, dragging files across did nothing, nothing
+  appeared in the queue, and no error was shown anywhere. The tab had to be
+  reopened. The transfer pool announces "queue drained" from one of its own
+  threads, and the refresh that followed was a direct call - so a pool thread
+  ran a directory listing on the **navigation** connection while the worker
+  thread was quite possibly using it as well. Two threads on one FTP control
+  socket, or one paramiko SFTP channel, interleave their requests and the
+  session does not recover: replies go to the wrong caller and the next
+  operation waits for a response that is never coming. paramiko sets no read
+  timeout, so that wait is permanent, and the worker thread never gets back to
+  its event loop - every later upload, listing and drop simply queued up
+  unread. A sync is what made it likely, because it sends one batch per
+  sub-directory: the pool falls idle over and over while the worker thread is
+  still busy with the next batch, or still walking a tree of removals on that
+  same connection when *delete files removed locally* is on. The refresh is now
+  handed back to the worker thread instead of being run wherever the pool
+  happened to finish.
+
+- **Selecting files, then having anything refresh the pane, unpicked them.**
+  Rebuilding a pane's rows threw the selection away, so a background sync
+  finishing left the transfer buttons dim and a drag begun a moment later never
+  started. A re-listing of the directory already on show now keeps what is
+  picked; navigating elsewhere still clears it, and a file that has since gone
+  from the listing drops out rather than lingering.
+
+- **Restoring a selection kept only one row of it.** Pick four files, let
+  folder statistics land or click a column to sort, and three of them were
+  quietly gone - `selectRow()` issues a *clear and select*, so each row undid
+  the one before. All of them come back now.
+
+### Changed
+- **A tree push is one transfer queue, not one per folder.** Uploads and
+  downloads are grouped by folder because each group lands somewhere
+  different, and each group used to be handed over as its own queue. The pool
+  therefore drained and restarted between every one: the queue panel's batch
+  counter reset over and over, its history filled with batches nobody asked
+  for, and each drain re-listed the server and made the tab reload its local
+  pane. A sync of a twenty-folder site paid all of that twenty times. It is
+  now a single queue with a single start, a single finish and one refresh at
+  the end - which is also what removed the last of the churn behind the two
+  fixes above.
+- **The publisher is named in full: RAPL Group, s.r.o.** It shows in the file's
+  Properties and in Add/Remove Programs. It does *not* change the "Unknown
+  publisher" line in the elevation prompt: Windows reads that from the file's
+  digital signature and from nowhere else, so only a code-signing certificate
+  can change it. `sign.ps1` is now wired into both build scripts and signs (and
+  timestamps) the app and the setup as soon as one is configured through
+  `SITEKEEPER_SIGN_THUMBPRINT`; with no certificate it says so and the build
+  carries on producing exactly what it produces today.
+- **A silent SFTP server no longer hangs the tab.** paramiko sets no read
+  timeout, so an SFTP session that stopped answering - a dropped link the TCP
+  stack has not noticed, or a channel whose replies went astray - blocked its
+  caller forever, and that caller is usually the thread serving the whole tab.
+  The channel now gives up after two minutes of complete silence, which the
+  session-revival path already knows how to recover from: it reports the
+  connection dead and opens a new one. This is idle time, not total time, so a
+  transfer of any size keeps resetting it.
+
 ## [1.8.0] - 2026-08-28
 
 ### Added

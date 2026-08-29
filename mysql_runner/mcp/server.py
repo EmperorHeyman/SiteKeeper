@@ -16,11 +16,15 @@ import json
 import sys
 import traceback
 
+from mysql_runner import __version__
 from mysql_runner.mcp.tools import TOOLS, AppAccess, ToolError
 
 #: Spoken when the client does not name a protocol revision of its own.
 PROTOCOL_DEFAULT = "2025-06-18"
-SERVER_INFO = {"name": "sitekeeper", "version": "1.5.2"}
+#: Reported to the client. Read from the package rather than written out
+#: again here, which is how it came to be claiming 1.5.2 three releases
+#: after the fact.
+SERVER_INFO = {"name": "sitekeeper", "version": __version__}
 
 
 class MCPServer:

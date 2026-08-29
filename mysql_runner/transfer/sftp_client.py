@@ -40,6 +40,18 @@ STREAM_POLL = 0.2
 #: Seconds allowed for the "can this account run commands at all" probe.
 PROBE_TIMEOUT = 6.0
 
+#: How long the SFTP channel may hear *nothing at all* before a read gives
+#: up, in seconds. Paramiko sets no read timeout, so a session that stops
+#: answering - a dropped link the TCP stack has not noticed, or a channel
+#: whose replies went astray - blocks its caller forever. Since that caller
+#: is usually the worker thread, and the worker thread is what serves the
+#: whole tab, "forever" meant a tab that quietly stopped doing anything at
+#: all until it was closed and reopened. A failure is recoverable; a hang is
+#: not - alive() then reports the session dead and it is reopened. This is
+#: idle time, not total time: a transfer of any size keeps resetting it, so
+#: it is generous enough that only a genuinely silent server trips it.
+IDLE_TIMEOUT = 120.0
+
 #: SSH channel window for the SFTP session. Paramiko's default (2 MB) caps
 #: how much data may be in flight unacknowledged, which throttles transfers
 #: badly on anything with real latency - the single biggest reason uploads
@@ -231,6 +243,9 @@ class SFTPFileSystem(RemoteFS):
             )
             if self._sftp is None:
                 raise TransferError("The server refused to open an SFTP session.")
+            channel = self._sftp.get_channel()
+            if channel is not None:
+                channel.settimeout(IDLE_TIMEOUT)
         except TransferError:
             client.close()
             raise
