@@ -131,6 +131,16 @@ class ServerDialog(QDialog):
         self._database = QLineEdit()
         self._database.setPlaceholderText("Optional starting database")
         self._passive = QCheckBox("Passive mode (recommended)")
+        # FTP has no shell, so a terminal on an FTP connection is an SSH
+        # login to the same host. This is where that port lives once it has
+        # been settled - the first terminal asks, and writes the answer here.
+        self._ssh_port = QSpinBox()
+        self._ssh_port.setRange(0, 65535)
+        self._ssh_port.setSpecialValueText("ask the first time")
+        self._ssh_port.setToolTip(
+            "Where this server's SSH is, for the terminal and for commands "
+            "Claude runs. Almost always 22."
+        )
         self._key_path = QLineEdit()
         self._key_path.setPlaceholderText("Optional OpenSSH private key")
         key_row = QHBoxLayout()
@@ -145,6 +155,7 @@ class ServerDialog(QDialog):
         self._host_form.addRow("Port:", self._port)
         self._host_form.addRow("Database:", self._database)
         self._host_form.addRow("Private key:", self._key_widget)
+        self._host_form.addRow("SSH port for the terminal:", self._ssh_port)
         self._host_form.addRow("", self._passive)
         layout.addWidget(self._host_box)
 
@@ -276,6 +287,9 @@ class ServerDialog(QDialog):
         _set_row_visible(self._host_form, self._database, is_mysql)
         _set_row_visible(self._host_form, self._key_widget, is_sftp)
         _set_row_visible(self._host_form, self._passive, is_ftp)
+        # SFTP shells on the port it is already talking to; only the
+        # protocols that have to borrow SSH need to be told where it is.
+        _set_row_visible(self._host_form, self._ssh_port, is_ftp)
 
         default_port = DEFAULT_PORTS.get(kind, 0)
         self._port.setToolTip(
@@ -383,6 +397,7 @@ class ServerDialog(QDialog):
         self._local_dir.setText(profile.local_dir)
         self._key_path.setText(profile.private_key_path)
         self._passive.setChecked(profile.passive)
+        self._ssh_port.setValue(profile.ssh_port)
         self._use_agent.setChecked(profile.use_agent)
         self._use_default_keys.setChecked(profile.use_default_keys)
         self._proxy_command.setText(profile.proxy_command)
@@ -424,6 +439,7 @@ class ServerDialog(QDialog):
             "local_dir": self._local_dir.text().strip(),
             "private_key_path": self._key_path.text().strip(),
             "passive": self._passive.isChecked(),
+            "ssh_port": int(self._ssh_port.value()),
             "use_agent": self._use_agent.isChecked(),
             "use_default_keys": self._use_default_keys.isChecked(),
             "jump_profile_id": str(self._jump.currentData() or ""),

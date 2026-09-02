@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
 
 from mysql_runner.storage.models import Environment, ServerProfile
 from mysql_runner.storage.settings import Settings
+from mysql_runner.transfer import hostkeys
 from mysql_runner.transfer.base import TransferError
 from mysql_runner.transfer.shellhistory import ShellHistory
 from mysql_runner.transfer.worker import ConnectionSpec
@@ -150,6 +151,9 @@ class _ShellWorker(QObject):
     opened = pyqtSignal(str)
     output = pyqtSignal(str)
     failed = pyqtSignal(str)
+    #: This server has never been confirmed. Carries a hostkeys.HostKeyUnknown
+    #: for the tab to put to the user, the same way a file-manager tab does.
+    host_key_unknown = pyqtSignal(object)
     finished = pyqtSignal()
     #: A directory listing asked for by Tab: (path, [(name, is_dir), ...]).
     listed = pyqtSignal(str, object)
@@ -167,6 +171,13 @@ class _ShellWorker(QObject):
             fs = spec.build()
             fs.connect()
             shell = fs.open_shell()
+        except hostkeys.HostKeyUnknown as exc:
+            # Not a failure - a question, and one this window reaches more
+            # often than the file panes do: a terminal on an FTP connection
+            # is the first time anything here has spoken SSH to that host, so
+            # there is no key on file for it yet.
+            self.host_key_unknown.emit(exc)
+            return
         except TransferError as exc:
             self.failed.emit(str(exc))
             return
@@ -523,6 +534,12 @@ class SshTerminalTab(QWidget):
         super().__init__(parent)
         self._profile = profile
         self._settings = settings or Settings()
+        #: Kept so the connection can be made a second time after the host
+        #: key has been confirmed - the directory as it was asked for, not
+        #: _cwd's "/" fallback, so a retry lands where the first try would
+        #: have.
+        self._spec = spec
+        self._start_dir = cwd
         self._cwd = cwd or "/"
         self._closing = False
         self._history = ShellHistory(profile.id)
@@ -603,6 +620,7 @@ class SshTerminalTab(QWidget):
         self._worker.opened.connect(self._on_opened)
         self._worker.output.connect(self._on_output)
         self._worker.failed.connect(self._on_failed)
+        self._worker.host_key_unknown.connect(self._on_host_key_unknown)
         self._worker.finished.connect(self._on_finished)
         self._worker.listed.connect(self._on_listed)
         self._thread.start()
@@ -629,6 +647,22 @@ class SshTerminalTab(QWidget):
         cursor.insertText(text)
         self._transcript.setTextCursor(cursor)
         self._transcript.ensureCursorVisible()
+
+    def _on_host_key_unknown(self, unknown: object) -> None:
+        """Show the fingerprint; connect again if it is the right server."""
+        from mysql_runner.ui.host_key_dialog import ask
+
+        if not isinstance(unknown, hostkeys.HostKeyUnknown):
+            return
+        if self._closing:
+            return
+        if ask(unknown, self):
+            self._say("Server confirmed. Opening a shell…")
+            self._open_requested.emit(self._spec, self._start_dir)
+            return
+        self._on_failed(
+            f"No shell: {unknown.host} was not confirmed as your server."
+        )
 
     def _on_failed(self, message: str) -> None:
         if self._closing:

@@ -177,15 +177,27 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
     context menu (which is how you switch which release is live).
   - **Production guard** - on a connection marked production, uploads, deletes, symlink
     changes, commands and watcher syncs all ask first.
+- **A terminal on any connection** - right-click a connection in the list ▸ *Open a
+  terminal* (or `Ctrl+Shift+T`) and you get a shell on that server without opening the file
+  manager first; inside a transfer tab the **Terminal** button and `Ctrl+T` do the same,
+  starting in the directory you are looking at. It is line-oriented on purpose, which is
+  what lets it remember your commands per server, suggest and complete them, `Ctrl+R` back
+  through them and ask before something destructive on a production box. The same menu
+  hands the connection to PuTTY, Windows Terminal, ssh.exe or WSL instead.
+
+  **FTP and FTPS connections get one too.** FTP has no shell, but the server almost always
+  answers on SSH with the same account, so that is what the terminal opens - the same host,
+  username and password, port 22 unless you say otherwise. It asks once per connection
+  before doing it, because that does send the saved password to a different service, and
+  remembers the port you settle on (*Edit ▸ SSH port for the terminal*).
 - **Server-side tools (SFTP)** - anything that would mean downloading a codebase is done on
   the server instead. Archives (`tar.gz`, `tar.bz2`, `tar`, `zip`) created and unpacked in
   place; content search via ripgrep or grep; an ncdu-style disk-usage view you can walk into;
-  a `tail -f` log viewer with a filter; an embedded SSH shell that opens in the directory you
-  are looking at (`Ctrl+T`); a one-command runner (`Ctrl+P`); a library of parameterised
-  snippets; a button that hands the session to PuTTY, Windows Terminal, ssh.exe or WSL; and
-  one that hands the directory you are looking at to VS Code over Remote-SSH.
-  The app probes once at connect time, so accounts that are SFTP-only simply do not show
-  these buttons rather than failing when pressed.
+  a `tail -f` log viewer with a filter; a one-command runner (`Ctrl+P`); a library of
+  parameterised snippets; and a button that hands the directory you are looking at to VS
+  Code over Remote-SSH. The app probes once at connect time, so accounts that are SFTP-only
+  simply do not show these buttons rather than failing when pressed - the Terminal button
+  stays, because a shell is a property of the server rather than of the protocol.
 - **Adopt an existing WinSCP install** - File ▸ *Import from WinSCP or a URL list* finds your
   sessions where WinSCP actually keeps them: the registry for an installed copy, or
   `WinSCP.ini` for a portable one, decoding the stored passwords either way. If neither is
@@ -221,6 +233,7 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
 | `Ctrl+Tab`          | Next tab                        |
 | `Ctrl+Shift+Tab`    | Previous tab                    |
 | `Ctrl+1` … `Ctrl+9` | Jump to tab 1–9                 |
+| `Ctrl+Shift+T`      | Terminal on the selected server |
 | `Ctrl+L`            | Clear the SQL console screen     |
 
 In a file-transfer tab:
@@ -234,7 +247,7 @@ In a file-transfer tab:
 | `Ctrl+Z`         | Undo the last overwrite                   |
 | `Ctrl+Shift+Q`   | Show / hide the transfer queue            |
 | `Ctrl+Shift+S`   | Sync this local folder with the server     |
-| `Ctrl+T`         | Open a shell here (SFTP)                  |
+| `Ctrl+T`         | Open a shell here (any connection)        |
 | `Ctrl+P`         | Run one command here (SFTP)               |
 | `Ctrl+Shift+F`   | Search file contents on the server (SFTP) |
 
@@ -273,9 +286,55 @@ cd mysql-runner
 claude mcp add sitekeeper -- python -m mysql_runner.mcp
 ```
 
-Claude then gets tools to list your profiles, read and list remote files, download,
-upload files and folders (`.deployignore`/`.gitignore` are honoured), and run MySQL
-queries with `mysql`-client-style output.
+### The tools
+
+Read-only, always available:
+
+| Tool | What it answers |
+| --- | --- |
+| `list_profiles` | Which connections are in scope, and a warning when a label names a target the connection does not actually use |
+| `list_remote_dir` | A listing with **permissions, owner:group**, size, time and symlink targets; `depth` walks subdirectories in one call instead of one call per directory |
+| `stat_remote` | What one or more paths are: type, size, mode, ownership, link target |
+| `check_remote_access` | **Whether a given user - `www-data` by default - can read, write and traverse these paths**, and what is in the way. Reads the mode, owner and group of the path *and every parent*, looks up that account's groups, and works out which triad applies |
+| `read_remote_file` | File contents - `tail_lines` reads the **end** of a log, `offset` a window, so a 200 MB error log costs what a small one does |
+| `search_remote` | `grep -rn` on the server (ripgrep where installed) |
+| `diff_remote` | Whether a local path matches a remote one, by content digest, file or whole tree |
+| `download_file` | One file, fetched |
+| `list_undo_history` | The restore points Sitekeeper kept, with the ids `undo_remote_change` takes |
+| `run_query` | SQL on a MySQL profile, `mysql`-client-style output. `via=<an SFTP/FTP profile on that server>` runs it through the server's **own** `mysql` client instead - which is what makes a **phpMyAdmin profile usable** (its username and password *are* MySQL's) and the only way into a database that listens on localhost only. Also needs **Run commands on the server** |
+
+Writing, once **Upload files and create folders** is ticked:
+
+| Tool | Notes |
+| --- | --- |
+| `upload_files` | **A named list of files in one call** - plain paths, or `{local, remote}` where a destination differs. `base_dir` keeps each file's path relative to a local root, which mirrors a scattered subtree without naming every destination. `dry_run` reports new / would-overwrite / already-identical and sends nothing; `skip_identical` sends only what differs. Reports every file individually |
+| `upload_folder` | A whole directory, `.deployignore`/`.gitignore` honoured. **Merges; never deletes** anything on the server. Takes the same `dry_run` and `skip_identical` |
+| `upload_file` | One file |
+| `make_remote_dir` | Parents included; does nothing to a directory that exists |
+| `chmod_remote` | Octal only, symbolic modes refused; `recursive` with `scope` of `files` or `dirs` |
+| `chown_remote` | Owner and/or group; needs a shell, and root for an owner change |
+| `move_remote` | Rename or move **on the server** - falls back to `mv` across filesystems |
+| `copy_remote` | `cp -a` on the server; on plain FTP a single file goes by way of this machine and the answer says so |
+| `symlink_remote` | Point a name at another path - often the whole of a fix. SFTP only; refuses to replace a real file |
+| `undo_remote_change` | Put one file back from a restore point |
+| `run_command` | One shell command, its output and exit status (its own tick: **Run commands on the server**) |
+| `delete_remote` | The destructive one: a directory goes recursively (its own tick: **Delete files and folders**) |
+
+Every description states what the tool does to the server - "read only", "merges; never
+deletes", "a directory goes recursively" - because a tool description is the whole of the
+interface a model sees, and a caller who cannot rule out the destructive reading will do
+the job by hand instead.
+
+The credentials never leave the vault in any of this: `via` builds the `mysql`
+invocation on the server with the password in its environment, and the command line is
+never echoed back into the conversation.
+
+Two of these deserve a note. **`check_remote_access`** exists because "why can PHP not
+write here" used to be structurally unanswerable through this server: a listing gave name,
+size and time, so the only way to find out was to deploy something and watch what
+happened. And **`upload_files`** exists because an agent that has just edited eleven files
+across a tree wants neither eleven calls nor the three hundred files in the folder they
+live in.
 
 ### What Claude may do is set in the app
 
@@ -284,10 +343,11 @@ tool call, so they take effect at once, in every project, with nothing restarted
 
 | Ticked | Grants |
 | --- | --- |
-| *(nothing)* | listings, file reads, downloads, `SELECT`-style SQL |
-| Upload files and create folders | uploads and creating remote directories |
+| *(nothing)* | listings with permissions, stats, access reports, file reads, remote search, diffs, downloads, restore-point list, `SELECT`-style SQL |
+| Upload files and create folders | uploads (single, batched or a whole folder), mkdir, chmod, chown, move, copy, symlink, and restoring from a restore point |
 | Delete files and folders | deleting remote files and directories |
 | Run SQL that changes data | anything past `SELECT`/`SHOW`/`DESCRIBE`/`EXPLAIN` |
+| Run commands on the server | `run_command`: one shell command per call, with its output and exit status |
 
 Connections marked **PROD** are granted one at a time, beside that connection, so
 deploying to one live site does not arm the rest. The same window limits which
@@ -310,7 +370,9 @@ tab that already holds that connection, over a loopback socket:
 - **deletes** go through the tab that owns the shadow-backup journal, so they can be
   restored from **History**;
 - **queries** run in the SQL console open on that connection, statement and output
-  landing in the transcript, marked as Claude's.
+  landing in the transcript, marked as Claude's;
+- **commands** run on the connection that tab already has open, so nothing logs in a
+  second time and what Claude ran joins the command history you recall with `↑`.
 
 Each call waits for the work to really finish, so Claude reports what happened rather
 than that it submitted something. With the app closed, or with no suitable tab open,
@@ -361,7 +423,7 @@ installer once ended up wrapping a 1.1.0 exe.
 ```powershell
 .\build_release.ps1                  # -> dist_onefile_upx\Sitekeeper.exe + release\*.zip
 powershell -ExecutionPolicy Bypass -File installer\build.ps1
-                                     # -> installer\Sitekeeper-1.10.1-Setup.exe
+                                     # -> installer\Sitekeeper-1.11.0-Setup.exe
 ```
 
 It builds from the virtual environment at `%USERPROFILE%\.venvs\mysqlrunner`, which needs
@@ -402,6 +464,7 @@ mysql_runner/
   ui/permissions_dialog.py       chmod presets, checkbox grid, octal box
   ui/remote_tools.py             Search, disk usage, archives, commands, snippets
   ui/ssh_terminal_tab.py         Embedded SSH shell, opened in the current directory
+  ui/shell_target_dialog.py      Asks once before an FTP connection borrows SSH
   ui/log_viewer.py               Live remote log viewer (tail -f)
   db/mysql_client.py             PyMySQL connection driven on a worker thread
   db/sqlsplit.py                 Statement splitting (quote- and comment-aware)
@@ -425,6 +488,8 @@ mysql_runner/
   transfer/githistory.py         Reading the log, and a file as it was at a commit
   transfer/connstr.py            Connection strings and WinSCP.ini import/export
   transfer/spawn.py              PuTTY / Windows Terminal / ssh.exe launcher
+  transfer/shellaccess.py        Where a connection's shell is (FTP borrows SSH)
+  transfer/longlist.py           The ls -l / FTP LIST parser: mode, owner, group
   transfer/editors.py            VS Code family: discovery, ssh-remote+ authority
   web/profile_factory.py         Isolated in-memory profile per tab
   web/browser_tab.py             QWebEngineView + auto-login + dark mode + startup SQL

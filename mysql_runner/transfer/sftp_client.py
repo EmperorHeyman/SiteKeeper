@@ -450,6 +450,11 @@ class SFTPFileSystem(RemoteFS):
             is_link=is_link,
             mode=stat.S_IMODE(mode) if mode else None,
             link_target=target,
+            # Numbers: SFTP carries no name table, so this is uid and gid.
+            # Whoever needs "www-data" rather than "33" asks the shell - see
+            # remote_exec.named_listing.
+            owner=str(attr.st_uid) if attr.st_uid is not None else "",
+            group=str(attr.st_gid) if attr.st_gid is not None else "",
         )
 
     def _link_is_dir(self, path: str, name: str) -> bool:
@@ -487,7 +492,27 @@ class SFTPFileSystem(RemoteFS):
             modified=float(attr.st_mtime) if attr.st_mtime else None,
             mode=stat.S_IMODE(mode) if mode else None,
             is_link=is_link,
+            link_target=self._read_link(path) if is_link else "",
+            owner=str(attr.st_uid) if attr.st_uid is not None else "",
+            group=str(attr.st_gid) if attr.st_gid is not None else "",
         )
+
+    def _read_link(self, path: str) -> str:
+        """Where a link points, or "" - never a reason to fail a stat."""
+        try:
+            return self._require().readlink(path) or ""
+        except Exception:
+            return ""
+
+    def read_range(self, remote: str, offset: int = 0, length: int = 0) -> bytes:
+        """Seek and read: the end of a log costs what the start would."""
+        sftp = self._require()
+        try:
+            with sftp.open(remote, "rb") as handle:
+                handle.seek(max(0, int(offset)))
+                return handle.read(length) if length else handle.read()
+        except Exception as exc:
+            raise TransferError(_describe(exc)) from exc
 
     # ----- mutations ------------------------------------------------------
     def mkdir(self, path: str) -> None:

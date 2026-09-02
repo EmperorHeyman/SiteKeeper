@@ -70,6 +70,13 @@ class ServerProfile:
     local_dir: str = ""
     private_key_path: str = ""   # SFTP key-based auth (optional).
     passive: bool = True         # FTP/FTPS passive mode.
+    #: Where this server's shell is, for the terminal and for server-side
+    #: commands. FTP and FTPS have no shell of their own, so both borrow SSH
+    #: on the same host with the same credentials. Zero means nobody has
+    #: decided yet, which is what lets the app ask once - handing an FTP
+    #: password to a different service is a decision, not a detail - and
+    #: never ask again. SFTP ignores this and uses its own port.
+    ssh_port: int = 0
     #: Offer the keys held by an SSH agent - Pageant, Windows' own ssh-agent,
     #: 1Password. On by default: plenty of accounts have no password at all
     #: and no key file to point at, and without this they cannot connect.
@@ -137,6 +144,7 @@ class ServerProfile:
             local_dir=data.get("local_dir", ""),
             private_key_path=data.get("private_key_path", ""),
             passive=bool(data.get("passive", True)),
+            ssh_port=int(data.get("ssh_port", 0) or 0),
             use_agent=bool(data.get("use_agent", True)),
             use_default_keys=bool(data.get("use_default_keys", False)),
             jump_profile_id=str(data.get("jump_profile_id", "") or ""),

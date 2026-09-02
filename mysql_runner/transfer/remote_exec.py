@@ -18,9 +18,11 @@ import shlex
 import string
 from dataclasses import dataclass, field
 
+from mysql_runner.transfer import longlist
 from mysql_runner.transfer.base import (
     Capability,
     ExecResult,
+    RemoteEntry,
     RemoteFS,
     RemoteStream,
     TransferError,
@@ -43,6 +45,17 @@ _DIGEST_TOOLS = {
 #: flood the UI.
 GREP_LIMIT = 500
 
+#: Paths one access report may ask about. Each one costs a line of script
+#: and a line of output, not a round trip, so the limit is about keeping the
+#: answer readable rather than about cost.
+MAX_PROBE_PATHS = 40
+
+#: How much of one command's output a transcript carries. Enough for a
+#: configuration file or the end of a build log, and bounded, because the
+#: readers are a socket reply and a language model rather than a terminal
+#: somebody can scroll.
+MAX_TRANSCRIPT = 40 * 1024
+
 
 def quote(value: str) -> str:
     """POSIX-quote one argument for a remote command line."""
@@ -63,6 +76,263 @@ def run(fs: RemoteFS, command: str, *, cwd: str = "", timeout: float = 60.0) -> 
     require_exec(fs)
     full = f"cd -- {quote(cwd)} && {command}" if cwd else command
     return fs.exec_command(full, timeout=timeout)
+
+
+def transcript(
+    command: str,
+    result: ExecResult,
+    *,
+    label: str = "",
+    cwd: str = "",
+    limit: int = MAX_TRANSCRIPT,
+) -> str:
+    """One command as a reader would have seen it: prompt, output, how it ended.
+
+    stdout and stderr go together and in that order rather than into two
+    labelled blocks. A shell interleaves them, most tools write their real
+    answer to one and their complaints to the other, and what anybody reading
+    this wants is the transcript a terminal would have shown.
+
+    Over ``limit`` the *end* is kept - the error at the bottom of a build log
+    is the part worth having - and the transcript says how much went.
+
+    A non-zero exit is not hidden and not treated as a failure of the call:
+    the command ran, and "exit 1" is its answer. Whoever asked decides what
+    that means.
+    """
+    where = f"{label}:{cwd}" if label and cwd else (label or cwd)
+    prompt = f"{where}$" if where else "$"
+    output = "\n".join(
+        part for part in (result.stdout.rstrip(), result.stderr.rstrip()) if part
+    )
+    if limit and len(output) > limit:
+        cut = len(output) - limit
+        output = f"[{cut} characters of earlier output not shown]\n" + output[-limit:]
+    ending = (
+        "exit 0"
+        if result.exit_status == 0
+        else f"exit {result.exit_status} - the command reported a failure"
+    )
+    return "\n".join([f"{prompt} {command}", output or "(no output)", f"[{ending}]"])
+
+
+# ----- who may write where ------------------------------------------------
+@dataclass
+class PathFacts:
+    """What one path is, and who owns it."""
+
+    path: str
+    exists: bool = False
+    entry: RemoteEntry | None = None
+    error: str = ""
+
+    @property
+    def mode(self) -> int | None:
+        return self.entry.mode if self.entry else None
+
+    @property
+    def owner(self) -> str:
+        return self.entry.owner if self.entry else ""
+
+    @property
+    def group(self) -> str:
+        return self.entry.group if self.entry else ""
+
+    @property
+    def kind(self) -> str:
+        if not self.entry:
+            return ""
+        if self.entry.is_link:
+            return "link"
+        return "directory" if self.entry.is_dir else "file"
+
+
+@dataclass
+class UserFacts:
+    """A user account as the server describes it."""
+
+    name: str
+    groups: list[str] = field(default_factory=list)
+    known: bool = False
+
+
+def named_listing(fs: RemoteFS, path: str) -> dict[str, RemoteEntry]:
+    """``ls -lA`` over the session's shell, by name.
+
+    The point is the two columns SFTP cannot give: an SFTP listing carries a
+    numeric uid and gid, and "33:33" does not answer "can the web server
+    write here" the way "www-data:www-data" does. One extra command on a
+    connection that is already open buys the names for a whole directory.
+
+    Returns {} rather than raising when there is no shell, or when ``ls``
+    surprises us: ownership names are an enrichment, and a listing without
+    them is the listing we had before.
+    """
+    if not fs.supports(Capability.EXEC):
+        return {}
+    try:
+        result = run(fs, f"ls -lA -- {quote(path or '/')}", timeout=45)
+    except TransferError:
+        return {}
+    return {entry.name: entry for entry in longlist.parse(result.stdout)}
+
+
+def effective_user(fs: RemoteFS) -> str:
+    """Who this connection is logged in as, per the server."""
+    try:
+        return run(fs, "id -un", timeout=20).stdout.strip()
+    except TransferError:
+        return ""
+
+
+def user_facts(fs: RemoteFS, user: str) -> UserFacts:
+    """A user's group memberships, which is what decides the group bits.
+
+    Comparison is by name throughout - ``ls`` prints names, so asking for
+    names here means never having to map a uid to anything.
+    """
+    user = (user or "").strip()
+    if not user:
+        return UserFacts(name="")
+    try:
+        result = run(fs, f"id -Gn {quote(user)}", timeout=20)
+    except TransferError:
+        return UserFacts(name=user)
+    if not result.ok:
+        return UserFacts(name=user)
+    return UserFacts(name=user, groups=result.stdout.split(), known=True)
+
+
+def path_facts(fs: RemoteFS, paths: list[str]) -> dict[str, PathFacts]:
+    """Type, mode and ownership for each path, in one round trip.
+
+    ``ls -ld`` rather than ``stat``: every Unix has it, prints the same nine
+    permission characters an FTP listing does - so one parser reads both -
+    and names a symlink's target in the same line. ``stat -c`` would be
+    tidier to read and is GNU-only, which on a BSD or a busybox host means no
+    answer at all.
+    """
+    require_exec(fs)
+    wanted = [path for path in dict.fromkeys(paths) if path]
+    if not wanted:
+        return {}
+    lines = []
+    for index, path in enumerate(wanted):
+        # The marker carries the index, so a path whose name ls decorates or
+        # whose line is missing entirely still lines up with what was asked.
+        lines.append(f"printf '=%s=\n' {index}")
+        lines.append(f"ls -ld -- {quote(path)} 2>&1")
+    result = run(fs, "; ".join(lines), timeout=90)
+    return _parse_probe(wanted, result.stdout)
+
+
+def _parse_probe(paths: list[str], output: str) -> dict[str, PathFacts]:
+    blocks: dict[int, list[str]] = {}
+    current = -1
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("=") and stripped.endswith("=") and stripped[1:-1].isdigit():
+            current = int(stripped[1:-1])
+            blocks[current] = []
+            continue
+        if current >= 0:
+            blocks[current].append(line)
+    facts: dict[str, PathFacts] = {}
+    for index, path in enumerate(paths):
+        text = "\n".join(blocks.get(index, []))
+        entries = longlist.parse(text)
+        if entries:
+            facts[path] = PathFacts(path=path, exists=True, entry=entries[0])
+            continue
+        note = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        facts[path] = PathFacts(path=path, exists=False, error=note)
+    return facts
+
+
+def ancestors(path: str) -> list[str]:
+    """Every directory that has to be traversable to reach ``path``.
+
+    Root first. A directory can be world-writable and still unreachable
+    because something above it is 0700 - which is the second thing to check
+    and the one nobody checks.
+    """
+    parts = [part for part in (path or "/").split("/") if part]
+    chain = ["/"]
+    for index in range(len(parts) - 1):
+        chain.append("/" + "/".join(parts[: index + 1]))
+    return chain
+
+
+def permission_bits(facts: PathFacts, user: UserFacts) -> tuple[str, str]:
+    """Which triad applies to ``user`` here, and why that one.
+
+    Returns ("rwx"-style bits, reason). Empty bits mean the answer is not
+    knowable from what the server said.
+    """
+    mode = facts.mode
+    if mode is None:
+        return "", "the server did not report a mode"
+    if user.name and facts.owner and user.name == facts.owner:
+        shift, reason = 6, f"owns it ({facts.owner})"
+    elif user.name and facts.group and facts.group in user.groups:
+        shift, reason = 3, f"is in its group ({facts.group})"
+    elif not user.known and user.name:
+        # Without the account's groups the group triad cannot be ruled in or
+        # out, and guessing "other" would understate what it can do.
+        return "", f"{user.name} is not an account on this server"
+    else:
+        shift, reason = 0, (
+            f"is neither the owner ({facts.owner or 'unknown'}) nor in its "
+            f"group ({facts.group or 'unknown'})"
+        )
+    triad = (mode >> shift) & 0o7
+    bits = "".join(
+        char if triad & bit else "-"
+        for char, bit in (("r", 0b100), ("w", 0b010), ("x", 0b001))
+    )
+    return bits, reason
+
+
+def copy_tree(fs: RemoteFS, source: str, target: str, *, timeout: float = 600.0) -> ExecResult:
+    """Copy on the server, contents and timestamps kept.
+
+    The reason this exists: moving thirteen attachments two directories
+    across without it means downloading them and uploading them again, which
+    on a 22 MB folder is 44 MB over the wire to achieve nothing that the
+    server could not have done locally in a second.
+    """
+    require_exec(fs)
+    return run(
+        fs, f"cp -a -- {quote(source)} {quote(target)}", timeout=timeout
+    ).require()
+
+
+def move_path(fs: RemoteFS, source: str, target: str, *, timeout: float = 600.0) -> ExecResult:
+    """``mv`` on the server - what a rename cannot do across filesystems."""
+    require_exec(fs)
+    return run(
+        fs, f"mv -f -- {quote(source)} {quote(target)}", timeout=timeout
+    ).require()
+
+
+def chown_tree(
+    fs: RemoteFS,
+    path: str,
+    owner: str,
+    group: str = "",
+    *,
+    recursive: bool = False,
+    timeout: float = 600.0,
+) -> ExecResult:
+    """Change ownership. ``owner`` may be empty to set only the group."""
+    require_exec(fs)
+    spec = f"{owner}:{group}" if group else owner
+    if not spec.strip(":"):
+        raise TransferError("Say who should own it.")
+    flag = "-R " if recursive else ""
+    return run(
+        fs, f"chown {flag}-- {quote(spec)} {quote(path)}", timeout=timeout
+    ).require()
 
 
 def has_tool(fs: RemoteFS, name: str) -> bool:

@@ -4,6 +4,199 @@ All notable changes to Sitekeeper are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.0] - 2026-09-02
+
+### Added
+- **A terminal on every connection, and one Claude can use.** The embedded SSH
+  shell existed, but you could only reach it from inside a file-manager tab,
+  through the *Server tools* menu - which hides itself on FTP, because FTP has
+  no shell. So on half the saved connections there was no terminal anywhere in
+  the app, and on the other half it was three clicks deep behind a menu named
+  after something else.
+
+  Both halves of that were wrong. A shell is a property of the server, not of
+  the protocol you happen to be moving files with: a host reached over FTP is
+  nearly always administered over SSH with the same account, which is how the
+  files got there in the first place.
+
+  - **From the connection list.** Right-click any file-transfer connection ▸
+    *Open a terminal*, or `Ctrl+Shift+T`, and the shell opens without a file
+    manager first. *Open in PuTTY / your terminal* is beside it, for the
+    terminal program set in Settings.
+  - **From a transfer tab.** A **Terminal** button that never hides, holding
+    the embedded shell (`Ctrl+T`) and the external one. Both entries left
+    *Server tools*, which is now what its name says: archives, search, disk
+    usage, logs.
+  - **On FTP and FTPS.** Those log in over SSH to the same host, as the same
+    user, with the same password, on port 22. It asks once per connection
+    before doing it - that password was saved for a different service, and
+    sending it somewhere new is a decision rather than a detail - and
+    remembers the port, which is also editable afterwards as *SSH port for the
+    terminal* in the connection's own dialog. An unknown host key still stops
+    and asks, exactly as it does for SFTP.
+- **`run_command`: Claude can run commands on your servers.** A new MCP tool
+  that runs one shell command and returns its output and exit status, gated by
+  a new tick - **Run commands on the server** in *Tools ▸ Connect Claude* - and
+  off until it is granted. It is deliberately its own permission rather than
+  part of "upload" or "delete": one command can do everything those describe
+  and a great deal they do not.
+
+  It works on FTP and FTPS connections too, over SSH to the same host, the same
+  way the app's own terminal does. Production connections stay behind their own
+  per-connection grant, so a live site is not armed by switching the shell on
+  for everything else.
+
+  Like every other thing Claude does since 1.10.1, the command is handed to the
+  running app when there is one: it runs on the connection that tab already
+  has open - nothing logs in a second time, nothing re-answers a host key - and
+  joins the command history you recall with `↑`. With the app closed, or on an
+  FTP tab that has no shell to lend, the MCP server opens SSH itself and says
+  which of the two it did.
+
+- **`upload_files`: a batch of files in one call.** Claude had two ways to push
+  files and both were wrong for the commonest job. `upload_file` sends one, so
+  eleven edited files meant eleven calls, eleven queues and eleven waits;
+  `upload_folder` sends everything in a directory, which is not what "these
+  eleven files" means and drags a lot of other people's work along with it.
+
+  The new tool takes the list an agent actually has - plain paths, or
+  `{local, remote}` objects where a destination differs - and sends it as one
+  queue: parents created in a single call, one transfer queue in the app
+  instead of one per file, one summary at the end. Give it `base_dir` (the
+  repository root, usually) and each file keeps its path relative to that
+  under `remote_dir`, so a scattered subtree lands correctly without naming
+  every destination.
+
+  It is deliberate that no ignore rules apply here: naming a file *is* the
+  decision, the same way it is when you select one in the app and press
+  Upload. It is also deliberate that a path which is not a file uploads
+  nothing at all and says which one - a list is an explicit request, and
+  sending ten of eleven files leaves nobody able to say what is deployed. It
+  needs the same **Upload files and create folders** tick as the other two,
+  and carries up to 500 files per call.
+
+- **Eleven more MCP tools, from one session's worth of dead ends.** An agent
+  spent a session debugging a permissions bug through this server and wrote
+  down everything it could not do. Most of it was not missing capability - the
+  app has done all of this for years - it was capability that had never been
+  exposed. So:
+
+  - **Permissions are visible and changeable.** `list_remote_dir` now reports
+    mode, `owner:group` and symlink targets rather than name/size/time, with
+    ownership as names (one `ls -lA` on connections that have a shell, since
+    SFTP itself gives numbers). `stat_remote` answers for named paths.
+    `chmod_remote` and `chown_remote` change them. Octal modes only -
+    symbolic ones like `g+w` are refused, so what is being set is never
+    ambiguous.
+  - **`check_remote_access` answers "why can PHP not write here".** That
+    question used to be structurally unanswerable through this server: a
+    listing gave three columns, none of them ownership, so the only way to
+    find out was to deploy something and see what happened. It now reads the
+    mode, owner and group of the path *and of every parent directory*, looks
+    up the asked-about account's group memberships, works out which
+    permission triad actually applies, and says so - including the case
+    nobody checks, where a 0777 directory inside a 0700 one is reachable by
+    nobody at all.
+  - **`move_remote` and `copy_remote` keep the bytes on the server.**
+    Consolidating thirteen attachments two directories across used to mean
+    downloading 22 MB and uploading it again to achieve something the server
+    could do locally in a second. `cp -a`/`mv` where there is a shell; on
+    plain FTP a single file goes by way of this machine and the answer says
+    so rather than pretending.
+  - **`search_remote`** is `grep -rn` on the server, ripgrep where it is
+    installed - the companion to `read_remote_file`, and the alternative to
+    grepping a local copy and then having to prove the copy matches what is
+    running.
+  - **`read_remote_file` can read the end of a file.** `tail_lines` reads
+    backwards from the end, so the last 200 lines of a 200 MB error log cost
+    what a small file costs; `offset` takes a window from a byte position.
+    Logs are a primary use of this server and reading them meant downloading
+    them whole. The default size limit is now 1 MB rather than 256 KB, which
+    was low enough to refuse a file the caller had written a moment earlier.
+  - **`symlink_remote`** creates and repoints links. Sometimes the elegant
+    fix is one link - `/var/www/uploads -> /var/www/private_data/uploads`
+    repairs every broken path at once, with no code changed - and without it
+    the alternative was patching seventeen files. It refuses to replace a
+    real file or directory, and needs `replace=true` to move an existing
+    link.
+  - **`diff_remote`** compares a local path with a remote one by content
+    digest, file or whole tree. This is the check worth making before
+    overwriting production, and it used to take a download and a local diff -
+    enough work that it gets skipped, which is how a deploy overwrites
+    somebody's hotfix.
+  - **The undo journal is visible.** Every write through Sitekeeper says it
+    can be undone, and nothing could see or use those restore points from
+    here - a safety net only the person at the keyboard could reach.
+    `list_undo_history` lists them, `undo_remote_change` puts one back.
+  - **`list_remote_dir` can recurse.** `depth` walks subdirectories in one
+    call; mapping a host used to be one call per directory.
+
+- **The batch uploads say what they will do before they do it.** `dry_run`
+  reports which files are new, which would be overwritten and which are
+  already byte-for-byte identical, and uploads nothing; `skip_identical`
+  sends only what differs, leaving identical files and their timestamps
+  alone. Both tools now report every file individually, so one failure in
+  seventeen does not leave the caller guessing which sixteen went. Available
+  on `upload_folder` as well as `upload_files`.
+
+- **`run_query` can go through the server's own mysql client.** Pass
+  `via=<an SFTP or FTP profile on that server>` and the statement runs there
+  rather than over a database connection from here. Two things follow from
+  that. A **phpMyAdmin profile becomes usable**: its username and password
+  *are* MySQL's, and until now they sat in the vault next to a tool that
+  refused to touch them - so somebody with two phpMyAdmin profiles for the
+  exact database they needed still could not check which rows referenced
+  which files. And a database that **only listens on localhost** - which is
+  every shared host - becomes reachable at all.
+
+  It needs "Run commands on the server" as well as the SQL grants, because
+  running a command on that server is exactly what it does. The invocation
+  carries the password in its environment rather than on the command line,
+  and is never echoed back: a transcript quoting it would put a live
+  credential into the conversation.
+
+- **A warning when a connection's label lies about where it goes.** With
+  twenty-one saved connections and write and delete granted, a label reading
+  `emproduction__ftp@sftp.example.com` that actually logs in as
+  `kioseku__1` is a foot-gun. `list_profiles` now compares the host and
+  account a label *claims* against the ones it uses, and flags the
+  difference. Quiet unless the label really does name a target, so "Live
+  site" and "Client A - staging" never warn.
+
+### Changed
+- A file-transfer-only session used to end its status line with "this protocol
+  has no shell, so the server-side tools are not available", which read as a
+  statement about the server. It now names what is actually missing - archives,
+  search, disk usage - and points at the Terminal button for the rest.
+
+### Fixed
+- **Every write tool now states its destructive semantics in its own
+  description.** `upload_folder` did not say whether it mirrored, so an agent
+  that could not rule out "deletes what is not local" declined to use it on
+  production and made seventeen single-file calls instead. It says "MERGES;
+  NEVER DELETES" now, `delete_remote` says a directory goes recursively, and
+  the read-only tools say they are read-only. A tool description is the whole
+  of the interface a model sees; leaving the dangerous reading possible costs
+  more than a long sentence does.
+- **A listing line beginning with "l" is no longer read as a symlink.** The
+  parser that reads `ls -l` and FTP `LIST` output checked only the first
+  character of the permission column, so `ls: cannot access '/x/y': No such
+  file or directory` - nine fields, starting with an l - parsed as a symlink
+  named "directory" owned by "access". The whole column is validated now,
+  position by position.
+- **The shell window could not ask about an unknown host key.** Only the file
+  panes knew how to put that question, so a shell opened on a server nothing
+  had confirmed reported "its identity has not been confirmed" and stopped,
+  with no way forward. It now shows the fingerprint and asks, exactly as a
+  connecting tab does. This was survivable while a shell could only be opened
+  from a tab that had already answered; it is not, now that the terminal can
+  be the first thing here ever to speak SSH to a host - which is every FTP
+  connection that borrows it.
+- **Opening PuTTY on an FTP connection dialled the FTP port.** The external
+  terminal took the port from the profile, so `ssh` was pointed at port 21 and
+  sat there until it gave up. It now asks where the *shell* is, in the app and
+  in the desktop front end's sidecar alike.
+
 ## [1.10.1] - 2026-09-02
 
 ### Added

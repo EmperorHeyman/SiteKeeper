@@ -48,6 +48,12 @@ class McpPolicy:
     allow_write: bool = False
     allow_delete: bool = False
     allow_sql_write: bool = False
+    #: Run commands in the server's own shell. Kept separate from the three
+    #: above rather than folded into any of them, because a shell is not a
+    #: bigger version of uploading a file: one command can do everything the
+    #: other grants describe and a great deal they do not, so it has to be a
+    #: decision of its own.
+    allow_exec: bool = False
     #: Profile ids MCP may use at all. Empty means every stored profile,
     #: including ones added later - which is the useful default, and the one
     #: the dialog offers first.
@@ -71,6 +77,7 @@ class McpPolicy:
             allow_write=bool(data.get("allow_write", False)),
             allow_delete=bool(data.get("allow_delete", False)),
             allow_sql_write=bool(data.get("allow_sql_write", False)),
+            allow_exec=bool(data.get("allow_exec", False)),
             profiles=_id_list(data.get("profiles")),
             production_profiles=_id_list(data.get("production_profiles")),
         )
@@ -115,7 +122,12 @@ class McpPolicy:
         return profile.id in self.production_profiles
 
     def any_grant(self) -> bool:
-        return self.allow_write or self.allow_delete or self.allow_sql_write
+        return (
+            self.allow_write
+            or self.allow_delete
+            or self.allow_sql_write
+            or self.allow_exec
+        )
 
     def describe(self) -> str:
         """One line for the server's startup banner on stderr."""
@@ -125,6 +137,7 @@ class McpPolicy:
                 ("write", self.allow_write),
                 ("delete", self.allow_delete),
                 ("sql-write", self.allow_sql_write),
+                ("shell", self.allow_exec),
             )
             if allowed
         ]

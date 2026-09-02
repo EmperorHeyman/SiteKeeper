@@ -69,6 +69,12 @@ class RemoteEntry:
     mode: int | None = None
     #: Where a symlink points, when it is cheap to find out.
     link_target: str = ""
+    #: Who it belongs to, as the server names them - "www-data", or "33" when
+    #: only a number was available, or "" when nothing said. Mode without
+    #: ownership answers nothing: "group can write" is only useful once you
+    #: know which group, which is why these travel together.
+    owner: str = ""
+    group: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,10 @@ class RemoteStat:
     modified: float | None = None
     mode: int | None = None
     is_link: bool = False
+    #: Where it points, when it is a link.
+    link_target: str = ""
+    owner: str = ""
+    group: str = ""
 
 
 @dataclass(frozen=True)
@@ -351,6 +361,30 @@ class RemoteFS(ABC):
                 os.unlink(temp)
             except OSError:
                 pass
+
+    def read_range(self, remote: str, offset: int = 0, length: int = 0) -> bytes:
+        """``length`` bytes from ``offset``, or to the end when length is 0.
+
+        This is what makes the end of a 200 MB log readable: seek to
+        ``size - window`` and take that. Reading such a file from the start,
+        which is all a stream can do, means moving the whole thing to find
+        out what happened last - and everything anybody wants from a log is
+        at the end.
+
+        The default implementation streams and slices, so a backend that
+        cannot seek is correct while being no faster than it was. Both
+        shipped backends override it: SFTP seeks the handle, FTP restarts the
+        transfer at an offset.
+        """
+        buffer = bytearray()
+        wanted = offset + length if length else 0
+
+        def sink(chunk: bytes) -> None:
+            buffer.extend(chunk)
+
+        self.stream_download(remote, sink)
+        window = bytes(buffer[offset:wanted]) if wanted else bytes(buffer[offset:])
+        return window
 
     def walk(self, path: str, *, follow_links: bool = False):
         """Yield (directory, entries) pairs, breadth-first-ish, like os.walk.

@@ -90,6 +90,34 @@ class ConnectionSpec:
     jump: object = None
     proxy_command: str = ""
 
+    @classmethod
+    def for_profile(cls, profile, jump: object = None) -> "ConnectionSpec":
+        """Everything a worker thread needs in order to open this profile.
+
+        ``jump`` is resolved by whoever has the vault open - a spec crosses
+        threads, so it holds a plain JumpHost rather than the id of a profile
+        it would have to look up.
+
+        This lives here rather than beside a tab because more than one caller
+        needs it now: a file-manager tab, and a terminal opened straight from
+        the connection list, which asks for the shell form of the same
+        profile (see ``transfer/shellaccess.py``).
+        """
+        return cls(
+            kind=profile.kind,
+            host=profile.host,
+            port=profile.effective_port,
+            username=profile.username,
+            password=profile.password,
+            private_key_path=profile.private_key_path,
+            passive=profile.passive,
+            use_agent=profile.use_agent,
+            use_default_keys=profile.use_default_keys,
+            host_key_mode=hostkeys.PROMPT,
+            jump=jump,
+            proxy_command=profile.proxy_command,
+        )
+
     def build(self) -> RemoteFS:
         """Instantiate the matching backend. Called on the worker thread."""
         if self.kind == ConnectionKind.SFTP:
@@ -563,6 +591,34 @@ class TransferWorker(QObject):
             return (True, f"Created {path} (and any missing parents)")
 
         self._run_bridge_op(request_id, "mkdir", job, refresh=parent)
+
+    @pyqtSlot(str, str, str, float)
+    def bridge_exec(
+        self, request_id: str, command: str, cwd: str, timeout: float
+    ) -> None:
+        """Run one command for the bridge, on this session's own connection.
+
+        The point of it coming here rather than being run in the MCP process:
+        this is the connection the user is already logged in on, so nothing
+        opens a second session, nothing re-answers a host key, and what Claude
+        ran shows up on the tab that ran it.
+
+        A command that exits non-zero is still a command that ran, so it comes
+        back as a success carrying the exit status. Only a shell that could
+        not be opened at all is a failure.
+        """
+        from mysql_runner.transfer import remote_exec
+
+        fs = self._fs
+        if fs is None:
+            self.bridge_op.emit(request_id, False, NOT_CONNECTED)
+            return
+
+        def job(remote: RemoteFS) -> tuple[bool, str]:
+            result = remote_exec.run(remote, command, cwd=cwd, timeout=timeout)
+            return (True, remote_exec.transcript(command, result, cwd=cwd))
+
+        self._run_bridge_op(request_id, "exec", job)
 
     def _run_bridge_op(self, request_id: str, label: str, job, *, refresh: str = "") -> None:
         """_run_ops, but the outcome goes to one waiting caller.

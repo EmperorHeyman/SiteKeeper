@@ -67,7 +67,6 @@ from mysql_runner.storage.models import (
 from mysql_runner.storage.settings import Settings
 from mysql_runner.transfer import editors
 from mysql_runner.transfer import permissions as perm
-from mysql_runner.transfer import spawn
 from mysql_runner.transfer.base import (
     Capability,
     RemoteEntry,
@@ -1318,8 +1317,14 @@ class FileManagerTab(QWidget):
 
     status_message = pyqtSignal(str)
     title_changed = pyqtSignal(str)
-    #: Asks the window to open a shell tab for (profile, spec, directory).
-    shell_requested = pyqtSignal(object, object, str)
+    #: Asks the window to open a terminal for (profile, directory). The
+    #: window resolves where the shell is - an FTP connection borrows SSH,
+    #: see transfer/shellaccess.py - because it owns the vault the answer is
+    #: remembered in.
+    shell_requested = pyqtSignal(object, str)
+    #: The same request, for the terminal program on this machine rather than
+    #: the embedded one: (profile, directory).
+    external_shell_requested = pyqtSignal(object, str)
     #: This connection's saved settings changed and want writing to disk.
     profile_changed = pyqtSignal(object)
 
@@ -1345,6 +1350,7 @@ class FileManagerTab(QWidget):
     #: answer can be matched to the caller blocked on it.
     _bridge_delete_requested = pyqtSignal(str, object)
     _bridge_mkdir_requested = pyqtSignal(str, str)
+    _bridge_exec_requested = pyqtSignal(str, str, str, float)
     _close_requested = pyqtSignal()
     _chmod_requested = pyqtSignal(str, int, bool, str)
     _symlink_requested = pyqtSignal(str, str)
@@ -1497,7 +1503,7 @@ class FileManagerTab(QWidget):
         self._shell_history = ShellHistory(profile.id)
         self._dialogs: dict[str, QWidget] = {}
         self._jump = jump
-        self._spec = _spec_for(profile, jump)
+        self._spec = ConnectionSpec.for_profile(profile, jump)
 
         self._build_ui()
         self._refresh_actions()
@@ -1692,11 +1698,26 @@ class FileManagerTab(QWidget):
 
         row.addStretch(1)
 
-        self._server_btn = _menu_button(
-            "Server tools",
-            "Archives, search, disk usage, shell and logs - all run on the server",
+        # A terminal is the one server-side thing every connection can have,
+        # so it is the one that never hides. It used to live inside Server
+        # tools, which disappears on FTP - and "this protocol has no shell"
+        # was read, reasonably, as "this server has no shell". It has one; the
+        # window opens SSH to the same host for it.
+        self._terminal_btn = _menu_button(
+            "Terminal",
+            "A shell on this server - embedded here, or in PuTTY / your own "
+            "terminal",
             (
                 ("Open a shell here", "Ctrl+T", self._on_terminal),
+                ("Open in PuTTY / your terminal", "", self._on_external_terminal),
+            ),
+        )
+        row.addWidget(self._terminal_btn)
+
+        self._server_btn = _menu_button(
+            "Server tools",
+            "Archives, search, disk usage and logs - all run on the server",
+            (
                 ("Run a command…", "Ctrl+P", self._on_command_bar),
                 ("Snippets…", "", self._on_snippets),
                 (None, "", None),
@@ -1704,7 +1725,6 @@ class FileManagerTab(QWidget):
                 ("Disk usage…", "", self._on_disk_usage),
                 ("Live logs…", "", self._on_logs),
                 (None, "", None),
-                ("Open in PuTTY / your terminal", "", self._on_external_terminal),
                 (
                     f"Open this folder in {self._editor_name()} over SSH",
                     "",
@@ -1935,6 +1955,7 @@ class FileManagerTab(QWidget):
             (self._upload_quiet_requested, self._worker.upload_quietly),
             (self._bridge_delete_requested, self._worker.bridge_delete),
             (self._bridge_mkdir_requested, self._worker.bridge_make_dir),
+            (self._bridge_exec_requested, self._worker.bridge_exec),
         )
         for signal, slot in outgoing:
             signal.connect(slot)
@@ -2025,8 +2046,9 @@ class FileManagerTab(QWidget):
         if not has_shell:
             self._set_status(
                 self._status.text()
-                + "  (file transfer only: this protocol has no shell, so the "
-                "server-side tools are not available)"
+                + "  (file transfer only, so archives, search and disk usage "
+                "are not available here - Terminal still opens a shell on "
+                "this server over SSH)"
             )
 
     def _on_failed(self, message: str) -> None:
@@ -4430,6 +4452,31 @@ class FileManagerTab(QWidget):
         self._bridge_mkdir_requested.emit(request_id, path)
         return ""
 
+    def accept_bridge_exec(
+        self, command: str, cwd: str, timeout: float, on_done
+    ) -> str:
+        """Run one command on this tab's connection for the MCP bridge.
+
+        Refused when this session has no shell - an FTP tab has none to lend,
+        and the MCP server then opens SSH to the same host itself, which is
+        what it would have done had the app not been running at all.
+        """
+        if not self._connected:
+            return "the tab for that connection is not connected"
+        if Capability.EXEC not in self._capabilities:
+            return "that connection is file-transfer only, so it has no shell"
+        if not command.strip():
+            return "no command was given"
+        # The same memory as the command bar and the shell tab: a command
+        # Claude ran here is one that was run here, and worth recalling.
+        self._shell_history.add(command)
+        request_id = self._track_bridge_op(on_done)
+        self._bridge_exec_requested.emit(request_id, command, cwd, float(timeout))
+        self._set_status(
+            f"Claude is running “{command}” on {self._profile.label}."
+        )
+        return ""
+
     # ----- keeping track of both kinds ------------------------------------
     def _track_bridge_transfer(self, keys, on_done) -> None:
         self._bridge_jobs.append(
@@ -4474,7 +4521,11 @@ class FileManagerTab(QWidget):
         callback(
             {"ok": bool(ok), "detail": message, "error": "" if ok else message}
         )
-        self._set_status(message)
+        # A command's answer is its whole transcript; the status line gets the
+        # first line of it, because a wrapped label handed eighty lines of
+        # output pushes the panes off the bottom of the tab.
+        first = message.strip().splitlines()
+        self._set_status(first[0] if first else "")
 
     def _finish_bridge_job(self, job: dict, abandoned: str = "") -> None:
         """Tell the waiting MCP call how its files got on."""
@@ -5014,40 +5065,25 @@ class FileManagerTab(QWidget):
         dialog.show()
 
     def _on_terminal(self) -> None:
-        if not self._require_shell():
-            return
-        self.shell_requested.emit(self._profile, self._spec, self._remote.path or "")
+        """Open a shell on this server, whatever this session is speaking.
+
+        Deliberately not behind :meth:`_require_shell`. A shell is a property
+        of the machine, not of the protocol this tab happens to be using: FTP
+        has none of its own, so the window opens an SSH session to the same
+        host instead. It is not behind _require_connection either - when FTP
+        is refusing to log in, a terminal is exactly what you want next.
+        """
+        self.shell_requested.emit(self._profile, self._remote.path or "")
 
     def _on_external_terminal(self) -> None:
-        terminals = spawn.detect_terminals()
-        if not terminals:
-            QMessageBox.information(
-                self,
-                "No terminal found",
-                "PuTTY, Windows Terminal, ssh.exe and WSL were all looked for "
-                "and none of them is installed.",
-            )
-            return
-        wanted = self._settings.terminal_program
-        chosen = next((t for t in terminals if t.name == wanted), terminals[0])
-        target = spawn.ShellTarget(
-            host=self._profile.host,
-            port=self._profile.effective_port,
-            username=self._profile.username,
-            password=self._profile.password,
-            key_path=self._profile.private_key_path,
-            remote_dir=self._remote.path or "",
-        )
-        try:
-            spawn.launch(
-                chosen,
-                target,
-                include_password=self._settings.terminal_send_password,
-            )
-        except OSError as exc:
-            QMessageBox.warning(self, "Could not start the terminal", str(exc))
-            return
-        self._set_status(f"Opened {chosen.name} in {target.remote_dir or 'the home directory'}.")
+        """Hand this session to PuTTY / Windows Terminal / ssh.exe.
+
+        Asked of the window for the same reason as the embedded shell: on an
+        FTP connection this is an SSH login with credentials saved for
+        something else, which is a question, and the window is what can
+        remember the answer.
+        """
+        self.external_shell_requested.emit(self._profile, self._remote.path or "")
 
     # ----- history / undo -------------------------------------------------
     def _on_history(self) -> None:
@@ -5195,7 +5231,8 @@ class FileManagerTab(QWidget):
             menu.addSeparator()
             menu.addAction("Search here…", self._on_search).setEnabled(has_shell)
             menu.addAction("Disk usage here…", self._on_disk_usage).setEnabled(has_shell)
-            menu.addAction("Open a shell here", self._on_terminal).setEnabled(has_shell)
+            # Not gated on has_shell: see _on_terminal.
+            menu.addAction("Open a shell here", self._on_terminal)
             menu.addAction("Copy remote path", self._copy_remote_path)
             menu.addSeparator()
             menu.addAction(
@@ -5782,29 +5819,6 @@ def _scan_local(target: str) -> list[RemoteEntry]:
             )
     entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
     return entries
-
-
-def _spec_for(profile: ServerProfile, jump: object = None) -> ConnectionSpec:
-    """Everything the worker thread needs to open this connection.
-
-    ``jump`` is resolved by whoever has the vault open - a spec crosses
-    threads, so it holds a plain JumpHost rather than the id of a profile it
-    would have to look up.
-    """
-    return ConnectionSpec(
-        kind=profile.kind,
-        host=profile.host,
-        port=profile.effective_port,
-        username=profile.username,
-        password=profile.password,
-        private_key_path=profile.private_key_path,
-        passive=profile.passive,
-        use_agent=profile.use_agent,
-        use_default_keys=profile.use_default_keys,
-        host_key_mode=hostkeys.PROMPT,
-        jump=jump,
-        proxy_command=profile.proxy_command,
-    )
 
 
 def _menu_button(text: str, tip: str, entries) -> QToolButton:

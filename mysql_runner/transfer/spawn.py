@@ -20,6 +20,8 @@ import subprocess
 from dataclasses import dataclass
 from enum import Enum
 
+from mysql_runner.transfer import shellaccess
+
 
 class TerminalKind(str, Enum):
     """How to talk to a given terminal program."""
@@ -93,6 +95,35 @@ def detect_terminals() -> list[Terminal]:
         if path:
             found.append(Terminal(name=name, executable=path, kind=kind))
     return found
+
+
+def preferred_terminal(name: str = "") -> "Terminal | None":
+    """The terminal to use: the configured one, else the best one present.
+
+    None means this machine has none of them, which is worth saying rather
+    than failing to start something.
+    """
+    terminals = detect_terminals()
+    if not terminals:
+        return None
+    return next((item for item in terminals if item.name == name), terminals[0])
+
+
+def target_for(profile, remote_dir: str = "") -> ShellTarget:
+    """Where a terminal for this saved connection should log in.
+
+    The port comes from :func:`shellaccess.shell_port`, not from the profile:
+    on an FTP connection the profile's port is the FTP one, and handing that
+    to ssh would dial the file-transfer service and hang.
+    """
+    return ShellTarget(
+        host=profile.host,
+        port=shellaccess.shell_port(profile),
+        username=profile.username,
+        password=profile.password,
+        key_path=profile.private_key_path,
+        remote_dir=remote_dir,
+    )
 
 
 def remote_login_command(remote_dir: str) -> str:

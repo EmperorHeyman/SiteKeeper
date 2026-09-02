@@ -71,6 +71,13 @@ PERMISSIONS = (
         "Run SQL that changes data",
         "Off means SELECT-style statements only.",
     ),
+    (
+        "allow_exec",
+        "Run commands on the server",
+        "A shell can do everything the boxes above describe and more, so it "
+        "is its own decision. FTP connections get one over SSH on the same "
+        "host.",
+    ),
 )
 
 
@@ -117,9 +124,9 @@ class MCPDialog(QDialog):
         intro = QLabel(
             "Claude Code and Claude Desktop can use these connections "
             "themselves - browse and read remote files, push files and "
-            "folders, run MySQL queries - against this same vault. Everything "
-            "here takes effect at once, in every project, with nothing to "
-            "restart."
+            "folders, run MySQL queries, run commands in the server's own "
+            "shell - against this same vault. Everything here takes effect "
+            "at once, in every project, with nothing to restart."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)

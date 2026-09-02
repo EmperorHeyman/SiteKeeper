@@ -49,7 +49,8 @@ from mysql_runner.storage.models import ConnectionKind, Environment, ServerProfi
 from mysql_runner.storage.portable import PortableError, export_profiles, import_profiles
 from mysql_runner.storage.settings import MIN_SIDEBAR_WIDTH, Settings
 from mysql_runner.storage.store import ServerStore
-from mysql_runner.transfer import connstr
+from mysql_runner.transfer import connstr, shellaccess, spawn
+from mysql_runner.transfer.worker import ConnectionSpec
 from mysql_runner.ui.bridge_server import BridgeServer
 from mysql_runner.ui.file_manager_tab import FileManagerTab
 from mysql_runner.ui.master_password_dialog import (
@@ -59,6 +60,7 @@ from mysql_runner.ui.master_password_dialog import (
 )
 from mysql_runner.ui.server_dialog import ServerDialog
 from mysql_runner.ui.settings_dialog import SettingsDialog
+from mysql_runner.ui.shell_target_dialog import ask_ssh_port
 from mysql_runner.ui import theme
 from mysql_runner.ui.sql_console_tab import SqlConsoleTab
 from mysql_runner.ui.ssh_terminal_tab import SshTerminalTab
@@ -66,6 +68,10 @@ from mysql_runner.transfer import sftp_client
 from mysql_runner.web.browser_tab import BrowserTab
 
 _NO_SELECTION = "No selection"
+
+#: Used when a bridge request asks for a command without saying how long it
+#: may take. The MCP server always says; a hand-written caller might not.
+DEFAULT_BRIDGE_EXEC_TIMEOUT = 120.0
 
 #: The category a connection falls into when it has no group of its own.
 #: The sidebar used to file everything under one "Ungrouped" heading, which
@@ -455,6 +461,22 @@ class MainWindow(QMainWindow):
         tab_menu.addAction(focus_action)
 
         tools_menu = menubar.addMenu("T&ools")
+        terminal_action = QAction("Open a &terminal on this connection", self)
+        terminal_action.setShortcut("Ctrl+Shift+T")
+        terminal_action.setToolTip(
+            "A shell on the selected server - including FTP connections, "
+            "which get one over SSH"
+        )
+        terminal_action.triggered.connect(self._on_open_terminal)
+        external_action = QAction("Open it in &PuTTY / your terminal", self)
+        external_action.setToolTip(
+            "Hand the selected connection to the terminal program set in "
+            "Settings"
+        )
+        external_action.triggered.connect(self._on_external_terminal)
+        tools_menu.addAction(terminal_action)
+        tools_menu.addAction(external_action)
+        tools_menu.addSeparator()
         mcp_action = QAction("Connect &Claude (MCP server)…", self)
         mcp_action.setToolTip(
             "Let Claude Code / Claude Desktop use these connections"
@@ -667,6 +689,15 @@ class MainWindow(QMainWindow):
         menu = QMenu(self._tree)
         connect = menu.addAction("Connect", self._on_connect)
         connect.setEnabled(profile is not None)
+        # A terminal without opening the file manager first. It is listed for
+        # every transfer connection, FTP included: those borrow SSH on the
+        # same host, which is asked about once and then remembered.
+        terminal = menu.addAction("Open a terminal", self._on_open_terminal)
+        terminal.setEnabled(profile is not None and shellaccess.has_shell(profile))
+        external = menu.addAction(
+            "Open in PuTTY / your terminal", self._on_external_terminal
+        )
+        external.setEnabled(profile is not None and shellaccess.has_shell(profile))
         menu.addSeparator()
         menu.addAction("Add…", self._on_add)
         edit = menu.addAction("Edit…", self._on_edit)
@@ -967,7 +998,8 @@ class MainWindow(QMainWindow):
             tab = FileManagerTab(
                 profile, dark_mode=dark, settings=self._settings, jump=jump
             )
-            tab.shell_requested.connect(self._open_shell_tab)
+            tab.shell_requested.connect(self._open_terminal_for)
+            tab.external_shell_requested.connect(self._launch_external_terminal)
             tab.profile_changed.connect(self._on_profile_changed)
             return tab
         # A browser tab's "dark mode" means the page, not the app chrome.
@@ -1018,6 +1050,120 @@ class MainWindow(QMainWindow):
         if not isinstance(profile, ServerProfile):
             return
         self._store.update(profile)
+
+    # ----- terminals -----------------------------------------------------
+    def _on_open_terminal(self) -> None:
+        """Ctrl+Shift+T, and the list's own menu: shell into what is selected.
+
+        The point of this being here rather than only inside a file-manager
+        tab: a terminal is often the whole reason for opening a server at
+        all, and it used to be three clicks deep behind a menu that hides
+        itself on FTP.
+        """
+        profile = self._selected_profile()
+        if profile is None:
+            QMessageBox.information(
+                self, _NO_SELECTION, "Select a server to open a terminal on."
+            )
+            return
+        self._open_terminal_for(profile)
+
+    def _open_terminal_for(self, profile: object, cwd: str = "") -> None:
+        """Open a shell tab for one connection, borrowing SSH if it must.
+
+        This is the only place that decides where a connection's shell is,
+        because it is the only place that can remember the answer: FTP and
+        FTPS have no shell of their own, so the first terminal on one asks
+        whether to log in over SSH instead and writes the port it settles on
+        into the vault (see ``transfer/shellaccess.py``).
+        """
+        assert isinstance(profile, ServerProfile)
+        if not shellaccess.has_shell(profile):
+            QMessageBox.information(
+                self,
+                "No terminal here",
+                f"{profile.label} is a {profile.kind.value} connection. "
+                "Terminals are for the file-transfer connections - FTP, FTPS "
+                "and SFTP - which are servers you can log in to.",
+            )
+            return
+        if not sftp_client.driver_available():
+            QMessageBox.critical(
+                self,
+                "SSH library missing",
+                "This build has no SSH library, so a terminal cannot be "
+                "opened. Install Paramiko and restart.",
+            )
+            return
+        jump, complaint = self._jump_for(profile)
+        if complaint:
+            QMessageBox.critical(self, "Jump host missing", complaint)
+            return
+        if not self._settle_ssh_port(profile):
+            return
+        spec = ConnectionSpec.for_profile(shellaccess.shell_profile(profile), jump)
+        self._open_shell_tab(profile, spec, cwd or profile.remote_dir.strip())
+
+    def _settle_ssh_port(self, profile: ServerProfile) -> bool:
+        """Make sure we know where this connection's shell is. False = not now.
+
+        Only FTP and FTPS ever ask, and only the first time: sending a
+        password saved for file transfer to a different service on that host
+        is a decision, so it is put once and written into the vault.
+        """
+        if not shellaccess.borrows_credentials(profile) or profile.ssh_port:
+            return True
+        port = ask_ssh_port(profile, self)
+        if not port:
+            return False
+        profile.ssh_port = port
+        self._store.update(profile)
+        self._refresh_server_list()
+        return True
+
+    def _on_external_terminal(self) -> None:
+        """Hand the selected connection to PuTTY, Windows Terminal or ssh."""
+        profile = self._selected_profile()
+        if profile is None:
+            QMessageBox.information(
+                self, _NO_SELECTION, "Select a server to open a terminal on."
+            )
+            return
+        self._launch_external_terminal(profile, profile.remote_dir.strip())
+
+    def _launch_external_terminal(self, profile: object, cwd: str = "") -> None:
+        """Start the terminal program on this machine, logged in and in ``cwd``."""
+        assert isinstance(profile, ServerProfile)
+        if not shellaccess.has_shell(profile):
+            QMessageBox.information(
+                self,
+                "No terminal here",
+                f"{profile.label} is a {profile.kind.value} connection, so "
+                "there is nothing for a terminal to log in to.",
+            )
+            return
+        if not self._settle_ssh_port(profile):
+            return
+        chosen = spawn.preferred_terminal(self._settings.terminal_program)
+        if chosen is None:
+            QMessageBox.information(
+                self,
+                "No terminal found",
+                "PuTTY, Windows Terminal, ssh.exe and WSL were all looked "
+                "for and none of them is installed.",
+            )
+            return
+        target = spawn.target_for(profile, cwd)
+        try:
+            spawn.launch(
+                chosen, target, include_password=self._settings.terminal_send_password
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not start the terminal", str(exc))
+            return
+        self.statusBar().showMessage(
+            f"Opened {chosen.name} on {profile.label}.", 5000
+        )
 
     def _open_shell_tab(self, profile: object, spec: object, cwd: str) -> None:
         """Open an SSH shell beside the file manager that asked for it."""
@@ -1503,7 +1649,7 @@ class MainWindow(QMainWindow):
         if request.op == "query":
             self._route_bridge_query(request)
             return
-        if request.op not in ("upload", "download", "delete", "mkdir"):
+        if request.op not in ("upload", "download", "delete", "mkdir", "exec"):
             request.fail(
                 f"Sitekeeper does not handle {request.op!r} requests.",
                 unavailable=True,
@@ -1538,6 +1684,13 @@ class MainWindow(QMainWindow):
                     note,
                     request.finish,
                 )
+        elif request.op == "exec":
+            refusal = tab.accept_bridge_exec(
+                str(payload.get("command", "")),
+                str(payload.get("cwd", "")),
+                float(payload.get("timeout") or DEFAULT_BRIDGE_EXEC_TIMEOUT),
+                request.finish,
+            )
         elif request.op == "delete":
             # is_dir is left out when the caller does not know, rather than
             # guessed at: the tab resolves it on the connection doing the work.

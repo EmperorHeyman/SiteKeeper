@@ -17,6 +17,7 @@ import ftplib
 import os
 from datetime import datetime, timezone
 
+from mysql_runner.transfer import longlist
 from mysql_runner.transfer.base import (
     Capability,
     ProgressCallback,
@@ -211,6 +212,8 @@ class FTPFileSystem(RemoteFS):
                     size=_as_int(facts.get("size")),
                     modified=_parse_mlsd_time(facts.get("modify")),
                     mode=_as_mode(facts.get("unix.mode")),
+                    owner=_fact(facts, "owner"),
+                    group=_fact(facts, "group"),
                 )
             )
         return entries
@@ -224,7 +227,7 @@ class FTPFileSystem(RemoteFS):
             raise TransferError(_describe(exc)) from exc
         entries: list[RemoteEntry] = []
         for line in lines:
-            entry = _parse_list_line(line)
+            entry = longlist.parse_line(line)
             if entry is not None and entry.name not in (".", ".."):
                 entries.append(entry)
         return entries
@@ -280,6 +283,8 @@ class FTPFileSystem(RemoteFS):
                 size=0 if is_dir else _as_int(facts.get("size")),
                 modified=_parse_mlsd_time(facts.get("modify")),
                 mode=_as_mode(facts.get("unix.mode")),
+                owner=_fact(facts, "owner"),
+                group=_fact(facts, "group"),
             )
         return None
 
@@ -422,6 +427,41 @@ class FTPFileSystem(RemoteFS):
             raise TransferError(_describe(exc)) from exc
         return transferred
 
+    def read_range(self, remote: str, offset: int = 0, length: int = 0) -> bytes:
+        """Restart the transfer at ``offset`` and keep ``length`` bytes.
+
+        REST is the resume command, and reading the end of a log is the same
+        request as resuming a download that stopped there. Servers that never
+        advertised REST get the base class's read-and-slice instead, which is
+        correct and slow rather than wrong.
+
+        The bytes past the window are read and dropped rather than the
+        transfer being cut short: aborting an FTP data connection mid-stream
+        leaves the control channel in a state the next command has to clean
+        up, and a tail is offset-to-end anyway, so there is usually nothing
+        past the window to drop.
+        """
+        offset = max(0, int(offset))
+        if not self._has_rest:
+            return super().read_range(remote, offset, length)
+        ftp = self._require()
+        buffer = bytearray()
+        wanted = length or 0
+
+        def receive(chunk: bytes) -> None:
+            if wanted and len(buffer) >= wanted:
+                return
+            buffer.extend(chunk)
+
+        try:
+            ftp.voidcmd("TYPE I")
+            ftp.retrbinary(
+                f"RETR {remote}", receive, blocksize=CHUNK, rest=offset or None
+            )
+        except ftplib.all_errors as exc:
+            raise TransferError(_describe(exc)) from exc
+        return bytes(buffer[:wanted]) if wanted else bytes(buffer)
+
     def _size(self, remote: str) -> int:
         """Best-effort file size; 0 when the server will not say."""
         ftp = self._require()
@@ -438,6 +478,21 @@ def _as_int(value: object) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
+
+
+def _fact(facts: dict, which: str) -> str:
+    """An MLSD ownership fact, by whichever name this server uses for it.
+
+    Ownership is not in RFC 3659, so servers that report it at all disagree
+    about the spelling: ProFTPD sends ``unix.owner`` (a name), others send
+    ``unix.ownername`` beside a numeric ``unix.owner``. A name is worth more
+    than a number here, so it wins when both are there.
+    """
+    for key in (f"unix.{which}name", f"unix.{which}", which):
+        value = facts.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _as_mode(value: object) -> int | None:
@@ -459,49 +514,6 @@ def _parse_mlsd_time(value: object) -> float | None:
     except ValueError:
         return None
     return stamp.replace(tzinfo=timezone.utc).timestamp()
-
-
-def _mode_from_permissions(text: str) -> int | None:
-    """Turn "rwxr-xr-x" from a LIST line into permission bits."""
-    body = text[1:10]
-    if len(body) != 9:
-        return None
-    mode = 0
-    for index, char in enumerate(body):
-        if char == "-":
-            continue
-        bit = (0b100, 0b010, 0b001)[index % 3]
-        mode |= bit << (6 - 3 * (index // 3))
-    return mode
-
-
-def _parse_list_line(line: str) -> RemoteEntry | None:
-    """Parse one Unix-style LIST line, e.g.
-
-    ``drwxr-xr-x 2 user group 4096 Jan 14 09:31 uploads``
-
-    Returns None for lines that are not entries (totals, blanks).
-    """
-    parts = line.split(maxsplit=8)
-    if len(parts) < 9 or not parts[0]:
-        return None
-    permissions = parts[0]
-    if permissions[0] not in "-dl":
-        return None
-    name = parts[8]
-    is_link = permissions[0] == "l"
-    target = ""
-    if is_link and " -> " in name:
-        name, target = name.split(" -> ", 1)
-    return RemoteEntry(
-        name=name,
-        is_dir=permissions[0] == "d",
-        size=_as_int(parts[4]),
-        modified=None,  # LIST timestamps are ambiguous; skip rather than guess.
-        is_link=is_link,
-        mode=_mode_from_permissions(permissions),
-        link_target=target,
-    )
 
 
 def _describe(exc: Exception) -> str:

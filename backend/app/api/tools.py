@@ -235,14 +235,10 @@ def launch_terminal(request: LaunchRequest, state=Depends(require_unlocked)) -> 
             detail="no terminal program was found on this machine",
         )
     chosen = next((t for t in found if t.name == request.terminal), found[0])
-    target = spawn.ShellTarget(
-        host=profile.host,
-        port=profile.effective_port,
-        username=profile.username,
-        password=profile.password,
-        key_path=profile.private_key_path,
-        remote_dir=request.remote_dir,
-    )
+    # Where the *shell* is, which on an FTP profile is not the port the
+    # profile names: handing ssh the FTP port dials the file-transfer service
+    # and hangs. See transfer/shellaccess.py.
+    target = spawn.target_for(profile, request.remote_dir)
     try:
         spawn.launch(chosen, target, include_password=request.include_password)
     except OSError as exc:
