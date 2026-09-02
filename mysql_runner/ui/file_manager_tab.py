@@ -59,8 +59,13 @@ from PyQt6.QtWidgets import (
 )
 
 from mysql_runner.runtime_mode import mapped_drive_letter, running_elevated
-from mysql_runner.storage.models import Environment, ServerProfile
+from mysql_runner.storage.models import (
+    ConnectionKind,
+    Environment,
+    ServerProfile,
+)
 from mysql_runner.storage.settings import Settings
+from mysql_runner.transfer import editors
 from mysql_runner.transfer import permissions as perm
 from mysql_runner.transfer import spawn
 from mysql_runner.transfer.base import (
@@ -69,7 +74,7 @@ from mysql_runner.transfer.base import (
     RemoteFS,
     local_relative,
 )
-from mysql_runner.transfer.githistory import Export, export_files
+from mysql_runner.transfer.githistory import Export, commit_subject, export_files
 from mysql_runner.transfer.gitwatch import (
     CommitEvent,
     GitCommitWatcher,
@@ -78,7 +83,9 @@ from mysql_runner.transfer.gitwatch import (
     find_repo,
 )
 from mysql_runner.transfer.hashing import DiffStatus
+from mysql_runner.transfer import hostkeys
 from mysql_runner.transfer.history import HistoryStore
+from mysql_runner.transfer.shellhistory import ShellHistory
 from mysql_runner.transfer.ignore import (
     IgnoreRules,
     add_patterns,
@@ -86,7 +93,7 @@ from mysql_runner.transfer.ignore import (
     pattern_for,
 )
 from mysql_runner.transfer.navhistory import NavHistory, mirror_path
-from mysql_runner.transfer.pool import Overwrite, PoolOptions
+from mysql_runner.transfer.pool import JobState, Overwrite, PoolOptions
 from mysql_runner.transfer.snippets import SnippetLibrary
 from mysql_runner.transfer.syncrules import (
     SyncMode,
@@ -116,7 +123,8 @@ from mysql_runner.ui.remote_tools import (
     SnippetsDialog,
     ToolProgressBar,
 )
-from mysql_runner.ui.transfer_queue_panel import TransferQueuePanel
+from mysql_runner.ui.changes_panel import ChangesPanel
+from mysql_runner.ui.transfer_queue_panel import TransferQueuePanel, origin_with_note
 
 _PARENT = ".."
 _COLUMNS = ("Name", "Size", "Modified", "Mode", "Sync")
@@ -149,6 +157,14 @@ _BULK_REMOVAL = 25
 #: Editing a remote file bigger than this asks first - the whole file comes
 #: down now and goes back up on every save.
 _MAX_EDIT_BYTES = 20 * 1024 * 1024
+
+#: Shown on the greyed-out "Open in VS Code" entries, because a disabled item
+#: that says nothing is a dead end.
+_NO_EDITOR_HINT = (
+    "No VS Code on this machine - or its command line is not on PATH. "
+    "Visual Studio Code, Insiders, Cursor, VSCodium and Windsurf are all "
+    "looked for."
+)
 
 #: How close to a pane's top or bottom edge a drag has to be before the
 #: listing starts scrolling itself, and how often it steps while it is there.
@@ -1313,7 +1329,10 @@ class FileManagerTab(QWidget):
     _home_requested = pyqtSignal()
     _mkdir_requested = pyqtSignal(str)
     _mkfile_requested = pyqtSignal(str)
-    _delete_requested = pyqtSignal(str, bool)
+    #: The whole selection at once: [(remote path, is_dir), ...]. One
+    #: signal rather than one per file, because the worker answers each of
+    #: them with a full directory listing and thirty of those is the wait.
+    _delete_requested = pyqtSignal(object)
     _rename_requested = pyqtSignal(str, str)
     _download_requested = pyqtSignal(object, str)
     #: A whole tree, grouped by destination folder, as one queue.
@@ -1322,6 +1341,10 @@ class FileManagerTab(QWidget):
     #: A whole tree, grouped by sub-directory, as one queue: (payload,
     #: base directory, quiet). See TransferWorker.upload_groups.
     _upload_groups_requested = pyqtSignal(object, str, bool)
+    #: MCP-bridge work that is not a transfer, carrying a request id so the
+    #: answer can be matched to the caller blocked on it.
+    _bridge_delete_requested = pyqtSignal(str, object)
+    _bridge_mkdir_requested = pyqtSignal(str, str)
     _close_requested = pyqtSignal()
     _chmod_requested = pyqtSignal(str, int, bool, str)
     _symlink_requested = pyqtSignal(str, str)
@@ -1379,6 +1402,7 @@ class FileManagerTab(QWidget):
         *,
         dark_mode: bool = False,
         settings: Settings | None = None,
+        jump: object = None,
     ) -> None:
         super().__init__(parent)
         self._profile = profile
@@ -1423,8 +1447,26 @@ class FileManagerTab(QWidget):
         self._sync_retries: dict[str, int] = {}
         #: Per rule, the activity-log entry still waiting for its scan result.
         self._activity_events: dict[str, object] = {}
+        #: Per rule, the subject of the commit whose diff is still being read,
+        #: so the queue batch it turns into can say which commit it is.
+        self._commit_notes: dict[str, str] = {}
+        #: Scratch copies that were asked for by name: copy -> editor. The
+        #: choice is made when the download is requested and has to survive
+        #: until the file lands, which is a round trip later.
+        self._edit_editors: dict[str, editors.Editor] = {}
+        #: The editor found for the current preference, worked out once per tab
+        #: rather than per right-click: looking for five programs means walking
+        #: PATH, and a PATH with a network drive on it is not free. Installing
+        #: an editor while the app is open shows up in the next tab.
+        self._editor_found: tuple[str, editors.Editor | None] | None = None
         #: Remote files being edited locally: scratch copy -> remote path.
         self._edit_watch: dict[str, str] = {}
+        #: Transfers handed to this tab by the MCP bridge and not yet
+        #: finished, matched to their queue rows. See accept_bridge_upload.
+        self._bridge_jobs: list[dict] = []
+        #: Bridge deletes and folder creations waiting on the worker, by
+        #: request id. See accept_bridge_delete.
+        self._bridge_ops: dict[str, object] = {}
         self._edit_mtimes: dict[str, float] = {}
         self._edit_dirty: dict[str, float] = {}
         self._edit_root = os.path.join(
@@ -1438,6 +1480,8 @@ class FileManagerTab(QWidget):
         )
         #: Per commit being published, the activity-log entry waiting for it.
         self._publish_events: dict[str, object] = {}
+        #: Per commit being published, its subject, read while it is extracted.
+        self._publish_notes: dict[str, str] = {}
         self._edit_timer = QTimer(self)
         self._edit_timer.setInterval(1500)
         self._edit_timer.timeout.connect(self._poll_edits)
@@ -1447,9 +1491,13 @@ class FileManagerTab(QWidget):
         self._mirroring = False
         self._mirror_local_base = ""
         self._mirror_remote_base = ""
-        self._command_history: list[str] = []
+        # The same memory the shell tab uses: both are 'commands I ran
+        # on this server', and keeping two of them meant the quick
+        # runner and the shell each forgot what the other had done.
+        self._shell_history = ShellHistory(profile.id)
         self._dialogs: dict[str, QWidget] = {}
-        self._spec = _spec_for(profile)
+        self._jump = jump
+        self._spec = _spec_for(profile, jump)
 
         self._build_ui()
         self._refresh_actions()
@@ -1515,6 +1563,17 @@ class FileManagerTab(QWidget):
         panes.addWidget(self._remote)
         panes.setSizes([500, 500])
 
+        # What the watcher has seen, waiting to be sent. Above the queue on
+        # purpose: this is the deciding, the queue below it is the doing.
+        self._changes_panel = ChangesPanel()
+        self._changes_panel.setVisible(False)
+        self._changes_panel.upload_requested.connect(self._on_changes_upload)
+        self._changes_panel.reveal_requested.connect(self._on_changes_reveal)
+        self._changes_panel.count_changed.connect(self._on_changes_count)
+        self._changes_panel.selection_changed.connect(
+            lambda _count: self._refresh_actions()
+        )
+
         self._queue_panel = TransferQueuePanel(workers=self._settings.transfer_workers)
         self._queue_panel.setVisible(False)
         self._queue_panel.pause_requested.connect(self._pause_requested.emit)
@@ -1532,9 +1591,11 @@ class FileManagerTab(QWidget):
         # is the user's to drag - down to a sliver when it is in the way.
         split = QSplitter(Qt.Orientation.Vertical)
         split.addWidget(panes)
+        split.addWidget(self._changes_panel)
         split.addWidget(self._queue_panel)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 1)
+        split.setStretchFactor(2, 1)
         split.setCollapsible(0, False)
         layout.addWidget(split, 1)
 
@@ -1602,6 +1663,15 @@ class FileManagerTab(QWidget):
         self._sync_btn.setMenu(sync_menu)
         row.addWidget(self._sync_btn)
 
+        # Ticking Watch opens the list; this is how it is reopened after it
+        # has been closed, and where the count lives so a tab that noticed
+        # something says so without being looked at.
+        self._changes_btn = QPushButton("Changes")
+        self._changes_btn.setCheckable(True)
+        self._changes_btn.setToolTip("Show what Watch has seen change on this machine")
+        self._changes_btn.toggled.connect(self._changes_panel_visible)
+        row.addWidget(self._changes_btn)
+
         self._queue_btn = QPushButton("Queue")
         self._queue_btn.setCheckable(True)
         self._queue_btn.setToolTip("Show the transfer queue (Ctrl+Shift+Q)")
@@ -1635,6 +1705,11 @@ class FileManagerTab(QWidget):
                 ("Live logs…", "", self._on_logs),
                 (None, "", None),
                 ("Open in PuTTY / your terminal", "", self._on_external_terminal),
+                (
+                    f"Open this folder in {self._editor_name()} over SSH",
+                    "",
+                    self._open_remote_folder_in_editor,
+                ),
             ),
         )
         # Hidden until the connection says it really has a shell.
@@ -1645,8 +1720,14 @@ class FileManagerTab(QWidget):
 
     def _watch_tooltip(self) -> str:
         if self._settings.watch_autosync:
-            return "Notice local edits as they are saved, and upload them"
-        return "Notice local edits as they are saved"
+            return (
+                "Notice local edits as they are saved, and upload them at "
+                "once (auto-upload is on in Settings)"
+            )
+        return (
+            "List local edits as they are saved, so you can pick what to "
+            "upload - files or whole folders"
+        )
 
     def _build_footer(self) -> QWidget:
         """The transfer bar: what acts on the current selection."""
@@ -1753,6 +1834,7 @@ class FileManagerTab(QWidget):
             pane.set_diff_colours(colours)
             pane.set_theme(enable)
         self._queue_panel.set_theme(enable)
+        self._changes_panel.set_theme(enable)
         activity = self._activity(create=False)
         if activity is not None:
             activity.set_theme(enable)
@@ -1787,6 +1869,9 @@ class FileManagerTab(QWidget):
             overwrite=Overwrite.ALWAYS,
             verify=settings.verify_uploads,
             preserve_times=settings.preserve_times,
+            # Stored in kilobytes because that is the unit anybody setting a
+            # limit thinks in; the pool counts bytes.
+            rate_limit=max(0, settings.transfer_rate_kb) * 1024,
         ).sane()
 
     def _ignore_rules(self) -> IgnoreRules:
@@ -1814,7 +1899,7 @@ class FileManagerTab(QWidget):
             (self._home_requested, self._worker.request_home),
             (self._mkdir_requested, self._worker.make_dir),
             (self._mkfile_requested, self._worker.make_file),
-            (self._delete_requested, self._worker.delete_entry),
+            (self._delete_requested, self._worker.delete_entries),
             (self._rename_requested, self._worker.rename_entry),
             (self._download_requested, self._worker.run_download),
             (self._download_groups_requested, self._worker.download_groups),
@@ -1848,6 +1933,8 @@ class FileManagerTab(QWidget):
             (self._options_changed, self._worker.update_options),
             (self._edit_requested, self._worker.fetch_for_edit),
             (self._upload_quiet_requested, self._worker.upload_quietly),
+            (self._bridge_delete_requested, self._worker.bridge_delete),
+            (self._bridge_mkdir_requested, self._worker.bridge_make_dir),
         )
         for signal, slot in outgoing:
             signal.connect(slot)
@@ -1856,6 +1943,7 @@ class FileManagerTab(QWidget):
             (self._worker.connected, self._on_connected),
             (self._worker.capabilities_ready, self._on_capabilities),
             (self._worker.failed, self._on_failed),
+            (self._worker.host_key_unknown, self._on_host_key_unknown),
             (self._worker.listing, self._on_listing),
             (self._worker.op_failed, self._on_op_message),
             (self._worker.op_done, self._on_op_message),
@@ -1865,6 +1953,8 @@ class FileManagerTab(QWidget):
             (self._worker.queue_finished, self._on_queue_finished),
             (self._worker.queue_item, self._queue_panel.update_item),
             (self._worker.queue_item, self._on_activity_item),
+            (self._worker.queue_item, self._on_bridge_item),
+            (self._worker.bridge_op, self._on_bridge_op),
             (self._worker.queue_stats, self._queue_panel.update_stats),
             (self._worker.tool_result, self._on_tool_result),
             (self._worker.tool_failed, self._on_tool_failed),
@@ -1892,6 +1982,24 @@ class FileManagerTab(QWidget):
         self._set_connection_state("busy", f"Connecting to {profile.describe_target()}")
         self._set_status(f"Connecting to {profile.describe_target()} …")
         self._open_requested.emit(self._spec)
+
+    def _on_host_key_unknown(self, unknown: object) -> None:
+        """First contact with this server: show its fingerprint and ask.
+
+        Answering yes records the key and connects; answering no leaves the tab
+        disconnected and says why, rather than retrying into the same question.
+        """
+        from mysql_runner.ui.host_key_dialog import ask
+
+        if not isinstance(unknown, hostkeys.HostKeyUnknown):
+            return
+        if ask(unknown, self):
+            self._set_status("Server confirmed. Connecting…")
+            self._connect_to_server()
+            return
+        self._on_failed(
+            f"Not connected: {unknown.host} was not confirmed as your server."
+        )
 
     # ----- worker callbacks -----------------------------------------------
     def _on_connected(self, banner: str) -> None:
@@ -1998,6 +2106,7 @@ class FileManagerTab(QWidget):
 
     def _on_closed(self) -> None:
         self._connected = False
+        self._abandon_bridge_jobs("the connection closed before it finished")
         if self._closing:
             return
         self._set_connection_state("fail", "The connection was closed.")
@@ -2251,7 +2360,9 @@ class FileManagerTab(QWidget):
 
         QDesktopServices.openUrl(QUrl.fromLocalFile(self._local_child(name)))
 
-    def _on_edit_remote(self, name: str) -> None:
+    def _on_edit_remote(
+        self, name: str, *, editor: editors.Editor | None = None
+    ) -> None:
         if not self._require_connection():
             return
         entry = self._remote.entry(name)
@@ -2270,7 +2381,10 @@ class FileManagerTab(QWidget):
             return
         remote = self._remote_child(name)
         local = os.path.join(self._edit_root, uuid.uuid4().hex[:8], name)
-        self._set_status(f"Fetching {name} for editing…")
+        if editor is not None:
+            self._edit_editors[local] = editor
+        where = f" for {editor.name}" if editor is not None else " for editing"
+        self._set_status(f"Fetching {name}{where}…")
         self._edit_requested.emit(remote, local)
 
     def _on_edit_ready(self, local: str, remote: str) -> None:
@@ -2282,11 +2396,24 @@ class FileManagerTab(QWidget):
         self._edit_watch[local] = remote
         if not self._edit_timer.isActive():
             self._edit_timer.start()
-        from PyQt6.QtGui import QDesktopServices
+        name = os.path.basename(local)
+        editor = self._edit_editors.pop(local, None)
+        opened_with = ""
+        if editor is not None:
+            try:
+                editors.open_paths(editor, [local])
+                opened_with = f" in {editor.name}"
+            except OSError as exc:
+                # The file is here and the watch is armed; falling back to
+                # whatever Windows opens it with is better than a status line
+                # about a program the user cannot do anything about right now.
+                self._set_status(f"{editor.name} would not start ({exc}).")
+        if not opened_with:
+            from PyQt6.QtGui import QDesktopServices
 
-        QDesktopServices.openUrl(QUrl.fromLocalFile(local))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(local))
         self._set_status(
-            f"Editing {os.path.basename(local)} - every save uploads back to "
+            f"Editing {name}{opened_with} - every save uploads back to "
             f"{remote} while this tab is open."
         )
 
@@ -2321,6 +2448,131 @@ class FileManagerTab(QWidget):
             False,
         )
         self._set_status(f"Uploading {name} → {remote}")
+
+    # ----- VS Code --------------------------------------------------------
+    # Two jobs, one editor, and the difference is worth knowing before you pick
+    # an entry. A *file* is fetched to a scratch copy and every save goes back
+    # up - the loop above, aimed at a named program instead of whatever Windows
+    # has registered for .php. A *folder* is not fetched at all: VS Code opens
+    # it over its own SSH session and edits the files where they are, which is
+    # the only way its search, its git and its terminal are the server's.
+    # Remote-SSH authenticates itself, so it never sees this app's stored
+    # password - see transfer/editors.py.
+    def _editor(self) -> editors.Editor | None:
+        """The editor to open things in, or None when none is installed."""
+        wanted = self._settings.editor_program
+        if self._editor_found is None or self._editor_found[0] != wanted:
+            self._editor_found = (wanted, editors.find_editor(wanted))
+        return self._editor_found[1]
+
+    def _editor_name(self) -> str:
+        """What to call it in a menu, whether or not it is installed."""
+        editor = self._editor()
+        return editor.name if editor is not None else "VS Code"
+
+    def _open_remote_in_editor(self, name: str) -> None:
+        """Fetch one server file into the editor, saves going back up."""
+        editor = self._editor()
+        if editor is None:
+            self._no_editor_note()
+            return
+        self._on_edit_remote(name, editor=editor)
+
+    def _open_remote_folder_in_editor(self) -> None:
+        """Open a server folder in place, over the editor's own SSH session."""
+        editor = self._editor()
+        if editor is None:
+            self._no_editor_note()
+            return
+        blocked = self._remote_ssh_block()
+        if blocked:
+            QMessageBox.information(self, "Not over this connection", blocked)
+            return
+        selection = self._remote.selection()
+        if len(selection) == 1 and selection[0][1]:
+            path = self._remote_child(selection[0][0])
+        else:
+            path = self._remote.path or "/"
+        # Nothing is queued and nothing is compared: from here on the editor
+        # writes to the server directly, which on a production box is exactly
+        # the thing the guard exists for.
+        if not self._confirm_production(
+            f"open {path} in {editor.name}, which then writes straight to"
+        ):
+            return
+        target = editors.RemoteTarget(
+            host=self._profile.host,
+            port=self._profile.effective_port,
+            username=self._profile.username,
+        )
+        try:
+            editors.open_remote(editor, target, path)
+        except OSError as exc:
+            QMessageBox.warning(self, f"Could not start {editor.name}", str(exc))
+            return
+        self._set_status(
+            f"{editor.name} is opening {path} on {target.authority()}. It "
+            "connects itself, so it asks for the key or password rather than "
+            "taking this connection's."
+        )
+
+    def _open_local_in_editor(self) -> None:
+        """Open the local selection - or the folder on show - in the editor."""
+        editor = self._editor()
+        if editor is None:
+            self._no_editor_note()
+            return
+        selection = self._local.selection()
+        paths = [self._local_child(name) for name, _is_dir in selection]
+        if not paths and self._local.path:
+            paths = [self._local.path]
+        if not paths:
+            self._set_status("There is nothing here to open.")
+            return
+        try:
+            editors.open_paths(editor, paths)
+        except OSError as exc:
+            QMessageBox.warning(self, f"Could not start {editor.name}", str(exc))
+            return
+        what = paths[0] if len(paths) == 1 else f"{len(paths)} items"
+        self._set_status(f"Opened {what} in {editor.name}.")
+
+    def _remote_ssh_block(self) -> str:
+        """Why the editor cannot open this connection's folders in place, or "".
+
+        Said in full rather than by hiding the entry: "why is this greyed out"
+        is a question with a real answer in every one of these cases, and two
+        of them are answered by doing something the app cannot do for you.
+        """
+        if self._profile.kind != ConnectionKind.SFTP:
+            return (
+                "VS Code can only open a folder in place over SSH, and this is "
+                f"an {self._profile.kind.value.upper()} connection. Opening a "
+                "single file still works: it comes down as a copy and every "
+                "save goes back up."
+            )
+        if self._profile.jump_profile_id or self._profile.proxy_command:
+            return (
+                "This connection is routed through a jump host or a proxy "
+                "command, and there is no way to hand that to VS Code on a "
+                "command line. Give the server a Host entry in ~/.ssh/config "
+                "and open it from VS Code itself."
+            )
+        if not self._profile.host:
+            return "This connection has no host name to give VS Code."
+        return ""
+
+    def _no_editor_note(self) -> None:
+        QMessageBox.information(
+            self,
+            "No editor found",
+            "Visual Studio Code, VS Code Insiders, Cursor, VSCodium and "
+            "Windsurf were all looked for on this machine, and none of them "
+            "is installed - or the one that is has no command line on PATH.\n\n"
+            "Installing VS Code with its “Add to PATH” option ticked is "
+            "enough. Settings ▸ File transfer picks between them when there "
+            "is more than one.",
+        )
 
     # ----- comparison ----------------------------------------------------
     def _on_compare(self, *, with_hashes: bool = True) -> None:
@@ -2475,10 +2727,19 @@ class FileManagerTab(QWidget):
     def _on_watch_toggled(self, watching: bool) -> None:
         if watching:
             self._restart_watcher(self._local.path)
-        elif self._watcher is not None:
+            # The list is the point of watching, so it opens with the watch
+            # rather than waiting for the first save to justify itself.
+            self._changes_btn.setChecked(True)
+            return
+        if self._watcher is not None:
             self._watcher.stop()
             self._watcher = None
             self._set_status("Stopped watching.")
+        # Whatever it already found stays on screen: the files are still
+        # different from the server, and closing the list would be the old
+        # behaviour of losing the answer as soon as it was given.
+        if not self._changes_panel.count():
+            self._changes_btn.setChecked(False)
 
     def _restart_watcher(self, path: str) -> None:
         if self._watcher is not None:
@@ -2493,7 +2754,12 @@ class FileManagerTab(QWidget):
             on_message=self.status_message.emit,
         )
         self._watcher.start(prime=True)
-        auto = " and uploading changes" if self._settings.watch_autosync else ""
+        self._changes_panel.set_root(path)
+        auto = (
+            " and uploading changes"
+            if self._settings.watch_autosync
+            else "; saves will be listed below"
+        )
         self._set_status(f"Watching {path}{auto}.")
 
     def _on_watch_changes(self, changes: object) -> None:
@@ -2508,6 +2774,10 @@ class FileManagerTab(QWidget):
             self._set_status(f"Changed locally: {text} (handled by the sync)")
             return
         if not self._settings.watch_autosync:
+            # The answer to "what changed?" is a list you can act on, not a
+            # status line the next message wipes.
+            self._changes_panel.add_changes(changes)
+            self._changes_btn.setChecked(True)
             self._set_status(f"Changed locally: {text}")
             return
         if not self._connected:
@@ -2515,7 +2785,15 @@ class FileManagerTab(QWidget):
             return
         self._upload_changes(changes)
 
-    def _upload_changes(self, changes: list[Change]) -> None:
+    def _upload_changes(self, changes: list[Change]) -> list[Change]:
+        """Send these changed files to the matching remote folders.
+
+        Returns what was actually handed to the queue, which is not always
+        what was asked for: a file deleted between being noticed and being
+        sent is dropped here, and a refused production confirmation drops the
+        lot. The changed-files panel clears its rows from this, so a row only
+        leaves the list when something really took it.
+        """
         base = self._local.path
         wanted = [
             change
@@ -2524,13 +2802,13 @@ class FileManagerTab(QWidget):
             and os.path.isfile(change.path)
         ]
         if not wanted:
-            return
+            return []
         if self._is_production and self._settings.production_guard:
             # Auto-upload to production is exactly the accident this guard is
             # for, so it asks - once per batch, not once per file.
             if not self._confirm_production(f"upload {len(wanted)} changed file(s) to"):
                 self._watch_box.setChecked(False)
-                return
+                return []
         # Read the destination once, before anything goes up, and send the
         # batches quietly: the pane this target came from must not be moved by
         # the upload it is aiming, or the next save nests inside the last one.
@@ -2547,6 +2825,40 @@ class FileManagerTab(QWidget):
                 (group, self._ignore_rules(), "watch"), target, True
             )
         self._set_status(f"Uploading {len(wanted)} changed file(s) from {base}.")
+        return wanted
+
+    # ----- the changed-files panel ----------------------------------------
+    def _changes_panel_visible(self, visible: bool) -> None:
+        self._changes_panel.setVisible(visible)
+        # Opening or closing the list moves where the loud button belongs.
+        self._refresh_actions()
+
+    def _on_changes_count(self, count: int) -> None:
+        """Carry the count onto the button, so a hidden list still speaks."""
+        self._changes_btn.setText(f"Changes ({count})" if count else "Changes")
+
+    def _on_changes_upload(self, changes: object) -> None:
+        """Send the files ticked in the panel to the remote pane's folder."""
+        if not isinstance(changes, list) or not changes:
+            return
+        if not self._connected:
+            self._set_status("Not connected, so nothing was sent.")
+            return
+        sent = self._upload_changes(changes)
+        if sent:
+            self._changes_panel.take_uploaded(sent)
+            self._queue_btn.setChecked(True)
+        elif not any(os.path.isfile(change.path) for change in changes):
+            # Gone from the disk between being noticed and being sent. A
+            # declined production confirmation also returns nothing, but that
+            # one has already said its piece in a dialog.
+            self._set_status("Those files are no longer on this machine.")
+
+    def _on_changes_reveal(self, path: object) -> None:
+        """Show one changed file's folder in the local pane."""
+        folder = os.path.dirname(str(path))
+        if folder and os.path.isdir(folder):
+            self._load_local(folder)
 
     # ----- synced folders -------------------------------------------------
     # A synced folder is a local directory paired with a remote one and a
@@ -3054,7 +3366,13 @@ class FileManagerTab(QWidget):
 
         def measure() -> None:
             # git runs off the GUI thread; a repo on a network drive can
-            # take a moment to answer.
+            # take a moment to answer. The subject is read here too: it costs
+            # one more git call on a thread that is already making one, and
+            # asking for it on the GUI thread to label a batch would stall the
+            # window for as long as the repository takes to answer.
+            self._commit_notes[rule_id] = (
+                commit_subject(repo, event.new) or event.detail
+            )
             self._commit_diff_ready.emit(
                 rule_id, repo, commit_changes(repo, event.old, event.new)
             )
@@ -3063,6 +3381,9 @@ class FileManagerTab(QWidget):
 
     def _on_commit_diff(self, rule_id: str, repo: str, changes: object) -> None:
         """git named the files one commit touched; send exactly those."""
+        # Popped whichever way this goes: a note left behind would be shown
+        # against the next commit to this rule, which is worse than none.
+        note = self._commit_notes.pop(rule_id, "")
         rule = self._rule(rule_id)
         if rule is None or self._closing:
             return
@@ -3116,7 +3437,7 @@ class FileManagerTab(QWidget):
                 flatten=rule.local,
                 rules=ignores,
                 quiet=True,
-                origin="git",
+                origin=origin_with_note("git", note),
             )
         if removals:
             shown = removals[:20]
@@ -3547,6 +3868,7 @@ class FileManagerTab(QWidget):
 
         def extract() -> None:
             # git runs off the GUI thread: a big commit is several seconds.
+            self._publish_notes[sha] = commit_subject(repo, sha)
             try:
                 export = export_files(repo, sha, placeable, dest)
             except OSError as exc:
@@ -3576,6 +3898,7 @@ class FileManagerTab(QWidget):
             return
         log = self._activity()
         entry = self._publish_events.pop(sha, None)
+        note = f"{sha[:8]} {self._publish_notes.pop(sha, '')}".strip()
         rule = self._rule(rule_id) or self._publish_rule()
         if not export.ok:
             reason = export.failures[0][1] if export.failures else "nothing to send"
@@ -3592,9 +3915,10 @@ class FileManagerTab(QWidget):
                 rule.remote_for(os.path.join(repo, rel.replace("/", os.sep)))
             )
             by_dir.setdefault(target, []).append((local_path, False))
+        origin = origin_with_note("publish", note)
         for target, group in by_dir.items():
             self._upload_quiet_requested.emit(
-                (group, IgnoreRules.empty(), "publish"), target, True
+                (group, IgnoreRules.empty(), origin), target, True
             )
         if entry is not None:
             log.add_files(entry, list(export.files))
@@ -3974,6 +4298,214 @@ class FileManagerTab(QWidget):
         if dialog is not None and item.upload:
             dialog.update_transfer(item)
 
+    # ----- work handed over by the MCP bridge -----------------------------
+    # Everything Claude does to a server used to happen in the MCP process, on
+    # its own connection, with a direct call - which is why none of it ever
+    # appeared anywhere in this window. It arrives here instead and goes
+    # through this tab's worker, so an upload becomes a queue row with a
+    # shadow backup behind it, a delete is journalled for Undo and re-lists
+    # the pane, and the caller is told what actually happened rather than that
+    # it submitted something.
+    #
+    # Transfers are matched to their queue rows by direction and destination;
+    # deletes and folder creation carry a request id, because op_done and
+    # op_failed say what happened without saying which request it was about.
+    def accept_bridge_upload(self, pairs, note: str, on_done) -> str:
+        """Queue (local, remote) pairs for the MCP bridge.
+
+        Returns "" once the work is queued - ``on_done`` is then called with a
+        summary as soon as every file has reached a terminal state - or the
+        reason it was not taken. The remote name has to match the local one:
+        the queue derives it from the file it is sending, so an upload that
+        also renames cannot be expressed here, and is better done by the
+        caller than silently done wrong.
+        """
+        if not self._connected:
+            return "the tab for that connection is not connected"
+        wanted = []
+        for local, remote in pairs:
+            if not os.path.isfile(local):
+                return f"{local} is not a file on this machine"
+            if os.path.basename(remote) != os.path.basename(local):
+                return "the upload renames the file, which the queue cannot do"
+            wanted.append((local, remote))
+        if not wanted:
+            return "nothing to upload"
+
+        by_dir: dict[str, list[tuple[str, bool]]] = {}
+        for local, remote in wanted:
+            by_dir.setdefault(RemoteFS.parent(remote) or "/", []).append(
+                (local, False)
+            )
+        self._track_bridge_transfer(
+            [_transfer_key(True, remote) for _local, remote in wanted], on_done
+        )
+        # One queue for the whole handover, not one per sub-directory. A
+        # folder push spread over thirty directories would otherwise drain and
+        # restart the pool thirty times, re-listing the server between each -
+        # which is the cost upload_groups exists to avoid.
+        self._upload_groups_requested.emit(
+            (
+                list(by_dir.items()),
+                IgnoreRules.empty(),
+                origin_with_note("mcp", note),
+            ),
+            RemoteFS.parent(wanted[0][1]) or "/",
+            True,
+        )
+        self._queue_btn.setChecked(True)
+        self._set_status(
+            f"Claude is uploading {len(wanted)} file(s) to {self._profile.label}."
+        )
+        return ""
+
+    def accept_bridge_download(self, pairs, note: str, on_done) -> str:
+        """Queue (remote, local) pairs for the MCP bridge.
+
+        The mirror of accept_bridge_upload, and it refuses for the mirror
+        reason: the queue names what it fetches after the file on the server,
+        so a download that renames on the way cannot be expressed here.
+        """
+        if not self._connected:
+            return "the tab for that connection is not connected"
+        wanted = []
+        for remote, local in pairs:
+            if RemoteFS.basename(remote) != os.path.basename(local):
+                return "the download renames the file, which the queue cannot do"
+            wanted.append((remote, os.path.abspath(local)))
+        if not wanted:
+            return "nothing to download"
+
+        by_dir: dict[str, list[tuple[str, bool]]] = {}
+        for remote, local in wanted:
+            by_dir.setdefault(os.path.dirname(local), []).append((remote, False))
+        for local_dir in by_dir:
+            try:
+                os.makedirs(local_dir, exist_ok=True)
+            except OSError as exc:
+                return f"cannot write to {local_dir}: {exc}"
+        self._track_bridge_transfer(
+            [_transfer_key(False, local) for _remote, local in wanted], on_done
+        )
+        self._download_groups_requested.emit(
+            (
+                list(by_dir.items()),
+                IgnoreRules.empty(),
+                origin_with_note("mcp", note),
+            )
+        )
+        self._queue_btn.setChecked(True)
+        self._set_status(
+            f"Claude is downloading {len(wanted)} file(s) from "
+            f"{self._profile.label}."
+        )
+        return ""
+
+    def accept_bridge_delete(self, path: str, is_dir: bool, on_done) -> str:
+        """Delete one path on the server for the MCP bridge.
+
+        Worth routing here more than any of the others: this is the one
+        destructive act with an undo, and the undo lives in this tab's
+        journal. A delete done in the MCP process could not be put back.
+        """
+        if not self._connected:
+            return "the tab for that connection is not connected"
+        if not path or path.rstrip("/") in ("", "/"):
+            return "that path is the root"
+        request_id = self._track_bridge_op(on_done)
+        # Passed through as-is, None included: bool(None) is False, which
+        # would send a directory to be removed as though it were a file and
+        # throw away the whole point of letting the worker stat it.
+        self._bridge_delete_requested.emit(request_id, [(path, is_dir)])
+        self._set_status(f"Claude is deleting {path} on {self._profile.label}.")
+        return ""
+
+    def accept_bridge_mkdir(self, path: str, on_done) -> str:
+        """Create a folder on the server for the MCP bridge."""
+        if not self._connected:
+            return "the tab for that connection is not connected"
+        if not path:
+            return "no path was given"
+        request_id = self._track_bridge_op(on_done)
+        self._bridge_mkdir_requested.emit(request_id, path)
+        return ""
+
+    # ----- keeping track of both kinds ------------------------------------
+    def _track_bridge_transfer(self, keys, on_done) -> None:
+        self._bridge_jobs.append(
+            {
+                "pending": set(keys),
+                "done": 0,
+                "failed": [],
+                "on_done": on_done,
+                "total": len(keys),
+            }
+        )
+
+    def _track_bridge_op(self, on_done) -> str:
+        request_id = uuid.uuid4().hex[:12]
+        self._bridge_ops[request_id] = on_done
+        return request_id
+
+    def _on_bridge_item(self, item) -> None:
+        """Tick one file off whichever bridge job was waiting for it."""
+        if not self._bridge_jobs or not item.state.finished:
+            return
+        key = _transfer_key(item.upload, item.destination)
+        for job in list(self._bridge_jobs):
+            if key not in job["pending"]:
+                continue
+            job["pending"].discard(key)
+            if item.state is JobState.DONE:
+                job["done"] += 1
+            else:
+                reason = item.error or item.state.value
+                job["failed"].append(f"{item.destination}: {reason}")
+            if not job["pending"]:
+                self._bridge_jobs.remove(job)
+                self._finish_bridge_job(job)
+            return
+
+    def _on_bridge_op(self, request_id: str, ok: bool, message: str) -> None:
+        """Answer the caller waiting on one delete or folder creation."""
+        callback = self._bridge_ops.pop(request_id, None)
+        if callback is None:
+            return
+        callback(
+            {"ok": bool(ok), "detail": message, "error": "" if ok else message}
+        )
+        self._set_status(message)
+
+    def _finish_bridge_job(self, job: dict, abandoned: str = "") -> None:
+        """Tell the waiting MCP call how its files got on."""
+        callback = job.get("on_done")
+        if callback is None:
+            return
+        job["on_done"] = None  # answer once, whatever else happens
+        callback(
+            {
+                "ok": True,
+                "sent": job["done"],
+                "total": job["total"],
+                "failed": list(job["failed"]),
+                "abandoned": abandoned,
+            }
+        )
+
+    def _abandon_bridge_jobs(self, reason: str) -> None:
+        """Answer anything still waiting when this tab stops being able to.
+
+        Without this the caller waits out its whole timeout on a connection
+        that has already gone - minutes of silence where one sentence would
+        do.
+        """
+        jobs, self._bridge_jobs = self._bridge_jobs, []
+        for job in jobs:
+            self._finish_bridge_job(job, abandoned=reason)
+        waiting, self._bridge_ops = self._bridge_ops, {}
+        for callback in waiting.values():
+            callback({"ok": False, "error": reason})
+
     # ----- commands -------------------------------------------------------
     def _set_active(self, *, remote: bool) -> None:
         self._remote_active = remote
@@ -4233,10 +4765,27 @@ class FileManagerTab(QWidget):
         if self._remote_active:
             if not self._require_connection():
                 return
-            for name, is_dir in selection:
-                self._delete_requested.emit(self._remote_child(name), is_dir)
+            self._delete_requested.emit(
+                [
+                    (self._remote_child(name), self._deletes_as_tree(name, is_dir))
+                    for name, is_dir in selection
+                ]
+            )
         else:
             self._delete_local(selection)
+
+    def _deletes_as_tree(self, name: str, is_dir: bool) -> bool:
+        """Whether this entry should be removed as a directory.
+
+        A symlink pointing at a directory lists as a directory, and following
+        one would empty whatever it points at while leaving the link behind.
+        Deleting a link means deleting the link, so it goes as a file - which
+        the pane can tell us, because the listing already knows.
+        """
+        if not is_dir:
+            return False
+        entry = self._remote.entry(name)
+        return not (entry is not None and entry.is_link)
 
     def _delete_local(self, selection: list[tuple[str, bool]]) -> None:
         for name, is_dir in selection:
@@ -4419,7 +4968,9 @@ class FileManagerTab(QWidget):
         dialog = self._dialogs.get("exec")
         if not isinstance(dialog, CommandBar):
             dialog = CommandBar(
-                self._remote.path or "/", history=self._command_history, parent=self
+                self._remote.path or "/",
+                history=self._shell_history.entries(),
+                parent=self,
             )
             dialog.command_requested.connect(self._on_run_command)
             self._dialogs["exec"] = dialog
@@ -4427,6 +4978,7 @@ class FileManagerTab(QWidget):
         dialog.raise_()
 
     def _on_run_command(self, command: str, cwd: str) -> None:
+        self._shell_history.add(command)
         if self._is_production and self._settings.production_guard:
             if not self._confirm_production(f"run “{command}” on"):
                 return
@@ -4436,7 +4988,6 @@ class FileManagerTab(QWidget):
         dialog = self._dialogs.get("exec")
         if isinstance(dialog, CommandBar):
             dialog.show_result(payload)
-            self._command_history = dialog.history()
         elif payload is not None:
             self._set_status(getattr(payload, "stdout", "").strip()[:400])
 
@@ -4568,15 +5119,49 @@ class FileManagerTab(QWidget):
         pane = self._remote if remote else self._local
         selection = pane.selection()
         menu = QMenu(self)
+        # Without this a disabled entry can only shrug; with it, it says why.
+        menu.setToolTipsVisible(True)
         has_shell = Capability.EXEC in self._capabilities
 
         one_file = len(selection) == 1 and not selection[0][1]
+        editor = self._editor()
+        editor_name = self._editor_name()
         if remote:
             menu.addAction("Download", self._on_download).setEnabled(bool(selection))
             menu.addAction(
                 "Edit locally",
                 lambda: self._on_edit_remote(selection[0][0]),
             ).setEnabled(one_file)
+            in_editor = menu.addAction(
+                f"Open in {editor_name}",
+                lambda: self._open_remote_in_editor(selection[0][0]),
+            )
+            in_editor.setEnabled(one_file and editor is not None)
+            if editor is None:
+                in_editor.setToolTip(_NO_EDITOR_HINT)
+            elif not one_file:
+                in_editor.setToolTip(
+                    "Pick a single file. A folder goes to the entry below."
+                )
+            else:
+                in_editor.setToolTip(
+                    f"Downloads {selection[0][0]} and uploads every save back "
+                    "to the server while this tab is open."
+                )
+            folder_in_editor = menu.addAction(
+                f"Open this folder in {editor_name} over SSH",
+                self._open_remote_folder_in_editor,
+            )
+            blocked = _NO_EDITOR_HINT if editor is None else self._remote_ssh_block()
+            if blocked:
+                folder_in_editor.setEnabled(False)
+                folder_in_editor.setToolTip(blocked)
+            else:
+                folder_in_editor.setToolTip(
+                    f"{editor_name} edits the files where they are, over its "
+                    "own SSH session - nothing is downloaded. Needs its "
+                    "Remote-SSH extension."
+                )
             menu.addSeparator()
         else:
             menu.addAction("Upload", self._on_upload).setEnabled(bool(selection))
@@ -4637,6 +5222,15 @@ class FileManagerTab(QWidget):
                 "opened"
             )
             menu.addAction("Open in Explorer", self._open_in_explorer)
+            local_in_editor = menu.addAction(
+                f"Open in {editor_name}", self._open_local_in_editor
+            )
+            local_in_editor.setEnabled(editor is not None)
+            local_in_editor.setToolTip(
+                _NO_EDITOR_HINT
+                if editor is None
+                else "Opens what is selected, or this folder when nothing is."
+            )
             menu.addAction("Copy path", self._copy_local_path)
             menu.addSeparator()
             menu.addAction("Compare with the server (F9)", lambda: self._on_compare())
@@ -4974,9 +5568,17 @@ class FileManagerTab(QWidget):
             # point the loud button at the user's own disk.
             uploading = True
 
+        # A changed-files list with something ticked in it is the action on
+        # this screen. The footer pair steps back to secondary rather than
+        # offering a second filled button, which by the rule this whole theme
+        # is built on would be no louder than none.
+        deferring = self._changes_panel.isVisible() and bool(
+            self._changes_panel.selected()
+        )
+
         self._dress_action(
             self._upload_btn,
-            primary=uploading,
+            primary=uploading and not deferring,
             count=len(local),
             arrow="▲",
             verb="Upload",
@@ -4986,7 +5588,7 @@ class FileManagerTab(QWidget):
         )
         self._dress_action(
             self._download_btn,
-            primary=not uploading,
+            primary=not uploading and not deferring,
             count=len(remote),
             arrow="▼",
             verb="Download",
@@ -5048,8 +5650,10 @@ class FileManagerTab(QWidget):
     def cleanup(self) -> None:
         """Cancel any transfer, close the connection, stop the thread."""
         self._closing = True
+        self._abandon_bridge_jobs("the tab was closed before it finished")
         self._edit_timer.stop()
         self._edit_watch.clear()
+        self._edit_editors.clear()
         # Scratch copies of edited files; the editor may still hold one open,
         # in which case it stays until Windows cleans the temp directory.
         shutil.rmtree(self._edit_root, ignore_errors=True)
@@ -5180,7 +5784,13 @@ def _scan_local(target: str) -> list[RemoteEntry]:
     return entries
 
 
-def _spec_for(profile: ServerProfile) -> ConnectionSpec:
+def _spec_for(profile: ServerProfile, jump: object = None) -> ConnectionSpec:
+    """Everything the worker thread needs to open this connection.
+
+    ``jump`` is resolved by whoever has the vault open - a spec crosses
+    threads, so it holds a plain JumpHost rather than the id of a profile it
+    would have to look up.
+    """
     return ConnectionSpec(
         kind=profile.kind,
         host=profile.host,
@@ -5189,6 +5799,11 @@ def _spec_for(profile: ServerProfile) -> ConnectionSpec:
         password=profile.password,
         private_key_path=profile.private_key_path,
         passive=profile.passive,
+        use_agent=profile.use_agent,
+        use_default_keys=profile.use_default_keys,
+        host_key_mode=hostkeys.PROMPT,
+        jump=jump,
+        proxy_command=profile.proxy_command,
     )
 
 
@@ -5289,6 +5904,20 @@ def _display_name(entry: RemoteEntry) -> str:
 
 
 # ----- formatting helpers -------------------------------------------------
+def _transfer_key(upload: bool, destination: str) -> tuple[bool, str]:
+    """Name one queued transfer the way both sides of the bridge will agree.
+
+    Keyed on the destination rather than the source, because that is what
+    identifies the job: two uploads of different local files to the same
+    remote path are the same piece of work arriving twice, and the queue
+    reports the destination either way. Direction is part of the key so a
+    download to ``C:/x/a.php`` cannot be ticked off by an upload of it.
+    """
+    if upload:
+        return (True, "/" + str(destination).replace("\\", "/").strip("/"))
+    return (False, os.path.normcase(os.path.abspath(str(destination))))
+
+
 def _human_size(size: int) -> str:
     if size <= 0:
         return "0 B"

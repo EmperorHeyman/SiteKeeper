@@ -24,6 +24,9 @@ DEFAULT_TRANSFER_WORKERS = 6
 #: treated as never having chosen - see _sane_workers.
 PREVIOUS_TRANSFER_WORKERS = 3
 MAX_TRANSFER_WORKERS = 16
+#: Highest speed limit the UI offers, in kilobytes per second. Past this the
+#: limit stops being a limit on any link somebody would want to set one on.
+MAX_TRANSFER_RATE_KB = 1024 * 1024
 
 
 @dataclass
@@ -61,6 +64,11 @@ class Settings:
     # ----- file transfer -------------------------------------------------
     # Parallel connections per file-manager tab. One is the old behaviour.
     transfer_workers: int = DEFAULT_TRANSFER_WORKERS
+    # Ceiling on the combined speed of those connections, in kilobytes per
+    # second; 0 is no limit and is the default. It applies to the pool as a
+    # whole rather than to each connection, so raising the connection count
+    # does not quietly raise the ceiling with it.
+    transfer_rate_kb: int = 0
     # Upload to a scratch name and rename into place, so a half-written file
     # is never served to a live request.
     atomic_uploads: bool = True
@@ -106,6 +114,10 @@ class Settings:
     # Hand the password to that terminal. It becomes visible to anything that
     # can list processes on this machine, so it is a deliberate choice.
     terminal_send_password: bool = True
+    # Preferred code editor for "Open in VS Code" ("" picks the first one
+    # found). A name from transfer/editors.py, not a path: the path moves with
+    # every update of a per-user install, the name does not.
+    editor_program: str = ""
 
     @classmethod
     def load(cls) -> "Settings":
@@ -136,6 +148,7 @@ class Settings:
             remember_password=bool(data.get("remember_password", False)),
             stay_logged_in=bool(data.get("stay_logged_in", False)),
             transfer_workers=cls._sane_workers(data.get("transfer_workers")),
+            transfer_rate_kb=cls._sane_rate(data.get("transfer_rate_kb")),
             atomic_uploads=bool(data.get("atomic_uploads", True)),
             shadow_backups=bool(data.get("shadow_backups", True)),
             history_days=max(0, int(data.get("history_days", 30) or 0)),
@@ -151,6 +164,7 @@ class Settings:
             watch_autosync=bool(data.get("watch_autosync", False)),
             terminal_program=str(data.get("terminal_program", "") or ""),
             terminal_send_password=bool(data.get("terminal_send_password", True)),
+            editor_program=str(data.get("editor_program", "") or ""),
         )
 
     # ----- validation -----------------------------------------------------
@@ -183,6 +197,15 @@ class Settings:
         if count == PREVIOUS_TRANSFER_WORKERS:
             return DEFAULT_TRANSFER_WORKERS
         return max(1, min(MAX_TRANSFER_WORKERS, count))
+
+    @staticmethod
+    def _sane_rate(value: object) -> int:
+        """Clamp the speed limit; anything unreadable means no limit."""
+        try:
+            rate = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(MAX_TRANSFER_RATE_KB, rate))
 
     @staticmethod
     def _sane_ids(value: object) -> list[str]:

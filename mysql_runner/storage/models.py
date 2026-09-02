@@ -70,6 +70,21 @@ class ServerProfile:
     local_dir: str = ""
     private_key_path: str = ""   # SFTP key-based auth (optional).
     passive: bool = True         # FTP/FTPS passive mode.
+    #: Offer the keys held by an SSH agent - Pageant, Windows' own ssh-agent,
+    #: 1Password. On by default: plenty of accounts have no password at all
+    #: and no key file to point at, and without this they cannot connect.
+    use_agent: bool = True
+    #: Also offer whatever is sitting in ~/.ssh. Off by default, because a
+    #: server with a low MaxAuthTries can refuse the key that would have
+    #: worked after three that were never meant for it.
+    use_default_keys: bool = False
+    #: Reach this server through another stored connection (its id). The
+    #: bastion's credentials are the ones already in the vault, which is the
+    #: whole reason for naming a profile rather than repeating a host here.
+    jump_profile_id: str = ""
+    #: Anything stranger: an OpenSSH-style ProxyCommand. %h, %p and %r are
+    #: replaced with the host, port and username.
+    proxy_command: str = ""
     #: Where this sits in its group when the list has been arranged by hand.
     #: Zero means "never dragged", and a group whose members are all zero is
     #: still listed alphabetically - so arranging one group by hand does not
@@ -122,5 +137,9 @@ class ServerProfile:
             local_dir=data.get("local_dir", ""),
             private_key_path=data.get("private_key_path", ""),
             passive=bool(data.get("passive", True)),
+            use_agent=bool(data.get("use_agent", True)),
+            use_default_keys=bool(data.get("use_default_keys", False)),
+            jump_profile_id=str(data.get("jump_profile_id", "") or ""),
+            proxy_command=str(data.get("proxy_command", "") or ""),
             order=int(data.get("order", 0) or 0),
         )

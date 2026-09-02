@@ -5,7 +5,7 @@ because each small file costs a round trip that nothing overlaps. This pool
 opens a handful of *separate* connections and runs a job on each, which is the
 difference between minutes and seconds on a tree of small files.
 
-Three properties matter as much as the speed:
+Five properties matter as much as the speed:
 
 * **The navigation connection is never used for transfers.** Browsing stays
   responsive while a queue runs, because the pool's connections are its own.
@@ -14,6 +14,15 @@ Three properties matter as much as the speed:
 * **Overwrites are safe.** With atomic uploads on, bytes go to a scratch name
   and are renamed into place, so a half-written file is never live; with shadow
   backups on, whatever was there is kept first so it can be put back.
+* **A momentary failure is not a failed file.** Each file gets a few spaced-out
+  attempts before it is given up on, and only for errors that could plausibly
+  come out differently - see _carry and PERMANENT_FAILURES.
+* **A retry does not start again.** Where the protocol allows it, an attempt
+  picks up from what the last one left, so a 400 MB file that broke at 380 MB
+  finishes in seconds rather than repeating twenty minutes of work.
+
+There is also one thing the pool deliberately gives up: a single speed limit
+across every connection, so somebody sharing an office link can have it back.
 
 Everything here is Qt-free: progress arrives through plain callables, which the
 Qt tab turns into signals and the FastAPI backend turns into WebSocket events.
@@ -41,6 +50,7 @@ from mysql_runner.transfer.base import (
 )
 from mysql_runner.transfer.history import Action, HistoryStore, make_entry
 from mysql_runner.transfer.ignore import IgnoreRules
+from mysql_runner.transfer.throttle import RateLimiter
 
 #: Priorities. Lower runs sooner; the queue is FIFO within one priority.
 PRIORITY_HIGH = 0
@@ -67,6 +77,41 @@ MAX_WORKERS = 16
 
 #: Progress is reported at most this often per file, to keep the UI cheap.
 PROGRESS_INTERVAL = 0.1
+
+#: How long to wait before each retry of a failed file, in seconds. The first
+#: is short because most of what it catches is momentary - a server briefly at
+#: its session limit, a lock held by the request that was serving the page as
+#: the file went over it - and the last is long enough to be worth trying.
+RETRY_BACKOFF = (1.0, 4.0, 10.0)
+
+#: Default number of retries per file, on top of the first attempt.
+DEFAULT_RETRIES = 2
+
+#: Errors that will say exactly the same thing however many times they are
+#: asked. Retrying these costs the user seconds per file across a whole queue
+#: and cannot possibly help, so a message containing one of these (the server's
+#: own words, lower-cased) fails at once - everything else gets its retries.
+PERMANENT_FAILURES = (
+    "no such file",
+    "not found",
+    "permission denied",
+    "access denied",
+    "not a directory",
+    "is a directory",
+    "file exists",
+    "no space left",
+    "quota exceeded",
+    "disk full",
+    "read-only file system",
+)
+
+#: How often the aggregate transfer rate is re-measured, in seconds.
+RATE_SAMPLE_INTERVAL = 0.6
+
+#: Weight kept from the previous rate sample. A queue of small files is bursty
+#: enough that the raw number jumps between "instant" and "nothing"; smoothing
+#: is what turns it into a figure worth putting an estimate on.
+RATE_SMOOTHING = 0.7
 
 
 class JobState(str, Enum):
@@ -111,6 +156,11 @@ class TransferItem:
     replaced: bool = False
     #: Set when the item was skipped or backed up, for the status line.
     note: str = ""
+    #: How many times this file has been tried, including the attempt running.
+    attempts: int = 0
+    #: Bytes already in place when the current attempt started, so a resumed
+    #: transfer's percentage carries on rather than starting again at nought.
+    resumed_from: int = 0
     _sequence: int = 0
     _cancel: bool = False
 
@@ -134,11 +184,17 @@ class TransferItem:
 
     @property
     def rate(self) -> float:
-        """Bytes per second so far, 0 when it has not started."""
+        """Bytes per second so far, 0 when it has not started.
+
+        Only the bytes this attempt actually moved: a file resumed at 380 of
+        400 MB would otherwise report the whole 380 as though it had arrived
+        in the second since the retry started.
+        """
         if not self.started:
             return 0.0
         elapsed = (self.finished_at or time.monotonic()) - self.started
-        return self.transferred / elapsed if elapsed > 0 else 0.0
+        moved = max(0, self.transferred - self.resumed_from)
+        return moved / elapsed if elapsed > 0 else 0.0
 
     def snapshot(self) -> "TransferItem":
         """A detached copy, safe to hand to the GUI thread."""
@@ -157,6 +213,8 @@ class TransferItem:
         clone.finished_at = self.finished_at
         clone.replaced = self.replaced
         clone.note = self.note
+        clone.attempts = self.attempts
+        clone.resumed_from = self.resumed_from
         clone._sequence = self._sequence
         return clone
 
@@ -179,9 +237,25 @@ class PoolOptions:
     #: possible; now that syncs compare content it buys only honest-looking
     #: dates on the server, so it is worth being able to decline.
     preserve_times: bool = True
+    #: How many times a failed file is tried again before it is given up on.
+    #: Most transfer failures in the wild are momentary, and the alternative
+    #: to retrying them is a queue that ends in a scatter of red rows somebody
+    #: has to notice and press Retry on by hand.
+    retries: int = DEFAULT_RETRIES
+    #: Carry on where an interrupted transfer stopped rather than sending or
+    #: fetching the whole file again. Only used where the protocol allows it -
+    #: see RemoteFS.supports_resume.
+    resume: bool = True
+    #: Ceiling on the *combined* speed of every connection in the pool, in
+    #: bytes per second. Zero is no limit, which is the default: the number
+    #: matters to somebody deploying from a shared office link in the middle
+    #: of the afternoon, and to nobody else.
+    rate_limit: int = 0
 
     def sane(self) -> "PoolOptions":
         self.workers = max(1, min(MAX_WORKERS, int(self.workers or 1)))
+        self.retries = max(0, min(len(RETRY_BACKOFF), int(self.retries or 0)))
+        self.rate_limit = max(0, int(self.rate_limit or 0))
         return self
 
 
@@ -260,6 +334,15 @@ class TransferPool:
         # Why the last connection attempt failed, for the items that end up
         # with nothing able to carry them.
         self._connect_error = "Could not open a connection."
+        # One budget for the whole pool, so the limit the user set is the
+        # limit the link sees however many connections are open.
+        self._limiter = RateLimiter(self._options.rate_limit)
+        # Aggregate speed, measured across the queue rather than per file:
+        # what somebody watching a deploy wants is how fast the *queue* is
+        # going and when it will end, which no single file can answer.
+        self._rate_bytes = 0
+        self._rate_stamp = time.monotonic()
+        self._rate_ewma = 0.0
 
 
     # ----- queue ----------------------------------------------------------
@@ -268,6 +351,11 @@ class TransferPool:
         if not items:
             return []
         with self._condition:
+            if self._active == 0 and self._queued_count() == 0:
+                # A fresh run: the byte counter it measures against has just
+                # been reset by clear_finished, so carrying the old sample
+                # over would report one enormous negative second.
+                self._reset_rate()
             for item in items:
                 self._sequence += 1
                 item._sequence = self._sequence
@@ -322,6 +410,26 @@ class TransferPool:
         """Change the connection count; new workers start on the next submit."""
         with self._lock:
             self._options.workers = max(1, min(MAX_WORKERS, int(count)))
+        self._ensure_workers()
+
+    def set_rate_limit(self, rate: int) -> None:
+        """Change the combined speed ceiling, in bytes per second (0 = none).
+
+        Takes effect on the next chunk of whatever is already in flight, not
+        on the next file: someone reaching for this in the middle of a large
+        upload is asking for their link back now.
+        """
+        rate = max(0, int(rate or 0))
+        with self._lock:
+            self._options.rate_limit = rate
+        self._limiter.set_rate(rate)
+
+    def update_options(self, options: PoolOptions) -> None:
+        """Apply changed settings to a pool that is already running."""
+        options = options.sane()
+        with self._lock:
+            self._options = options
+        self._limiter.set_rate(options.rate_limit)
         self._ensure_workers()
 
     def cancel(self, item_id: str) -> bool:
@@ -385,13 +493,23 @@ class TransferPool:
         """Forget finished items. ``keep_failed`` leaves failures retryable."""
         with self._condition:
             before = len(self._items)
-            self._items = [
-                item
-                for item in self._items
-                if not item.state.finished
-                or (keep_failed and item.state == JobState.FAILED)
-            ]
-            return before - len(self._items)
+            keeping: list[TransferItem] = []
+            dropping: list[TransferItem] = []
+            for item in self._items:
+                if not item.state.finished or (
+                    keep_failed and item.state == JobState.FAILED
+                ):
+                    keeping.append(item)
+                else:
+                    dropping.append(item)
+            self._items = keeping
+        # Forgetting a failed download means forgetting that the part of it
+        # already on disk was worth anything, so the part goes too. Only local
+        # scratch files can be here: the remote ones are removed the moment an
+        # upload is given up on (see _carry).
+        for item in dropping:
+            self._discard_local_scratch(item)
+        return before - len(self._items)
 
     def retry(self, item_id: str) -> bool:
         """Put one failed (or cancelled) item back in the queue."""
@@ -461,14 +579,52 @@ class TransferPool:
                 tally[item.state.value] += 1
                 total_bytes += item.size
                 done_bytes += item.size if item.state == JobState.DONE else item.transferred
+            rate = self._sample_rate(done_bytes)
+            remaining = max(0, total_bytes - done_bytes)
+            # No estimate rather than a wrong one: a paused queue is not slow,
+            # and a queue whose files are all of unknown size has nothing to
+            # divide. Both used to show as "0 seconds left".
+            eta = remaining / rate if rate > 0 and remaining and not self._paused else None
             return {
                 "counts": tally,
                 "bytes_done": done_bytes,
                 "bytes_total": total_bytes,
+                "rate": rate,
+                "eta": eta,
                 "paused": self._paused,
                 "workers": self._options.workers,
                 "active": self._active,
             }
+
+    def _sample_rate(self, done_bytes: int) -> float:
+        """Bytes per second across the queue, smoothed. Call with the lock held.
+
+        Measured against the clock rather than summed from each running file's
+        own average, because those averages are of different ages: a file that
+        started a second ago and one that is nearly finished say very different
+        things about a link that has not changed at all.
+        """
+        now = time.monotonic()
+        elapsed = now - self._rate_stamp
+        if elapsed < RATE_SAMPLE_INTERVAL:
+            return self._rate_ewma
+        # clear_finished can take completed bytes back out of the total, so a
+        # sample is only ever of forward movement.
+        sample = max(0, done_bytes - self._rate_bytes) / elapsed
+        self._rate_bytes = done_bytes
+        self._rate_stamp = now
+        self._rate_ewma = (
+            sample
+            if self._rate_ewma <= 0
+            else RATE_SMOOTHING * self._rate_ewma + (1 - RATE_SMOOTHING) * sample
+        )
+        return self._rate_ewma
+
+    def _reset_rate(self) -> None:
+        """Start measuring again. Call with the lock held."""
+        self._rate_bytes = 0
+        self._rate_stamp = time.monotonic()
+        self._rate_ewma = 0.0
 
     def idle(self) -> bool:
         with self._lock:
@@ -502,33 +658,93 @@ class TransferPool:
                 item = self._next_item()
                 if item is None:
                     return
-                error = self._run_item(connection, item)
-                if error is None:
-                    continue
-                # A session dropped while the pool sat idle fails whatever it
-                # is handed, so check the connection before believing the
-                # error - a dead one earns the item one go on a fresh session.
-                if self._stopping or item._cancel or connection.alive():
-                    self._finish(item, JobState.FAILED, error=error)
-                    continue
-                self._close_connection(index)
-                try:
-                    connection = self._connection_for(index)
-                except TransferError as exc:
-                    self._finish(item, JobState.FAILED, error=str(exc))
-                    self._events.message(f"Connection {index + 1}: {exc}")
-                    return
-                self._events.message("A transfer connection was dropped; reconnected.")
-                item.transferred = 0
-                error = self._run_item(connection, item)
-                if error is not None:
-                    self._finish(item, JobState.FAILED, error=error)
+                connection = self._carry(connection, index, item)
+                if connection is None:
+                    return  # nothing left to carry anything on
         finally:
             self._retire()
             self._close_connection(index)
             # Every way out of this loop ends here, which is the only place
             # that can tell whether the last worker has just gone.
             self._abandon_queue()
+
+    def _carry(self, connection: RemoteFS, index: int, item: TransferItem):
+        """Run one item to a conclusion, retrying what is worth retrying.
+
+        Returns the connection to use for the next item - not always the one
+        it was given, since a dropped session is replaced here - or None when
+        this worker can no longer serve the queue at all.
+
+        Two different failures used to land in the same place. A session that
+        died while the pool sat idle fails whatever it is handed next, and that
+        one has always earned a fresh connection and another go. But a live
+        connection refusing a single file - a lock held by the request that was
+        serving the page as it went over, a server momentarily at its session
+        limit, a write that lost a race with a cron job - failed the file
+        outright, and a queue of four hundred ended in a scatter of red rows
+        that all succeeded the moment somebody pressed Retry. Both are now the
+        same thing: a few attempts, spaced out, and only for errors that could
+        plausibly come out differently.
+        """
+        attempts = max(0, int(self._options.retries)) + 1
+        for attempt in range(1, attempts + 1):
+            item.attempts = attempt
+            if attempt > 1:
+                item.note = ""  # drop the previous attempt's "trying again"
+            error = self._run_item(connection, item)
+            if error is None:
+                return connection
+            if self._stopping or item._cancel:
+                self._fail(connection, item, error)
+                return connection
+            dropped = not connection.alive()
+            if attempt >= attempts or (not dropped and not _worth_retrying(error)):
+                self._fail(connection, item, error)
+                return connection
+            if dropped:
+                self._close_connection(index)
+                try:
+                    connection = self._connection_for(index)
+                except TransferError as exc:
+                    self._fail(connection, item, str(exc))
+                    self._events.message(f"Connection {index + 1}: {exc}")
+                    return None
+                self._events.message(
+                    "A transfer connection was dropped; reconnected."
+                )
+            elif not self._wait_to_retry(attempt, item):
+                self._fail(connection, item, error)
+                return connection
+            item.note = f"{error} - trying again ({attempt} of {attempts - 1})"
+            self._events.item(item)
+        return connection
+
+    def _fail(self, fs: RemoteFS, item: TransferItem, error: str) -> None:
+        """Give up on an item, and clean up after the attempts it had.
+
+        The remote scratch of a half-finished upload always goes: leaving one
+        behind so a later manual Retry could resume it would mean every upload
+        that ever failed leaves a stray ``.mrtmp-`` file on somebody's server,
+        which is a worse thing to be true than re-sending a file. A download's
+        local part is kept - it costs nothing, it is on this machine, and it is
+        what makes Retry on a 400 MB file finish in seconds.
+        """
+        self._discard_remote_scratch(fs, item)
+        if item._cancel or self._stopping:
+            self._discard_local_scratch(item)
+            self._finish(item, JobState.CANCELLED)
+            return
+        self._finish(item, JobState.FAILED, error=error)
+
+    def _wait_to_retry(self, attempt: int, item: TransferItem) -> bool:
+        """Sleep before the next attempt. False when the wait was cut short."""
+        delay = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)) - 1]
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if self._stopping or item._cancel:
+                return False
+            time.sleep(0.1)
+        return True
 
     def _note_ceiling(self, exc: TransferError, index: int) -> None:
         """Record what a refused connection tells us about this server.
@@ -664,12 +880,19 @@ class TransferPool:
                 self._finish(item, JobState.SKIPPED)
                 return None
             self._prepare_destination(item)
-            self._backup_destination(fs, item)
+            if item.attempts <= 1:
+                # Once per file, not once per attempt: the backup is a whole
+                # download of the old remote copy, and repeating it on a retry
+                # would cost more than the transfer being retried - and write a
+                # second journal entry for one replacement.
+                self._backup_destination(fs, item)
             if item.upload:
                 self._do_upload(fs, item)
             else:
                 self._do_download(fs, item)
         except _Cancelled:
+            self._discard_remote_scratch(fs, item)
+            self._discard_local_scratch(item)
             self._finish(item, JobState.CANCELLED)
             return None
         except TransferError as exc:
@@ -801,39 +1024,113 @@ class TransferPool:
             and abs(result.st_mtime - existing.modified) <= 2.0
         )
 
+    # ----- scratch files and resuming -------------------------------------
+    # Both scratch names are derived from the item's id rather than a fresh
+    # uuid per attempt, which is the whole of what makes resuming possible: a
+    # retry has to be able to find what the attempt before it left behind.
+    @staticmethod
+    def _scratch_remote(item: TransferItem) -> str:
+        return temp_name(item.remote, item.id)
+
+    @staticmethod
+    def _scratch_local(item: TransferItem) -> str:
+        return f"{item.local}.mrpart-{item.id}"
+
+    def _can_resume(self, fs: RemoteFS) -> bool:
+        return bool(self._options.resume) and fs.supports_resume()
+
+    def _resume_offset(self, fs: RemoteFS, item: TransferItem) -> int:
+        """How much of an upload is already on the server. 0 to start again.
+
+        Never on the first attempt: a scratch file at that point can only be
+        one this pool did not write - left by a crash, or by a build that used
+        the same id scheme - and resuming into somebody else's bytes would
+        produce a file that is the right length and wrong all the way through.
+        """
+        if item.attempts <= 1 or not self._can_resume(fs):
+            return 0
+        try:
+            existing = int(fs.stat(self._scratch_remote(item)).size or 0)
+        except TransferError:
+            return 0
+        try:
+            total = os.path.getsize(item.local)
+        except OSError:
+            return 0
+        return existing if 0 < existing <= total else 0
+
+    def _local_resume_offset(self, fs: RemoteFS, item: TransferItem) -> int:
+        """How much of a download is already on disk. 0 to start again."""
+        if item.attempts <= 1 or not self._can_resume(fs):
+            return 0
+        try:
+            have = os.path.getsize(self._scratch_local(item))
+        except OSError:
+            return 0
+        if have <= 0 or (item.size and have > item.size):
+            return 0  # nothing, or more than the source has: not this file
+        return have
+
+    def _discard_remote_scratch(self, fs: RemoteFS, item: TransferItem) -> None:
+        if not item.upload:
+            return
+        try:
+            fs.remove(self._scratch_remote(item))
+        except Exception:
+            pass  # never created, already gone, or the session is dead
+
+    def _discard_local_scratch(self, item: TransferItem) -> None:
+        if item.upload:
+            return
+        try:
+            os.unlink(self._scratch_local(item))
+        except OSError:
+            pass
+
     def _do_upload(self, fs: RemoteFS, item: TransferItem) -> None:
-        progress = self._progress_for(item)
         if not self._options.atomic:
-            fs.upload(item.local, item.remote, progress)
+            # Straight at the destination: there is no scratch to resume into,
+            # and appending to a file a live request may be reading is the very
+            # thing atomic uploads exist to prevent.
+            item.resumed_from = 0
+            fs.upload(item.local, item.remote, self._progress_for(item))
             self._verify(fs, item)
             return
-        scratch = temp_name(item.remote, uuid.uuid4().hex[:8])
-        try:
-            fs.upload(item.local, scratch, progress)
-            fs.replace(scratch, item.remote)
-        except (TransferError, _Cancelled):
-            try:
-                fs.remove(scratch)
-            except TransferError:
-                pass  # Nothing was created, or it is not ours to remove.
-            raise
+        scratch = self._scratch_remote(item)
+        item.resumed_from = self._resume_offset(fs, item)
+        item.note = _resume_note(item)
+        progress = self._progress_for(item)
+        # A TransferError deliberately leaves the scratch where it is: the next
+        # attempt resumes into it, and _fail removes it when there is no next
+        # attempt. A rename that failed on a complete scratch is the happiest
+        # case of all - the retry re-sends nothing and just renames again.
+        fs.upload(item.local, scratch, progress, resume_from=item.resumed_from)
+        fs.replace(scratch, item.remote)
         self._preserve_mtime(fs, item)
         self._verify(fs, item)
 
     def _do_download(self, fs: RemoteFS, item: TransferItem) -> None:
-        progress = self._progress_for(item)
         if not self._options.atomic:
-            fs.download(item.remote, item.local, progress)
+            item.resumed_from = 0
+            fs.download(item.remote, item.local, self._progress_for(item))
             return
-        scratch = f"{item.local}.mrtmp-{uuid.uuid4().hex[:8]}"
+        scratch = self._scratch_local(item)
+        item.resumed_from = self._local_resume_offset(fs, item)
+        item.note = _resume_note(item)
+        progress = self._progress_for(item)
+        keep = self._can_resume(fs)
         try:
-            fs.download(item.remote, scratch, progress)
+            fs.download(
+                item.remote,
+                scratch,
+                progress,
+                resume_from=item.resumed_from,
+                keep_partial=keep,
+            )
             os.replace(scratch, item.local)
-        except (TransferError, _Cancelled, OSError):
-            try:
-                os.unlink(scratch)
-            except OSError:
-                pass
+        except (TransferError, OSError):
+            if not keep:
+                self._discard_local_scratch(item)
             raise
 
     def _preserve_mtime(self, fs: RemoteFS, item: TransferItem) -> None:
@@ -874,7 +1171,15 @@ class TransferPool:
         item.note = "verified"
 
     def _progress_for(self, item: TransferItem) -> ProgressCallback:
-        state = {"last": 0.0}
+        # "seen" starts at the resume mark, so a resumed transfer's first
+        # callback is not charged to the speed limit for bytes that went over
+        # the wire yesterday.
+        state = {"last": 0.0, "seen": float(item.resumed_from)}
+
+        def interrupt() -> None:
+            """Let a cancel out of a long wait for the speed limit."""
+            if item._cancel or self._stopping:
+                raise _Cancelled()
 
         def report(transferred: int, total: int) -> None:
             # This runs once per 32 KB on every worker at once, so it reads
@@ -889,6 +1194,14 @@ class TransferPool:
                 if item._cancel or self._stopping:
                     raise _Cancelled()
                 time.sleep(0.1)
+            # The bytes are already on the wire by the time a backend calls
+            # back, so the budget is paid afterwards and it is the *next*
+            # chunk that waits. One bucket for the whole pool, so the limit
+            # does not multiply by the number of connections.
+            moved = transferred - state["seen"]
+            if moved > 0:
+                state["seen"] = transferred
+                self._limiter.take(int(moved), interrupt)
             item.transferred = transferred
             if total and total != item.size:
                 item.size = total
@@ -913,6 +1226,29 @@ class TransferPool:
         self._events.item(item)
         if was_idle:
             self._events.idle(self.stats())
+
+
+def _resume_note(item: TransferItem) -> str:
+    """What the queue row should say about a transfer picking up mid-file."""
+    if item.resumed_from <= 0:
+        return ""
+    if item.size:
+        percent = int(item.resumed_from * 100 / item.size)
+        return f"resuming at {percent}%"
+    return "resuming"
+
+
+def _worth_retrying(error: str) -> bool:
+    """Whether an error could plausibly come out differently next time.
+
+    The point is not to be clever about it - it is to avoid spending fifteen
+    seconds per file learning that a permission has not changed. Anything not
+    recognised as settled gets its retries, because the cost of retrying
+    something hopeless is seconds and the cost of not retrying something
+    momentary is a failed deploy.
+    """
+    text = (error or "").lower()
+    return not any(phrase in text for phrase in PERMANENT_FAILURES)
 
 
 # ----- building a queue ---------------------------------------------------

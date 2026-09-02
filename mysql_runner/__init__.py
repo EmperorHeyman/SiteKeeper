@@ -21,6 +21,6 @@ will fail to import.
 #: carries it - the exe resource, the installer, the frontend manifests -
 #: is a build artefact; this is what the running code can actually read,
 #: which is why the MCP server no longer hard-codes a number of its own.
-__version__ = "1.8.2"
+__version__ = "1.10.1"
 
 __all__ = ["__version__"]

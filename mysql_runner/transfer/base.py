@@ -27,6 +27,12 @@ ProgressCallback = Callable[[int, int], None]
 #: Chunk size used for streaming reads and hashing.
 CHUNK = 64 * 1024
 
+#: How many paths go on one shell command line. Every kernel caps the length
+#: of an argument list, and a deploy of a large site can name thousands of
+#: directories; a few dozen per command keeps every line comfortably short
+#: while still turning a thousand round trips into a couple of dozen.
+SHELL_ARG_BATCH = 64
+
 
 class TransferError(Exception):
     """Raised for any backend failure worth showing the user."""
@@ -163,15 +169,41 @@ class RemoteFS(ABC):
 
     @abstractmethod
     def download(
-        self, remote: str, local: str, progress: ProgressCallback | None = None
+        self,
+        remote: str,
+        local: str,
+        progress: ProgressCallback | None = None,
+        *,
+        resume_from: int = 0,
+        keep_partial: bool = False,
     ) -> None:
-        """Copy a remote file to a local path."""
+        """Copy a remote file to a local path.
+
+        ``resume_from`` continues an interrupted copy: the first that many
+        bytes are assumed to be in ``local`` already and are neither fetched
+        again nor rewritten, and ``progress`` counts from there so the queue's
+        percentage does not jump backwards. Zero is a normal, whole copy.
+
+        ``keep_partial`` leaves whatever arrived on disk when the copy fails,
+        which is the whole point of being able to resume - the default throws
+        it away, because a caller that cannot resume wants no half-written
+        file lying around pretending to be the real one.
+        """
 
     @abstractmethod
     def upload(
-        self, local: str, remote: str, progress: ProgressCallback | None = None
+        self,
+        local: str,
+        remote: str,
+        progress: ProgressCallback | None = None,
+        *,
+        resume_from: int = 0,
     ) -> None:
-        """Copy a local file to a remote path."""
+        """Copy a local file to a remote path.
+
+        ``resume_from`` appends to what is already on the server rather than
+        starting again - see :meth:`download`.
+        """
 
     # ----- capabilities ---------------------------------------------------
     def capabilities(self) -> frozenset[Capability]:
@@ -180,6 +212,16 @@ class RemoteFS(ABC):
 
     def supports(self, capability: Capability) -> bool:
         return capability in self.capabilities()
+
+    def supports_resume(self) -> bool:
+        """Whether an interrupted transfer can carry on where it stopped.
+
+        Not a :class:`Capability`, because nothing in the interface is offered
+        or hidden on the strength of it - it only decides whether a retry
+        starts from zero, which is a question the transfer pool asks and the
+        user never sees.
+        """
+        return False
 
     def _require_capability(self, capability: Capability) -> None:
         if not self.supports(capability):
@@ -334,15 +376,54 @@ class RemoteFS(ABC):
 
     def makedirs(self, path: str) -> None:
         """Create a directory and any missing parents, ignoring existing ones."""
-        parts = [p for p in posixpath.normpath(path).split("/") if p]
-        absolute = path.startswith("/")
-        current = "/" if absolute else ""
-        for part in parts:
-            current = self.join(current, part) if current else part
+        self.makedirs_many([path])
+
+    def makedirs_many(self, paths: Iterable[str]) -> None:
+        """Create several directories and their parents, ignoring existing ones.
+
+        Worth having as one call rather than a loop over :meth:`makedirs`: a
+        tree push creates one directory per folder in it, and every one of
+        those was a round trip - plus another for each parent, re-created from
+        the top for every sibling. Where the account has a shell that whole
+        chain is a single ``mkdir -p`` with every path on one command line,
+        which is one round trip for the lot; everywhere else it is the same
+        walk as before, minus the parents already made on this call.
+        """
+        wanted = [p for p in dict.fromkeys(paths) if p and p not in ("/", ".")]
+        if not wanted:
+            return
+        if self.supports(Capability.EXEC) and self._shell_makedirs(wanted):
+            return
+        made: set[str] = set()
+        for path in wanted:
+            parts = [p for p in posixpath.normpath(path).split("/") if p]
+            current = "/" if path.startswith("/") else ""
+            for part in parts:
+                current = self.join(current, part) if current else part
+                if current in made:
+                    continue
+                made.add(current)
+                try:
+                    self.mkdir(current)
+                except TransferError:
+                    pass  # Already there, or the next call reports the truth.
+
+    def _shell_makedirs(self, paths: list[str]) -> bool:
+        """``mkdir -p`` the given paths. False when the shell would not do it."""
+        from mysql_runner.transfer.remote_exec import quote, run
+
+        for batch in _chunked(paths, SHELL_ARG_BATCH):
+            joined = " ".join(quote(path) for path in batch)
             try:
-                self.mkdir(current)
+                result = run(self, f"mkdir -p -- {joined}", timeout=120)
             except TransferError:
-                pass  # Already there, or the next call will report the truth.
+                return False  # no usable shell; the caller falls back
+            if not result.ok:
+                # A refusal here is a real permission problem, and the walk
+                # would only spend a round trip per level arriving at it. Let
+                # the first file to land report it, as the loop always did.
+                return True
+        return True
 
     # ----- path helpers (POSIX semantics for every backend) --------------
     @staticmethod
@@ -357,6 +438,12 @@ class RemoteFS(ABC):
     @staticmethod
     def basename(path: str) -> str:
         return posixpath.basename(posixpath.normpath(path or "/"))
+
+
+def _chunked(values: list[str], size: int):
+    """Yield ``values`` in slices of at most ``size``."""
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
 
 
 def temp_name(remote: str, token: str) -> str:

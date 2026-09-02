@@ -9,10 +9,12 @@ Each run of the queue is one timestamped batch, newest at the top - the thing
 that just happened is the thing being looked for, and it should never be at the
 bottom of a scroll. Batches are grouped by the minute rather than the second,
 and everything started by one trigger inside that minute folds into a single
-headline: "14:32 — 7 file(s) · git sync" with the outcome alongside. That last
-part matters most on a busy afternoon, because "why is it uploading?" is
-answered by *what started it*, not by how many files it is. Old batches with
-nothing unfinished in them are dropped once enough newer ones exist.
+headline: "14:32 — 7 file(s) · git sync: fix the login form" with the outcome
+alongside. That last part matters most on a busy afternoon, because "why is it
+uploading?" is answered by *what started it*, not by how many files it is - and
+for a commit that means the message it was written with - the same thing every
+git client shows - rather than the bare word "git". Old batches with nothing
+unfinished in them are dropped once enough newer ones exist.
 """
 
 from __future__ import annotations
@@ -61,8 +63,35 @@ _ORIGINS = {
     "sync": "folder sync",
     "compare": "compare",
     "publish": "published from git",
+    # Work Claude handed over through the MCP bridge. Named after who asked
+    # rather than what it is, because "why is it uploading?" has a different
+    # and more urgent answer when the answer is not "you".
+    "mcp": "Claude",
     "manual": "",
 }
+
+#: A trigger key and the free text that goes with it travel as one string
+#: separated by this, so a batch can name the commit behind it without a
+#: second argument threaded through the worker and its signals. Chosen
+#: because it cannot occur in a commit subject, unlike anything printable.
+_NOTE_SEP = "\x1f"
+
+#: How much of a note the headline shows before it crowds out the columns.
+#: The whole of it is on the tooltip either way.
+_NOTE_LIMIT = 60
+
+
+def origin_with_note(key: str, note: str) -> str:
+    """Pack a trigger and what it was about into one origin string."""
+    note = " ".join(str(note).split())
+    return f"{key}{_NOTE_SEP}{note}" if note else key
+
+
+def _elide(text: str, limit: int = _NOTE_LIMIT) -> str:
+    """One line, no longer than ``limit`` - a subject is not a paragraph."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
 
 _FINISHED = frozenset(
     (
@@ -184,11 +213,14 @@ class TransferQueuePanel(QWidget):
     def start_batch(self, total: int, origin: str = "") -> None:
         """A new queue run: fold the previous batches up, group what is coming.
 
-        ``origin`` names the trigger - see ``_ORIGINS``. Two runs join into one
+        ``origin`` names the trigger - see ``_ORIGINS`` - and may carry a note
+        after ``_NOTE_SEP`` saying what it was about. Two runs join into one
         headline when they fall in the same clock minute *and* came from the
         same trigger: a commit sync that touches six subfolders arrives as six
         submissions and is one event, while a file dragged in by hand half a
-        minute later is not, and must not be filed under the sync.
+        minute later is not, and must not be filed under the sync. The note is
+        part of that comparison, so two commits in the same minute stay two
+        batches rather than merging into one pile of files from both.
         """
         if total <= 0:
             return
@@ -215,6 +247,10 @@ class TransferQueuePanel(QWidget):
         self._batch_minute = minute
         self._batch_origin = origin
         batch.setText(0, self._headline(total))
+        label, note = self._split_origin()
+        if note:
+            # The headline is elided to fit the column; hovering gives it whole.
+            batch.setToolTip(0, f"{label}: {note}" if label else note)
         batch.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
         font = batch.font(0)
         font.setBold(True)
@@ -226,10 +262,19 @@ class TransferQueuePanel(QWidget):
         self._batch_total = total
 
     def _headline(self, total: int) -> str:
-        """"14:32 — 7 file(s) · git sync"."""
+        """"14:32 — 7 file(s) · git sync: fix the login form"."""
         text = f"{self._batch_minute} — {total} file(s)"
-        label = _ORIGINS.get(self._batch_origin, self._batch_origin)
-        return f"{text}  ·  {label}" if label else text
+        label, note = self._split_origin()
+        if label and note:
+            return f"{text}  ·  {label}: {_elide(note)}"
+        if label or note:
+            return f"{text}  ·  {label or _elide(note)}"
+        return text
+
+    def _split_origin(self) -> tuple[str, str]:
+        """The origin as (what to call the trigger, what it was about)."""
+        key, _, note = self._batch_origin.partition(_NOTE_SEP)
+        return _ORIGINS.get(key, key), note.strip()
 
     def _groups(self) -> list[QTreeWidgetItem]:
         found = []
@@ -342,12 +387,24 @@ class TransferQueuePanel(QWidget):
         self._refresh_batch(row.parent())
 
     def update_stats(self, stats: dict) -> None:
+        """The header line: how far along, how fast, and how much longer.
+
+        "23 running, 300 waiting" answers none of the question somebody
+        watching a deploy is actually asking, which is whether to wait for it
+        or go and do something else. The rate and the estimate come from the
+        pool, measured across the queue rather than per file - see
+        TransferPool.stats - and both are simply left out when there is
+        nothing honest to say.
+        """
         counts = stats.get("counts", {})
         queued = counts.get(JobState.QUEUED.value, 0)
         running = counts.get(JobState.RUNNING.value, 0)
         done = counts.get(JobState.DONE.value, 0)
         failed = counts.get(JobState.FAILED.value, 0)
-        parts = [f"{running} running", f"{queued} waiting", f"{done} done"]
+        finished = done + failed + counts.get(JobState.SKIPPED.value, 0)
+        everything = finished + running + queued
+        parts = [f"{finished} of {everything}"] if everything else []
+        parts.append(f"{running} running")
         if failed:
             parts.append(f"{failed} failed")
         self._retry_btn.setVisible(bool(failed))
@@ -356,6 +413,12 @@ class TransferQueuePanel(QWidget):
             parts.append(
                 f"{_human_size(stats.get('bytes_done', 0))} of {_human_size(total)}"
             )
+        rate = float(stats.get("rate") or 0.0)
+        if rate > 0:
+            parts.append(f"{_human_size(int(rate))}/s")
+        eta = stats.get("eta")
+        if eta is not None:
+            parts.append(f"{_human_duration(float(eta))} left")
         self._summary.setText("  ·  ".join(parts))
         self.set_paused(bool(stats.get("paused")))
         workers = int(stats.get("workers", self._workers.value()) or 1)
@@ -479,6 +542,25 @@ def _progress_text(item) -> str:
     if item.state == JobState.RUNNING and item.rate > 0:
         return f"{percent}%  ({_human_size(int(item.rate))}/s)"
     return f"{percent}%"
+
+
+def _human_duration(seconds: float) -> str:
+    """A time remaining, rounded to what it is worth claiming to know.
+
+    An estimate good to the second is not one, and "1847 seconds" makes the
+    reader do the division. Under a minute is the only place the exact figure
+    means anything, and past an hour nobody is waiting at the screen anyway.
+    """
+    seconds = max(0.0, seconds)
+    if seconds < 10:
+        return "a few seconds"
+    if seconds < 60:
+        return f"{int(seconds)} seconds"
+    if seconds < 3600:
+        minutes = int(seconds / 60 + 0.5)
+        return "about a minute" if minutes <= 1 else f"about {minutes} minutes"
+    hours = seconds / 3600
+    return "about an hour" if hours < 1.5 else f"about {int(hours + 0.5)} hours"
 
 
 def _human_size(size: int) -> str:

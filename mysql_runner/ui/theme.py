@@ -23,7 +23,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import QFrame, QLabel, QSizePolicy, QWidget
 
 
@@ -136,6 +144,21 @@ LIGHT = Palette(
 
 def palette(dark: bool) -> Palette:
     return DARK if dark else LIGHT
+
+
+def mono_font(size: int = 10) -> QFont:
+    """The fixed-width face for output, commands and fingerprints.
+
+    Named rather than repeated: anything the user is expected to *compare* -
+    a fingerprint against a control panel, a path against a listing - has to
+    line up character for character, and the style hint is what makes a
+    machine without Consolas fall back to another monospace face rather than
+    to the proportional default.
+    """
+    font = QFont("Consolas")
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    font.setPointSize(size)
+    return font
 
 
 def production_badge(explanation: str, parent: QWidget | None = None) -> QLabel:
@@ -554,6 +577,15 @@ QFrame#sepv {{
 QLabel#title {{ font-weight: 600; color: {c.text}; }}
 QLabel#hint {{ color: {c.text_dim}; }}
 QLabel#warning {{ color: {c.red}; }}
+/* A quoted fact inside a dialog - a fingerprint, a path, a command - set
+   apart from the prose around it so the thing to be compared is findable. */
+QFrame#card {{
+    background: {c.card};
+    border: 1px solid {c.border_soft};
+    border-radius: 8px;
+    padding: 4px;
+}}
+QFrame#card QLabel {{ background: transparent; }}
 QLabel#status {{
     color: {c.text_dim};
     background: {c.panel};

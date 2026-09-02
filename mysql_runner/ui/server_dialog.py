@@ -34,6 +34,7 @@ from mysql_runner.storage.models import (
     Environment,
     ServerProfile,
 )
+from mysql_runner.transfer import hostkeys
 
 _KIND_LABELS = {
     ConnectionKind.PHPMYADMIN: "phpMyAdmin (browser tab)",
@@ -71,9 +72,16 @@ def _set_row_visible(form: QFormLayout, field, visible: bool) -> None:
 class ServerDialog(QDialog):
     """Collects/edits the fields of a :class:`ServerProfile`."""
 
-    def __init__(self, parent=None, profile: ServerProfile | None = None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        profile: ServerProfile | None = None,
+        *,
+        profiles: list[ServerProfile] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._profile = profile
+        self._profiles = profiles or []
         self.setWindowTitle("Edit Connection" if profile else "Add Connection")
         self.setModal(True)
         self.setMinimumWidth(520)
@@ -154,6 +162,56 @@ class ServerDialog(QDialog):
         creds_form.addRow("", self._password_hint)
         layout.addWidget(creds)
 
+        # ----- SSH ---------------------------------------------------------
+        self._ssh_box = QGroupBox("SSH")
+        ssh_form = QFormLayout(self._ssh_box)
+        self._use_agent = QCheckBox("Use the keys in my SSH agent")
+        self._use_agent.setChecked(True)
+        self._use_agent.setToolTip(
+            "Pageant, the ssh-agent built into Windows, or 1Password. This is "
+            "how most people who never type a password connect at all."
+        )
+        self._use_default_keys = QCheckBox("Also try the keys in ~/.ssh")
+        self._use_default_keys.setToolTip(
+            "Off by default: a server that allows only three attempts can "
+            "refuse the key that would have worked, after three that were "
+            "never meant for it."
+        )
+        ssh_form.addRow(self._use_agent)
+        ssh_form.addRow(self._use_default_keys)
+
+        self._jump = QComboBox()
+        self._jump.setToolTip(
+            "Reach this server through another saved connection. Its "
+            "credentials are the ones already in the vault."
+        )
+        ssh_form.addRow("Connect via:", self._jump)
+        self._proxy_command = QLineEdit()
+        self._proxy_command.setPlaceholderText(
+            "Optional, e.g. ssh -W %h:%p bastion (advanced)"
+        )
+        self._proxy_command.setToolTip(
+            "An OpenSSH-style ProxyCommand. %h, %p and %r become the host, "
+            "port and username. Used instead of the jump host above."
+        )
+        ssh_form.addRow("Proxy command:", self._proxy_command)
+
+        self._forget_key = QPushButton("Forget this server's host key")
+        self._forget_key.setToolTip(
+            "Use this only when the server was genuinely rebuilt or rekeyed. "
+            "Sitekeeper will ask you to confirm its identity again next time."
+        )
+        self._forget_key.clicked.connect(self._on_forget_key)
+        ssh_form.addRow("", self._forget_key)
+        ssh_hint = QLabel(
+            "The jump host is reached directly - one hop, even if it names a "
+            "jump host of its own."
+        )
+        ssh_hint.setWordWrap(True)
+        ssh_hint.setObjectName("hint")
+        ssh_form.addRow(ssh_hint)
+        layout.addWidget(self._ssh_box)
+
         # ----- starting directories ---------------------------------------
         self._dirs_box = QGroupBox("Starting directories")
         dirs_form = QFormLayout(self._dirs_box)
@@ -208,6 +266,10 @@ class ServerDialog(QDialog):
 
         self._web_box.setVisible(is_web)
         self._host_box.setVisible(not is_web)
+        self._ssh_box.setVisible(is_sftp)
+        if is_sftp:
+            self._fill_jump_choices()
+            self._sync_forget_button()
         self._dirs_box.setVisible(kind.is_transfer)
         self._sql_box.setVisible(is_web or is_mysql)
 
@@ -226,6 +288,61 @@ class ServerDialog(QDialog):
         )
         # The dialog shrinks when sections disappear; let Qt re-fit it.
         self.adjustSize()
+
+    # ----- SSH ------------------------------------------------------------
+    def _fill_jump_choices(self) -> None:
+        """Offer every other SFTP connection as a possible bastion."""
+        current = self._jump.currentData() or (
+            self._profile.jump_profile_id if self._profile else ""
+        )
+        self._jump.blockSignals(True)
+        self._jump.clear()
+        self._jump.addItem("Nothing - connect directly", "")
+        mine = self._profile.id if self._profile else ""
+        for candidate in self._profiles:
+            # Not itself, and not something that cannot forward.
+            if candidate.id == mine or candidate.kind != ConnectionKind.SFTP:
+                continue
+            self._jump.addItem(
+                f"{candidate.label} ({candidate.host})", candidate.id
+            )
+        index = self._jump.findData(current)
+        self._jump.setCurrentIndex(max(0, index))
+        self._jump.blockSignals(False)
+
+    def _sync_forget_button(self) -> None:
+        """Only offer to forget a key when there is one to forget."""
+        host = self._host.text().strip()
+        port = int(self._port.value()) or DEFAULT_PORTS.get(
+            ConnectionKind.SFTP, 22
+        )
+        known = bool(host) and hostkeys.is_known(host, port)
+        self._forget_key.setEnabled(known)
+        self._forget_key.setText(
+            "Forget this server's host key"
+            if known
+            else "No host key recorded yet"
+        )
+
+    def _on_forget_key(self) -> None:
+        host = self._host.text().strip()
+        port = int(self._port.value()) or DEFAULT_PORTS.get(
+            ConnectionKind.SFTP, 22
+        )
+        if not host:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Forget host key",
+            f"Forget the identity recorded for {host}?\n\n"
+            "The next connection will ask you to confirm its fingerprint "
+            "again. Only do this if the server was genuinely rebuilt or "
+            "rekeyed - if it was not, a mismatch is a warning worth heeding.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        hostkeys.forget(host, port)
+        self._sync_forget_button()
 
     # ----- browsing -------------------------------------------------------
     def _on_browse_key(self) -> None:
@@ -266,6 +383,9 @@ class ServerDialog(QDialog):
         self._local_dir.setText(profile.local_dir)
         self._key_path.setText(profile.private_key_path)
         self._passive.setChecked(profile.passive)
+        self._use_agent.setChecked(profile.use_agent)
+        self._use_default_keys.setChecked(profile.use_default_keys)
+        self._proxy_command.setText(profile.proxy_command)
 
     def _on_accept(self) -> None:
         if not self._label.text().strip():
@@ -304,7 +424,16 @@ class ServerDialog(QDialog):
             "local_dir": self._local_dir.text().strip(),
             "private_key_path": self._key_path.text().strip(),
             "passive": self._passive.isChecked(),
+            "use_agent": self._use_agent.isChecked(),
+            "use_default_keys": self._use_default_keys.isChecked(),
+            "jump_profile_id": str(self._jump.currentData() or ""),
+            "proxy_command": self._proxy_command.text().strip(),
         }
         if self._profile:
-            return ServerProfile(id=self._profile.id, **kwargs)
+            # ``order`` is where this connection sits in its group. It is not
+            # on this form and never was, so rebuilding the profile without it
+            # sent every edited connection back to the top of its heading.
+            return ServerProfile(
+                id=self._profile.id, order=self._profile.order, **kwargs
+            )
         return ServerProfile(**kwargs)

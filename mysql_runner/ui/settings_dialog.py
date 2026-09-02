@@ -20,7 +20,12 @@ from PyQt6.QtWidgets import (
 )
 
 from mysql_runner.crypto import vault as vault_mod
-from mysql_runner.storage.settings import MAX_TRANSFER_WORKERS, Settings
+from mysql_runner.storage.settings import (
+    MAX_TRANSFER_RATE_KB,
+    MAX_TRANSFER_WORKERS,
+    Settings,
+)
+from mysql_runner.transfer import editors
 from mysql_runner.transfer import spawn
 
 # (label, minutes) — 0 means "never auto-lock".
@@ -223,6 +228,28 @@ class SettingsDialog(QDialog):
         speed_note.setWordWrap(True)
         speed_note.setObjectName(_HINT_ROLE)
         speed_form.addRow(speed_note)
+
+        self._rate_limit = QSpinBox()
+        self._rate_limit.setRange(0, MAX_TRANSFER_RATE_KB)
+        self._rate_limit.setSingleStep(64)
+        self._rate_limit.setValue(settings.transfer_rate_kb)
+        self._rate_limit.setSpecialValueText("No limit")
+        self._rate_limit.setToolTip(
+            "The ceiling applies to everything this tab is transferring "
+            "together, not to each connection, so raising the number above "
+            "does not raise this one with it. Takes effect immediately - "
+            "including part-way through a file already going up."
+        )
+        speed_form.addRow(
+            "Limit speed to:", self._with_unit(self._rate_limit, "KB/s", width=96)
+        )
+        rate_note = QLabel(
+            "Leave this at No limit unless somebody else is sharing the line: "
+            "a queue at full tilt takes the whole uplink with it."
+        )
+        rate_note.setWordWrap(True)
+        rate_note.setObjectName(_HINT_ROLE)
+        speed_form.addRow(rate_note)
         self._folder_stats = QCheckBox(
             "Show folders' real size and newest change date"
         )
@@ -342,7 +369,7 @@ class SettingsDialog(QDialog):
         behaviour_form.addRow(autosync_note)
         page_layout.addWidget(behaviour)
 
-        terminal = QGroupBox("External terminal")
+        terminal = QGroupBox("External programs")
         terminal_form = QFormLayout(terminal)
         self._terminal = QComboBox()
         self._terminal.addItem("The first one found", "")
@@ -363,8 +390,37 @@ class SettingsDialog(QDialog):
             "can list processes on this machine. A key file is used instead "
             "whenever the connection has one."
         )
-        terminal_form.addRow("Prefer:", self._terminal)
+        terminal_form.addRow("Terminal:", self._terminal)
         terminal_form.addRow(self._terminal_password)
+
+        self._editor = QComboBox()
+        self._editor.addItem("The first one found", "")
+        for editor in editors.detect_editors():
+            self._editor.addItem(editor.name, editor.name)
+        index = self._editor.findData(settings.editor_program)
+        if index >= 0:
+            self._editor.setCurrentIndex(index)
+        elif settings.editor_program:
+            self._editor.addItem(
+                f"{settings.editor_program} (not found)", settings.editor_program
+            )
+            self._editor.setCurrentIndex(self._editor.count() - 1)
+        self._editor.setToolTip(
+            "Which editor the “Open in VS Code” entries use. VS Code, Insiders, "
+            "Cursor, VSCodium and Windsurf are looked for; they all share the "
+            "same command line."
+        )
+        editor_note = QLabel(
+            "Right-click a remote file ▸ Open in VS Code downloads it and "
+            "uploads every save back. Right-click a remote folder on SFTP and "
+            "VS Code opens it on the server itself, over its own SSH session - "
+            "so it asks for that server's password or key itself, and needs "
+            "the Remote-SSH extension installed."
+        )
+        editor_note.setWordWrap(True)
+        editor_note.setObjectName(_HINT_ROLE)
+        terminal_form.addRow("Editor:", self._editor)
+        terminal_form.addRow(editor_note)
         page_layout.addWidget(terminal)
 
         page_layout.addStretch(1)
@@ -444,6 +500,9 @@ class SettingsDialog(QDialog):
     def transfer_workers(self) -> int:
         return int(self._workers.value())
 
+    def transfer_rate_kb(self) -> int:
+        return int(self._rate_limit.value())
+
     def atomic_uploads(self) -> bool:
         return self._atomic.isChecked()
 
@@ -485,3 +544,6 @@ class SettingsDialog(QDialog):
 
     def terminal_send_password(self) -> bool:
         return self._terminal_password.isChecked()
+
+    def editor_program(self) -> str:
+        return str(self._editor.currentData() or "")

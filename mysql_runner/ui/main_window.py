@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from mysql_runner import __version__
 from mysql_runner.crypto import vault as vault_mod
 from mysql_runner.db import mysql_client
 from mysql_runner.runtime_mode import running_elevated
@@ -49,6 +50,7 @@ from mysql_runner.storage.portable import PortableError, export_profiles, import
 from mysql_runner.storage.settings import MIN_SIDEBAR_WIDTH, Settings
 from mysql_runner.storage.store import ServerStore
 from mysql_runner.transfer import connstr
+from mysql_runner.ui.bridge_server import BridgeServer
 from mysql_runner.ui.file_manager_tab import FileManagerTab
 from mysql_runner.ui.master_password_dialog import (
     ChangeMasterPasswordDialog,
@@ -128,6 +130,8 @@ class MainWindow(QMainWindow):
         self._profile_refs: dict[object, int] = {}
         self._panes: list[QTabWidget] = []
         self._active_pane = 0
+        #: Set by _start_bridge, at the very end of construction.
+        self._bridge = None
         self.setWindowTitle("Sitekeeper")
         self._size_to_screen()
 
@@ -136,6 +140,7 @@ class MainWindow(QMainWindow):
         self._build_shortcuts()
         self._refresh_server_list()
         self._apply_settings()
+        self._start_bridge()
 
     def _size_to_screen(self) -> None:
         """Open at a size that suits the monitor, not a fixed 1200x800.
@@ -722,7 +727,7 @@ class MainWindow(QMainWindow):
 
     # ----- CRUD actions --------------------------------------------------
     def _on_add(self) -> None:
-        dialog = ServerDialog(self)
+        dialog = ServerDialog(self, profiles=self._store.all())
         if dialog.exec():
             self._store.add(dialog.result_profile())
             self._refresh_server_list()
@@ -732,7 +737,7 @@ class MainWindow(QMainWindow):
         if profile is None:
             QMessageBox.information(self, _NO_SELECTION, "Select a server to edit.")
             return
-        dialog = ServerDialog(self, profile=profile)
+        dialog = ServerDialog(self, profile=profile, profiles=self._store.all())
         if dialog.exec():
             self._store.update(dialog.result_profile())
             self._refresh_server_list()
@@ -955,12 +960,58 @@ class MainWindow(QMainWindow):
                     "Install Paramiko and restart.",
                 )
                 return None
-            tab = FileManagerTab(profile, dark_mode=dark, settings=self._settings)
+            jump, complaint = self._jump_for(profile)
+            if complaint:
+                QMessageBox.critical(self, "Jump host missing", complaint)
+                return None
+            tab = FileManagerTab(
+                profile, dark_mode=dark, settings=self._settings, jump=jump
+            )
             tab.shell_requested.connect(self._open_shell_tab)
             tab.profile_changed.connect(self._on_profile_changed)
             return tab
         # A browser tab's "dark mode" means the page, not the app chrome.
         return BrowserTab(profile, dark_mode=self._settings.web_dark_mode)
+
+    def _jump_for(self, profile: ServerProfile):
+        """Resolve the bastion a connection goes through: (jump, complaint).
+
+        A named jump host that has since been deleted or turned into something
+        that cannot forward is refused rather than ignored. Connecting straight
+        at a server somebody deliberately put behind a bastion is not a smaller
+        version of what they asked for - it is a different thing, and on a
+        private network it would only fail with a confusing timeout anyway.
+
+        One hop. Chains are not followed: the bastion is reached directly, even
+        if it names a jump host of its own.
+        """
+        wanted = profile.jump_profile_id
+        if not wanted:
+            return None, ""
+        bastion = self._store.get(wanted)
+        if bastion is None:
+            return None, (
+                f"{profile.label} is set to connect through another saved "
+                "connection, but that connection no longer exists. Edit "
+                f"{profile.label} and pick a jump host, or clear the setting."
+            )
+        if bastion.kind != ConnectionKind.SFTP:
+            return None, (
+                f"{profile.label} is set to connect through {bastion.label}, "
+                f"which is a {bastion.kind.value} connection. Only SFTP "
+                "connections can forward for another."
+            )
+        from mysql_runner.transfer.sftp_client import JumpHost
+
+        return JumpHost(
+            host=bastion.host,
+            port=bastion.effective_port,
+            username=bastion.username,
+            password=bastion.password,
+            private_key_path=bastion.private_key_path,
+            use_agent=bastion.use_agent,
+            label=bastion.label,
+        ), ""
 
     def _on_profile_changed(self, profile: object) -> None:
         """A tab changed something worth keeping - write it to the vault."""
@@ -972,7 +1023,11 @@ class MainWindow(QMainWindow):
         """Open an SSH shell beside the file manager that asked for it."""
         assert isinstance(profile, ServerProfile)
         tab = SshTerminalTab(
-            profile, spec, cwd, dark_mode=self._settings.dark_mode
+            profile,
+            spec,
+            cwd,
+            dark_mode=self._settings.dark_mode,
+            settings=self._settings,
         )
         pane = self._pane()
         index = pane.addTab(tab, f"{profile.label} — shell")
@@ -1259,6 +1314,7 @@ class MainWindow(QMainWindow):
         """Copy the file-transfer preferences across and tell open tabs."""
         settings = self._settings
         settings.transfer_workers = dialog.transfer_workers()
+        settings.transfer_rate_kb = dialog.transfer_rate_kb()
         settings.atomic_uploads = dialog.atomic_uploads()
         settings.shadow_backups = dialog.shadow_backups()
         settings.history_days = dialog.history_days()
@@ -1278,6 +1334,7 @@ class MainWindow(QMainWindow):
         settings.watch_autosync = dialog.watch_autosync()
         settings.terminal_program = dialog.terminal_program()
         settings.terminal_send_password = dialog.terminal_send_password()
+        settings.editor_program = dialog.editor_program()
         for _pane, _index, widget in self._all_tabs():
             apply = getattr(widget, "apply_settings", None)
             if callable(apply):
@@ -1420,8 +1477,133 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Download failed: {name}", 6000)
 
     # ----- shutdown ------------------------------------------------------
+    # ----- the MCP bridge -------------------------------------------------
+    # Claude's uploads used to happen in the MCP server's own process, on its
+    # own connection, and so appeared nowhere in this window. They arrive here
+    # instead now: routed to whichever tab already holds that connection, and
+    # queued through it like anything else. See transfer/bridge.py.
+    def _start_bridge(self) -> None:
+        self._bridge = BridgeServer(self)
+        self._bridge.request.connect(self._on_bridge_request)
+        self._bridge.message.connect(
+            lambda text: self.statusBar().showMessage(text, 8000)
+        )
+        self._bridge.start()
+
+    def _on_bridge_request(self, request) -> None:
+        """Answer one request from the MCP server, on the GUI thread.
+
+        "Unavailable" is not a failure: it means this window cannot take the
+        job, and the MCP server should do it itself rather than tell Claude
+        that nothing happened.
+        """
+        if request.op == "ping":
+            request.finish({"ok": True, "version": __version__})
+            return
+        if request.op == "query":
+            self._route_bridge_query(request)
+            return
+        if request.op not in ("upload", "download", "delete", "mkdir"):
+            request.fail(
+                f"Sitekeeper does not handle {request.op!r} requests.",
+                unavailable=True,
+            )
+            return
+
+        tab = self._transfer_tab(str(request.payload.get("profile_id", "")))
+        if tab is None:
+            request.fail(
+                "no file-manager tab is open on that connection",
+                unavailable=True,
+            )
+            return
+        payload = request.payload
+        note = str(payload.get("note", ""))
+        if request.op in ("upload", "download"):
+            pairs = [
+                (str(entry.get("local", "")), str(entry.get("remote", "")))
+                for entry in payload.get("items") or []
+                if isinstance(entry, dict)
+            ]
+            if not pairs:
+                request.fail("that request named no files", unavailable=True)
+                return
+            if request.op == "upload":
+                refusal = tab.accept_bridge_upload(pairs, note, request.finish)
+            else:
+                # The wire carries (local, remote) whichever way the bytes go;
+                # the download side wants them the other way round.
+                refusal = tab.accept_bridge_download(
+                    [(remote, local) for local, remote in pairs],
+                    note,
+                    request.finish,
+                )
+        elif request.op == "delete":
+            # is_dir is left out when the caller does not know, rather than
+            # guessed at: the tab resolves it on the connection doing the work.
+            is_dir = payload.get("is_dir")
+            refusal = tab.accept_bridge_delete(
+                str(payload.get("path", "")),
+                None if is_dir is None else bool(is_dir),
+                request.finish,
+            )
+        else:
+            refusal = tab.accept_bridge_mkdir(
+                str(payload.get("path", "")), request.finish
+            )
+        if refusal:
+            request.fail(refusal, unavailable=True)
+
+    def _route_bridge_query(self, request) -> None:
+        """Run one statement in the SQL console open on that connection."""
+        console = self._console_tab(str(request.payload.get("profile_id", "")))
+        if console is None:
+            request.fail(
+                "no SQL console tab is open on that connection",
+                unavailable=True,
+            )
+            return
+        refusal = console.accept_bridge_query(
+            str(request.payload.get("sql", "")), request.finish
+        )
+        if refusal:
+            request.fail(refusal, unavailable=True)
+
+    def _console_tab(self, profile_id: str):
+        """An open, connected SQL console for this connection, if any."""
+        return self._tab_for(profile_id, SqlConsoleTab)
+
+    def _transfer_tab(self, profile_id: str):
+        """An open, connected file-manager tab for this connection, if any."""
+        return self._tab_for(profile_id, FileManagerTab)
+
+    @staticmethod
+    def _tab_matches(widget, profile_id: str) -> bool:
+        profile = getattr(widget, "_profile", None)
+        return (
+            profile is not None
+            and profile.id == profile_id
+            and bool(getattr(widget, "_connected", False))
+        )
+
+    def _tab_for(self, profile_id: str, kind):
+        """The first open, connected tab of ``kind`` on this connection.
+
+        Connected matters: an open tab that has lost its session would take
+        the work and then fail on it, when the honest answer is that there is
+        nowhere to put it and the caller should do it itself.
+        """
+        if not profile_id:
+            return None
+        for _pane, _index, widget in self._all_tabs():
+            if isinstance(widget, kind) and self._tab_matches(widget, profile_id):
+                return widget
+        return None
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         """Stop worker threads before the window goes away."""
+        if self._bridge is not None:
+            self._bridge.stop()
         for pane in self._panes:
             for index in reversed(range(pane.count())):
                 widget = pane.widget(index)

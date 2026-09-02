@@ -6,14 +6,19 @@ a previous unlock - ``SITEKEEPER_MASTER_PASSWORD`` is the fallback for
 machines that cache nothing), profiles come from the same encrypted store,
 and connections use the same FTP/FTPS/SFTP backends as the file manager.
 
-The safety model is opt-in by flag, not by trust:
+The safety model is opt-in, and what it reads is the app's own grants file
+rather than this process's command line - see ``mcp/policy.py`` for why:
 
 * reading (listings, file contents, downloads, SELECTs) is always allowed,
-* uploads and mkdir need ``--allow-write``,
-* deleting anything on a server needs ``--allow-delete``,
-* SQL that changes data needs ``--allow-sql-write``,
-* and none of the above touch a profile marked PRODUCTION without
-  ``--allow-production`` on top.
+* uploads and mkdir need "Upload files and create folders",
+* deleting anything on a server needs "Delete files and folders",
+* SQL that changes data needs "Run SQL that changes data",
+* and none of the above touch a connection marked PRODUCTION until that
+  connection is granted production by name.
+
+Each of those is a tick in Sitekeeper's "Connect Claude" window, re-read on
+every tool call, so switching one on lands on the next thing Claude tries
+rather than the next time the server starts.
 
 Tool output is plain text sized for a model to read, never credentials.
 """
@@ -22,9 +27,10 @@ from __future__ import annotations
 
 import io
 import os
-from dataclasses import dataclass
 
+from mysql_runner.mcp.policy import LivePolicy, McpPolicy
 from mysql_runner.storage.models import ConnectionKind, Environment, ServerProfile
+from mysql_runner.transfer import bridge
 from mysql_runner.transfer.base import (
     Capability,
     RemoteFS,
@@ -32,6 +38,7 @@ from mysql_runner.transfer.base import (
     local_relative,
 )
 from mysql_runner.transfer.ignore import IgnoreRules
+from mysql_runner.transfer.removal import UNCOUNTED, delete_tree
 
 #: In-memory reads are for configs and logs, not for site archives.
 MAX_READ_BYTES = 2 * 1024 * 1024
@@ -51,39 +58,31 @@ class ToolError(Exception):
     """A refusal or failure whose text goes straight back to the model."""
 
 
-@dataclass(frozen=True)
-class Policy:
-    """What this MCP process is allowed to do, fixed at startup."""
+#: Where in the app the grants are ticked, so a refusal can say where to go.
+WINDOW = 'the "Connect Claude" window in Sitekeeper (Tools -> Connect Claude)'
 
-    allow_write: bool = False
-    allow_delete: bool = False
-    allow_sql_write: bool = False
-    allow_production: bool = False
-    #: Labels the server may use; empty means every stored profile.
-    profiles: tuple[str, ...] = ()
-
-    def describe(self) -> str:
-        grants = [
-            name
-            for name, allowed in (
-                ("write", self.allow_write),
-                ("delete", self.allow_delete),
-                ("sql-write", self.allow_sql_write),
-                ("production", self.allow_production),
-            )
-            if allowed
-        ]
-        scope = ", ".join(self.profiles) if self.profiles else "all profiles"
-        return f"granted: {', '.join(grants) or 'read-only'}; profiles: {scope}"
+#: Policy attribute -> the label of the checkbox that sets it. A refusal that
+#: names the box is one the reader can act on; "--allow-write" was a string
+#: they had to already know the meaning of.
+GRANT_LABELS = {
+    "allow_write": "Upload files and create folders",
+    "allow_delete": "Delete files and folders",
+    "allow_sql_write": "Run SQL that changes data",
+}
 
 
 class AppAccess:
     """The vault, the profiles, and one live connection per server."""
 
-    def __init__(self, policy: Policy) -> None:
-        self.policy = policy
+    def __init__(self) -> None:
+        self._policy = LivePolicy()
         self._store = None
         self._remotes: dict[str, RemoteFS] = {}
+
+    @property
+    def policy(self) -> McpPolicy:
+        """The grants as they stand right now, not as they stood at startup."""
+        return self._policy.current()
 
     # ----- the vault --------------------------------------------------------
     def _unlock(self):
@@ -122,11 +121,8 @@ class AppAccess:
 
     # ----- profiles ----------------------------------------------------------
     def profiles(self) -> list[ServerProfile]:
-        found = self.store().all()
-        if not self.policy.profiles:
-            return found
-        wanted = {label.casefold() for label in self.policy.profiles}
-        return [p for p in found if p.label.casefold() in wanted]
+        policy = self.policy
+        return [p for p in self.store().all() if policy.sees(p)]
 
     def profile(self, ref: str) -> ServerProfile:
         """Find a profile by label (case-insensitive) or id prefix."""
@@ -202,16 +198,23 @@ class AppAccess:
         self._remotes.clear()
 
     # ----- permission gates ----------------------------------------------------
-    def guard(self, profile: ServerProfile, action: str, allowed: bool, flag: str) -> None:
-        if not allowed:
+    def guard(self, profile: ServerProfile, action: str, grant: str) -> None:
+        """Refuse unless the app grants this, on this connection, right now."""
+        policy = self.policy
+        if not getattr(policy, grant):
             raise ToolError(
-                f"{action} is switched off for this MCP server. Restart it "
-                f"with {flag} to allow it."
+                f"{action} is not switched on for Claude. Tick "
+                f'"{GRANT_LABELS[grant]}" in {WINDOW}, then try again - it '
+                "takes effect at once, with nothing to restart."
             )
-        if profile.environment == Environment.PROD and not self.policy.allow_production:
+        if profile.environment == Environment.PROD and not policy.allows_production(
+            profile
+        ):
             raise ToolError(
-                f"{profile.label} is marked PRODUCTION. Restart the MCP "
-                "server with --allow-production to act on it."
+                f"{profile.label} is marked PRODUCTION, and production is "
+                "granted per connection. Tick it beside that connection in "
+                f"{WINDOW}, then try again - it takes effect at once, with "
+                "nothing to restart."
             )
 
 
@@ -236,25 +239,6 @@ def _human_time(epoch: float | None) -> str:
         return "                "
 
 
-def _delete_tree(fs: RemoteFS, path: str) -> int:
-    """Remove a directory and everything in it. Returns entries removed."""
-    removed = 0
-    try:
-        entries = fs.listdir(path)
-    except TransferError:
-        fs.rmdir(path)
-        return 1
-    for entry in entries:
-        child = fs.join(path, entry.name)
-        if entry.is_dir and not entry.is_link:
-            removed += _delete_tree(fs, child)
-        else:
-            fs.remove(child)
-            removed += 1
-    fs.rmdir(path)
-    return removed + 1
-
-
 def _preserve_mtime(fs: RemoteFS, local: str, remote: str) -> None:
     if not fs.supports(Capability.SET_MTIME):
         return
@@ -262,6 +246,79 @@ def _preserve_mtime(fs: RemoteFS, local: str, remote: str) -> None:
         fs.set_mtime(remote, os.path.getmtime(local))
     except (TransferError, OSError):
         pass  # cosmetic; never fail an upload over it
+
+
+def _hand_over(
+    profile, pairs: list[tuple[str, str]], note: str, *, download: bool = False
+) -> str | None:
+    """Give these uploads to a running Sitekeeper, or None if there is none.
+
+    This is what puts Claude's transfers in the app's queue - as real rows
+    that can be cancelled and reordered, backed by the shadow-backup journal
+    so "undo replace" can put back whatever they overwrote, under the same
+    rate limit and written atomically. Doing it here in this process, which is
+    what used to happen, got none of that and showed nothing anywhere.
+
+    A missing app, or one with no tab open on this connection, is not a
+    failure: None sends the caller back to its own uploading, which is what it
+    did before there was a bridge at all.
+    """
+    try:
+        reply = bridge.call(
+            {
+                "op": "download" if download else "upload",
+                "profile_id": profile.id,
+                "profile": profile.label,
+                "note": note,
+                "items": [{"local": local, "remote": remote} for local, remote in pairs],
+            }
+        )
+    except bridge.BridgeUnavailable:
+        return None
+    except bridge.BridgeError as exc:
+        raise ToolError(str(exc)) from exc
+
+    sent = int(reply.get("sent", 0))
+    total = int(reply.get("total", len(pairs)))
+    failed = [str(line) for line in reply.get("failed") or []]
+    verb = "Downloaded" if download else "Uploaded"
+    where = "from" if download else "to"
+    lines = [
+        f"{verb} {sent}/{total} file(s) {where} {profile.label} through the "
+        "Sitekeeper queue (cancellable there, and undoable with Undo replace)."
+    ]
+    lines += [f"FAILED {line}" for line in failed[:5]]
+    if len(failed) > 5:
+        lines.append(f"... and {len(failed) - 5} more failures.")
+    if reply.get("abandoned"):
+        lines.append(f"Stopped early: {reply['abandoned']}.")
+    return "\n".join(lines)
+
+
+def _hand_op(profile, op: str, **fields) -> str | None:
+    """Give one non-transfer operation to a running Sitekeeper.
+
+    Deleting matters most here. It is the only destructive thing Claude can
+    do that has an undo, and the undo is the app's shadow-backup journal - a
+    delete performed in this process could not be put back from the app,
+    which is exactly the wrong way round for the one operation nobody wants
+    to get wrong.
+
+    None means there is nobody to hand it to, and the caller does it itself.
+    """
+    try:
+        reply = bridge.call({"op": op, "profile_id": profile.id, **fields})
+    except bridge.BridgeUnavailable:
+        return None
+    except bridge.BridgeError as exc:
+        # The app tried and the server said no. Doing it again directly would
+        # fail the same way and skip the journal while it did.
+        raise ToolError(str(exc)) from exc
+    detail = str(reply.get("detail") or "Done.")
+    if op == "query":
+        # The output is the answer; the note says where it ran.
+        return f"{detail}\n\n(run in Sitekeeper's SQL console for {profile.label})"
+    return f"{detail} (through Sitekeeper, so it is in this tab's history)"
 
 
 def _plan_folder(local_dir: str, remote_dir: str) -> tuple[list[tuple[str, str]], list[str]]:
@@ -294,13 +351,23 @@ def _plan_folder(local_dir: str, remote_dir: str) -> tuple[list[tuple[str, str]]
 
 # ----- the tools themselves ----------------------------------------------------
 def list_profiles(access: AppAccess, _args: dict) -> str:
+    policy = access.policy
     profiles = access.profiles()
     if not profiles:
-        return "No profiles are stored (or none match this server's --profiles filter)."
+        return (
+            "No connections are in scope. Either none are stored yet, or "
+            f"{WINDOW} is limiting Claude to connections that no longer exist."
+        )
     lines = [f"{len(profiles)} profile(s):"]
     for p in profiles:
         env = f" [{p.environment.value.upper()}]" if p.environment != Environment.NONE else ""
+        # A PROD connection that has not been granted production is worth
+        # saying so about here rather than only when a write is refused.
+        if p.environment == Environment.PROD and not policy.allows_production(p):
+            env += " (read-only: production not granted)"
         lines.append(f"- {p.label} — {p.kind.value} {p.describe_target()}{env}")
+    lines.append("")
+    lines.append(f"Claude is {policy.describe()}. Change it in {WINDOW}.")
     return "\n".join(lines)
 
 
@@ -344,11 +411,19 @@ def read_remote_file(access: AppAccess, args: dict) -> str:
 
 def download_file(access: AppAccess, args: dict) -> str:
     profile = access.profile(str(args.get("profile", "")))
-    fs = access.remote(profile)
     remote = str(args.get("remote_path", "")).strip()
     local = str(args.get("local_path", "")).strip()
     if not remote or not local:
         raise ToolError("Both remote_path and local_path are required.")
+    handed = _hand_over(
+        profile,
+        [(local, remote)],
+        RemoteFS.basename(remote),
+        download=True,
+    )
+    if handed is not None:
+        return handed
+    fs = access.remote(profile)
     os.makedirs(os.path.dirname(os.path.abspath(local)) or ".", exist_ok=True)
     fs.download(remote, local)
     return f"Downloaded {remote} -> {local} ({_human_size(os.path.getsize(local))})."
@@ -356,16 +431,21 @@ def download_file(access: AppAccess, args: dict) -> str:
 
 def upload_file(access: AppAccess, args: dict) -> str:
     profile = access.profile(str(args.get("profile", "")))
-    access.guard(profile, "Uploading", access.policy.allow_write, "--allow-write")
+    access.guard(profile, "Uploading", "allow_write")
     local = str(args.get("local_path", "")).strip()
     remote = str(args.get("remote_path", "")).strip()
     if not local or not remote:
         raise ToolError("Both local_path and remote_path are required.")
     if not os.path.isfile(local):
         raise ToolError(f"{local} is not a file on this machine.")
-    fs = access.remote(profile)
     if remote.endswith("/"):
         remote = RemoteFS.join(remote, os.path.basename(local))
+    # Before dialling anything: if the app is up and holding this connection,
+    # the upload is its job and this process never needs to connect at all.
+    handed = _hand_over(profile, [(local, remote)], os.path.basename(local))
+    if handed is not None:
+        return handed
+    fs = access.remote(profile)
     parent = RemoteFS.parent(remote)
     if parent not in ("", "/"):
         fs.makedirs(parent)
@@ -376,7 +456,7 @@ def upload_file(access: AppAccess, args: dict) -> str:
 
 def upload_folder(access: AppAccess, args: dict) -> str:
     profile = access.profile(str(args.get("profile", "")))
-    access.guard(profile, "Uploading", access.policy.allow_write, "--allow-write")
+    access.guard(profile, "Uploading", "allow_write")
     local_dir = str(args.get("local_dir", "")).strip()
     remote_dir = str(args.get("remote_dir", "")).strip()
     if not local_dir or not remote_dir:
@@ -392,13 +472,15 @@ def upload_folder(access: AppAccess, args: dict) -> str:
         )
     if not uploads:
         return f"Nothing to upload: {local_dir} is empty after the ignore rules."
+    handed = _hand_over(
+        profile, uploads, f"{os.path.basename(local_dir) or local_dir} -> {remote_dir}"
+    )
+    if handed is not None:
+        return handed
     fs = access.remote(profile)
-    fs.makedirs(remote_dir)
-    for directory in directories:
-        try:
-            fs.mkdir(directory)
-        except TransferError:
-            pass  # almost always "already exists"
+    # Every directory in one call: on a server with a shell that is a single
+    # `mkdir -p`, rather than a round trip per folder before a byte moves.
+    fs.makedirs_many([remote_dir, *directories])
     sent = 0
     failures: list[str] = []
     for local, remote in uploads:
@@ -421,24 +503,37 @@ def upload_folder(access: AppAccess, args: dict) -> str:
 
 def make_remote_dir(access: AppAccess, args: dict) -> str:
     profile = access.profile(str(args.get("profile", "")))
-    access.guard(profile, "Creating directories", access.policy.allow_write, "--allow-write")
+    access.guard(profile, "Creating directories", "allow_write")
     path = str(args.get("path", "")).strip()
     if not path:
         raise ToolError("Say which directory to create (path).")
+    handed = _hand_op(profile, "mkdir", path=path)
+    if handed is not None:
+        return handed
     access.remote(profile).makedirs(path)
     return f"Created {path} (and any missing parents)."
 
 
 def delete_remote(access: AppAccess, args: dict) -> str:
     profile = access.profile(str(args.get("profile", "")))
-    access.guard(profile, "Deleting", access.policy.allow_delete, "--allow-delete")
+    access.guard(profile, "Deleting", "allow_delete")
     path = str(args.get("path", "")).strip()
     if not path or path.rstrip("/") in ("", "/"):
         raise ToolError("Refusing: name one file or directory, never the root.")
+    # No is_dir: the app stats it on the connection that will do the deleting,
+    # rather than this process opening one of its own to answer a question it
+    # is about to hand over anyway.
+    handed = _hand_op(profile, "delete", path=path)
+    if handed is not None:
+        return handed
     fs = access.remote(profile)
     stat = fs.stat(path)
     if stat.is_dir and not stat.is_link:
-        removed = _delete_tree(fs, path)
+        removed = delete_tree(fs, path)
+        if removed == UNCOUNTED:
+            # The server did it in one command rather than one per file, so
+            # there is no count - which is the point of asking it that way.
+            return f"Deleted {path} and everything in it."
         return f"Deleted {path} ({removed} entr(y/ies))."
     fs.remove(path)
     return f"Deleted {path}."
@@ -471,13 +566,16 @@ def run_query(access: AppAccess, args: dict) -> str:
         if s.sql.lstrip().split(None, 1)[0].casefold() not in READ_ONLY_SQL
     ]
     if writes:
-        access.guard(
-            profile,
-            "SQL that changes data",
-            access.policy.allow_sql_write,
-            "--allow-sql-write",
-        )
-    database = str(args.get("database", "")).strip() or profile.database
+        access.guard(profile, "SQL that changes data", "allow_sql_write")
+    database = str(args.get("database", "")).strip()
+    if not database:
+        # Only when no schema was named. An open console is on whatever
+        # schema it is on, and running a statement somewhere other than where
+        # the caller asked for it is worse than not running it in the app.
+        handed = _hand_op(profile, "query", sql=sql)
+        if handed is not None:
+            return handed
+    database = database or profile.database
     pymysql = import_driver()
     try:
         connection = pymysql.connect(

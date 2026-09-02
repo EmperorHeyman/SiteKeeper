@@ -4,7 +4,255 @@ All notable changes to Sitekeeper are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.10.1] - 2026-09-02
+
+### Added
+- **Everything Claude does now happens in the app.** The MCP server is a
+  separate process, and it used to work on its own connection with direct
+  calls - so nothing it did ever appeared in this window. Nothing uploaded
+  had a queue row, a shadow backup to undo, the speed limit applied or an
+  atomic write; nothing deleted could be put back, because the undo journal
+  belongs to the app; no query left a trace anywhere. There was nothing to
+  display, which is why nothing was displayed.
+
+  All six operations now go to the running app over a loopback socket and are
+  carried out by the tab that already holds that connection:
+
+  - **Uploads and downloads** become ordinary transfer-queue rows -
+    cancellable, reorderable, rate-limited, undoable with *Undo replace* -
+    labelled **Claude** so "why is it transferring?" has an answer. A folder
+    push goes as one queue rather than one per sub-directory.
+  - **Deletes** run through the tab that owns the shadow-backup journal, so
+    something Claude removed can be restored from *History* like anything
+    else, and the pane re-lists itself afterwards. This is the one that
+    mattered most: a delete done in the other process could not be undone.
+  - **New folders** are made on the tab's connection and show up at once.
+  - **Queries** run in the SQL console open on that connection, so the
+    statement and its output land in the transcript you are already looking
+    at, marked as Claude's rather than appearing unexplained.
+
+  Every call blocks until the work is really finished, so Claude is told what
+  happened - "3 of 4 uploaded, 1 failed: permission denied" - rather than that
+  it submitted something. With the app closed, or with no suitable tab open,
+  each operation falls back to doing the work itself exactly as before, and
+  says which of the two it did.
+- **Watch shows you what changed and lets you choose.** Ticking *Watch* used
+  to do one of two things, and neither was what the checkbox implies: with
+  auto-upload off - the default - it wrote a status line naming three files
+  that the next message wiped, and with auto-upload on it sent everything the
+  moment it settled, without ever asking. There is now a list under the panes
+  that accumulates every save the watcher notices, with what happened to each
+  file and when. Folders nest and are tri-state, so *push this directory and
+  nothing else* is one click, and *Upload selected* sends only what is ticked.
+  Files deleted locally are listed separately and are not sent: mirroring a
+  removal onto a server belongs to a folder sync rule, which has a defined
+  scope, not to a watch that follows whatever the local pane is showing.
+  Auto-upload is still there in Settings for anyone who wants it.
+
+### Changed
+- **What Claude may do is set in Sitekeeper, not on a command line.** The
+  permissions used to be `--allow-write` and friends in the MCP client's
+  config, which was wrong in three ways at once. It was invisible - nothing in
+  the app could tell you what Claude was currently allowed to do. It was
+  per-project: Claude Code keeps a separate config per folder, so the same
+  server was read-only in one and could delete in another, with no indication
+  which one you were talking to, and a `--allow-production` added in one
+  project did nothing everywhere else. And it could only be changed by
+  restarting the server, which is what every refusal told you to go and do.
+  *Tools ▸ Connect Claude* is now the control panel: the ticks are the
+  permission, they are read on every tool call, and they take effect at once
+  in every project. Production is granted one connection at a time, beside
+  that connection, so deploying to one live site does not arm the rest.
+  Refusals now name the box to tick instead of a flag. Existing registrations
+  keep working - the old flags are accepted and ignored, with a note saying
+  so - but everything starts read-only until it is granted in the app.
+
+## [1.10.0] - 2026-09-01
+
+### Added
+- **Right-click ▸ Open in VS Code.** Two different things wear that name,
+  because two different things are wanted from it. A *remote file* comes down
+  as a scratch copy and opens in VS Code, and every save goes straight back to
+  the server - the loop "Edit locally" has always run, except that it now opens
+  the editor you actually work in rather than whatever Windows has registered
+  for `.php`. A *remote folder* on SFTP is not downloaded at all: VS Code opens
+  it on the server over its own SSH session, so its search, its git and its
+  terminal are the server's and nothing is copied to this machine. That session
+  is VS Code's own, so it asks for the key or the password itself rather than
+  taking this connection's - a password handed over on a command line is
+  visible to anything that can list processes, which is the same trade the
+  PuTTY button makes explicit - and the status line says so rather than letting
+  a prompt appear out of nowhere. On a production connection it asks first,
+  because from that point the editor writes straight to the live box with
+  nothing queued and nothing compared. FTP and FTPS get the file entry and, in
+  place of the folder one, the reason: there is no FTP authority for VS Code to
+  open, and a connection routed through a jump host cannot be described on a
+  command line either. The local pane has the entry too, beside *Open in
+  Explorer*, where it opens what is selected or the folder on show.
+  Visual Studio Code, VS Code Insiders, Cursor, VSCodium and Windsurf are all
+  looked for - they share one command line - and *Settings ▸ File transfer*
+  picks between them when more than one is installed.
+
+### Fixed
+- **A greyed-out context-menu entry can now say why.** Qt hides action tooltips
+  unless a menu is told to show them, and nothing ever told it - so the answer
+  to "why can't I click this?" was written, attached to the right entry, and
+  invisible. Both file-manager menus show them now, which is also how *Start
+  here next time* got its explanation back.
+
+## [1.9.1] - 2026-09-01
+
+### Changed
+- **A git sync says which commit it is.** The queue headline read
+  "20:02 - 7 file(s) - git sync" for every commit of the afternoon, so the one
+  question it exists to answer - *which* of them is this? - was the one it
+  would not answer, and three syncs in a row were indistinguishable from each
+  other. It now carries the commit's subject line, the same text every git
+  client shows: "20:02 - 7 file(s) - git sync: fix the login form". A subject
+  too long for the column is cut short and given whole on the tooltip.
+  Publishing from history names its commit too, short sha and subject both.
+- **Two commits in the same minute are two batches.** They used to fold into
+  one headline, which was right when a single commit arrived as six
+  submissions and wrong the moment the second commit was a different commit:
+  the files of both ended up in one pile under one of their names.
+
+## [1.9.0] - 2026-08-31
+
+### Added
+- **SSH agents work.** Sitekeeper connected with `allow_agent=False`, so anyone
+  whose key lives in Pageant, in the ssh-agent built into Windows, or behind
+  1Password could not connect at all - there was nothing to offer and no way to
+  say so. Keys from every agent on the machine are now offered, including the
+  Windows one, which listens on a named pipe that Paramiko cannot reach on its
+  own and which this now speaks to directly. There is a switch per connection,
+  plus an optional "also try the keys in ~/.ssh" that is off by default because
+  a server with a low `MaxAuthTries` will refuse the key that would have worked
+  after three that were never meant for it.
+- **A server's identity is confirmed before the first connection.** SSH has no
+  certificate authority; the host key is the only check there is, and
+  Sitekeeper used to record whatever answered without a word - so the one
+  moment the check exists for was the one moment nothing was checked. A server
+  never seen before now shows its fingerprint, in both SHA-256 and MD5 form
+  (control panels still print the old one), and says what to compare it
+  against. Neither button is styled as the loud one and Enter presses "no". A
+  *changed* key still refuses outright, and there is now a **Forget this
+  server's host key** button for the case where a server was genuinely rekeyed
+  - which used to mean finding the right line in `known_hosts` by hand.
+- **Jump hosts and proxy commands.** A connection can be routed through another
+  saved connection, so a server behind a bastion is reachable and the bastion's
+  credentials are the ones already in the vault. `direct-tcpip` is what OpenSSH
+  does for `-J`: the session to the real server is end to end, and the bastion
+  never sees its traffic. For anything stranger there is an OpenSSH-style
+  ProxyCommand with `%h`, `%p` and `%r`. One hop; chains are not followed, and
+  a jump host that has since been deleted refuses the connection rather than
+  quietly going direct.
+- **The shell remembers what you typed.** Commands are kept per connection and
+  survive closing the tab, the app and the machine. Per connection rather than
+  globally: "the last thing I ran here" is a useful question, and mixing two
+  servers' histories is how a command meant for staging is recalled on
+  production. The quick command runner (Ctrl+P) shares the same memory, so the
+  two places you can type a command no longer each forget what the other did.
+- **The shell suggests as you type.** The rest of the most recent matching
+  command appears in front of the cursor, greyed; Right or End takes it. It is
+  drawn rather than inserted, so the text on the line is always the text you
+  typed and Enter can never run something you did not.
+- **Up walks what you started typing.** Type `git` and Up walks the git
+  commands, not everything that happened to come before them.
+- **Tab completes remote paths and command names.** Paths come from a real
+  listing over the session's own SFTP channel - not a guess, and not a command
+  written into your transcript that you did not type. Several matches fill in
+  what they share and then list themselves, the way a shell does.
+- **Ctrl+R searches backwards through the history.** Enter leaves the match on
+  the line rather than running it; one more Enter runs it. Recalling a command
+  and firing it at a server should not be the same keystroke.
+- **A destructive command on a production server asks first.** `rm -rf`, `DROP
+  DATABASE`, `chmod 777`, `git reset --hard`, `shutdown` and friends, named in
+  plain English - "this would delete files and folders outright" - because a
+  confirmation over a command line nobody re-reads is not a safeguard.
+- **Two things are deliberately not remembered:** anything typed with a leading
+  space, which is the convention every shell uses for "do this but do not write
+  it down", and anything that looks like it carries a password on the command
+  line. An application that keeps an encrypted vault has no business leaving
+  `mysql -pSECRET` in a plain text file beside it.
+- **A failed file is tried again before it is given up on.** A transfer that
+  broke on a live connection used to fail outright, so a queue of four hundred
+  ended in a scatter of red rows that all succeeded the moment somebody pressed
+  *Retry failed*: a lock held by the request serving the page as the file went
+  over it, a server momentarily at its session limit, a write that lost a race
+  with a cron job. Each file now gets three attempts spaced a second, four
+  seconds and ten apart. Errors that cannot come out differently - no such
+  file, permission denied, disk full, read-only filesystem - still fail at
+  once, so a hopeless queue costs no waiting.
+- **An interrupted transfer carries on where it stopped.** A 400 MB download
+  that broke at 380 used to start again from nothing. Where the protocol allows
+  it - always over SFTP, and over FTP where the server advertises `REST` - the
+  next attempt resumes from the mark, and the queue row says so. A partly
+  downloaded file is kept on this machine so even a *Retry* pressed an hour
+  later finishes in seconds; a partly uploaded one is not kept on the server,
+  because a stray scratch file left on somebody's host is worse than re-sending.
+- **A speed limit for the whole tab.** *Settings ▸ File transfer ▸ Limit speed
+  to*. Six connections at full tilt is right for a deploy and wrong for an
+  office at two in the afternoon. The ceiling is on everything the tab is
+  transferring together rather than on each connection, so raising *Files at
+  once* does not quietly raise it too, and it takes effect on the next chunk -
+  including part-way through a file already going up.
+- **The queue says how fast and how much longer.** The header now reads
+  *"12 of 340 · 3 running · 48.0 MB of 1.2 GB · 41.0 MB/s · about 2 minutes
+  left"*. The rate is measured across the queue rather than per file, because
+  a queue is a stream of files and no single one of them can answer the
+  question. Both the rate and the estimate are simply left out when there is
+  nothing honest to say - a paused queue is not a slow one.
+
+### Changed
+- **Deleting a folder no longer holds up the window.** Removing a tree is one
+  round trip per file plus one per directory, strictly in order, and it ran on
+  the connection the file panes browse with - so the pane you were looking at
+  stopped answering for as long as it took. Slow *writing* jobs now have a
+  connection of their own, alongside the one the read-only tools already had:
+  deletes, recursive chmod, and fetching a file to edit in place. Opening a
+  40 MB log to look at the end of it no longer stops you browsing either.
+- **Deleting a folder on a server with a shell is one command.** `rm -rf` does
+  the whole tree in a single round trip and the server does the walking: a
+  `node_modules` that measured 510 round trips now takes one. FTP, FTPS and
+  SFTP-only accounts still walk it, but iteratively rather than recursively, so
+  a deeply nested cache cannot exhaust Python's stack.
+- **Deleting a selection re-lists the directory once, not once per file.**
+  Thirty files used to cost thirty deletes *and* thirty full directory
+  listings, in order. The listings were most of the wait and none of the work.
+- **A tree push creates its directories in one call.** Where the account has a
+  shell, a site of two hundred folders goes up as a single `mkdir -p` instead of
+  two hundred round trips taken in turn before a byte of it moves. This applies
+  to the app, to `upload_folder` over MCP, and to the FastAPI backend.
+- **Deleting is written once instead of three times.** The file manager, the
+  MCP server and the FastAPI backend had a recursive copy each; all three now
+  use `transfer/removal.py` and get the shell fast path with it.
+
+### Fixed
+- **Editing a connection sent it back to the top of its group.** The dialog
+  rebuilt the profile from its own fields, and the position a connection had
+  been dragged to is not one of them - so every edit silently reset it. (The
+  drag itself still does not persist; that is a separate bug, in the sidebar.)
+- **A directory could be reported as a file over FTP.** `stat` asked `SIZE` and
+  then `MDTM` and called the path a file if *either* answered, so a server
+  willing to give a directory a size described that directory as a file - and a
+  directory that refused both paid for two useless commands before falling back
+  to reading the parent listing anyway. It now uses `MLST` where the server
+  advertises it (one round trip, and it says outright what the path is) and the
+  parent listing otherwise. Both are right about type, and both are fewer round
+  trips than the pair of guesses they replace.
+- **A folder that could not be read reported the wrong error.** A failed
+  listing fell through to a bare `rmdir`, so "permission denied" arrived as
+  "directory not empty", which describes nothing that happened.
+- **Deleting a symlinked folder emptied what it pointed at.** A link to a
+  directory lists as that directory, so the walk went into it and removed the
+  contents, leaving the link behind pointing at the hole. The link now goes and
+  its target is left alone.
+- **Closing a tab could wait on a long job.** Closing took each background
+  channel's lock, so a comparison of a large site - or now a big delete - held
+  it up. Nothing waits any more: an idle channel is closed on the spot and a
+  busy one closes its own session on the way out.
+- **A file that vanished before a delete reached it is no longer an error.**
+  A deploy or a cron job getting there first is not a delete that went wrong.
 
 ## [1.8.2] - 2026-08-29
 

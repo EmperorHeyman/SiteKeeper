@@ -88,3 +88,14 @@ def sync_rules_path() -> Path:
 def known_hosts_path() -> Path:
     """Path to the SSH known-hosts file used by SFTP connections."""
     return app_data_dir() / "known_hosts"
+
+
+def mcp_policy_path() -> Path:
+    """Path to the (plain JSON) grants the MCP server reads on every call.
+
+    Kept out of settings.json deliberately. This is a permission grant, not a
+    preference: it should not be reset by anything that resets the interface,
+    and "what may Claude do" is worth being able to read, back up and diff on
+    its own.
+    """
+    return app_data_dir() / "mcp_policy.json"

@@ -96,6 +96,9 @@ class SqlConsoleTab(QWidget):
         self._history_index = 0
         self._busy = False
         self._connected = False
+        #: A statement the MCP bridge is waiting on, and the outcomes it has
+        #: produced so far. One at a time: see accept_bridge_query.
+        self._bridge_query: dict | None = None
         self._closing = False
         self._startup_done = False
 
@@ -210,6 +213,8 @@ class SqlConsoleTab(QWidget):
 
     def _on_outcome(self, outcome: object) -> None:
         assert isinstance(outcome, QueryOutcome)
+        if self._bridge_query is not None:
+            self._bridge_query["outcomes"].append(outcome)
         if outcome.error:
             self._write(outcome.error)
             self._write("")
@@ -238,9 +243,48 @@ class SqlConsoleTab(QWidget):
 
     def _on_batch_finished(self) -> None:
         self._set_busy(False)
+        self._finish_bridge_query()
+
+    # ----- statements handed over by the MCP bridge -----------------------
+    # Claude used to open its own MySQL connection in the MCP process, so a
+    # query it ran left no trace anywhere in this window. Running it here
+    # instead puts the statement and its output in the transcript you are
+    # already looking at, on the connection this tab already holds - and marks
+    # it as Claude's, because an unexplained statement appearing in your own
+    # console would be worse than not seeing it at all.
+    def accept_bridge_query(self, sql: str, on_done) -> str:
+        """Run one batch for the bridge. Returns "" if it was taken."""
+        if not self._connected:
+            return "the SQL console for that connection is not connected"
+        if self._busy or self._bridge_query is not None:
+            return "that SQL console is in the middle of something"
+        if not sql.strip():
+            return "no SQL was given"
+        self._bridge_query = {"on_done": on_done, "outcomes": []}
+        self._write(_PROMPT + "-- run by Claude", newline_before=True)
+        for line in sql.strip().splitlines():
+            self._write(_CONTINUATION + line, newline_before=False)
+        self._set_busy(True)
+        self._sql_requested.emit(sql)
+        return ""
+
+    def _finish_bridge_query(self, abandoned: str = "") -> None:
+        """Hand the collected output back to whoever asked for it."""
+        pending, self._bridge_query = self._bridge_query, None
+        if pending is None:
+            return
+        callback = pending["on_done"]
+        if abandoned:
+            callback({"ok": False, "error": abandoned})
+            return
+        callback({"ok": True, "detail": _render(pending["outcomes"])})
+
+    def _abandon_bridge_query(self, reason: str) -> None:
+        self._finish_bridge_query(abandoned=reason)
 
     def _on_closed(self) -> None:
         self._connected = False
+        self._abandon_bridge_query("the connection closed before it finished")
         self._input.setEnabled(False)
         self._input.setPlaceholderText("Disconnected — press Reconnect")
         self._cancel_btn.setText("Reconnect")
@@ -370,6 +414,7 @@ class SqlConsoleTab(QWidget):
     def cleanup(self) -> None:
         """Close the connection and stop the worker thread."""
         self._closing = True
+        self._abandon_bridge_query("the tab was closed before it finished")
         # Detach first: a connect or query still running must not deliver its
         # result into a widget that is being destroyed.
         try:
@@ -383,6 +428,37 @@ class SqlConsoleTab(QWidget):
         self._thread.quit()
         # Give the worker a moment to unwind; it only has to close a socket.
         self._thread.wait(3000)
+
+
+def _render(outcomes) -> str:
+    """The same output the transcript shows, as text for the caller.
+
+    Deliberately the mysql-client shape the MCP server already returns for
+    this tool, so an answer that came through the app and one that did not
+    read identically - the difference is where it happened, not what it says.
+    """
+    blocks = []
+    for outcome in outcomes:
+        if outcome.error:
+            blocks.append(f"mysql> {outcome.statement.strip()}\n{outcome.error}")
+            continue
+        body = ""
+        if outcome.is_result_set:
+            body = (
+                format_vertical(outcome.columns, outcome.rows)
+                if outcome.vertical
+                else format_table(outcome.columns, outcome.rows)
+            )
+            body += "\n" if body else ""
+        body += format_summary(
+            outcome.rowcount, outcome.duration_ms, outcome.is_result_set
+        )
+        if outcome.truncated:
+            body += f"\n(only the first {outcome.rowcount} rows are shown)"
+        if outcome.message:
+            body += f"\n{outcome.message}"
+        blocks.append(f"mysql> {outcome.statement.strip()}\n{body}")
+    return "\n\n".join(blocks) or "No output."
 
 
 def _mono_font() -> QFont:

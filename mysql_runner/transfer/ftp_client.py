@@ -56,6 +56,11 @@ class FTPFileSystem(RemoteFS):
         self._passive = passive
         self._ftp: ftplib.FTP | None = None
         self._capabilities: frozenset[Capability] = frozenset()
+        #: Set from FEAT at login. MLST answers "what is this path" in one
+        #: round trip and says whether it is a directory; REST is what lets an
+        #: interrupted transfer carry on instead of starting again.
+        self._has_mlst = False
+        self._has_rest = False
 
     # ----- lifecycle ------------------------------------------------------
     def connect(self) -> str:
@@ -119,7 +124,15 @@ class FTPFileSystem(RemoteFS):
             found.add(Capability.SET_MTIME)
         if self._site_supports("CHMOD", feature_text):
             found.add(Capability.CHMOD)
+        # Neither of these is a Capability - nothing in the UI turns on them -
+        # but both decide how many round trips ordinary work costs.
+        self._has_mlst = "MLST" in features
+        self._has_rest = "REST" in features
         return frozenset(found)
+
+    def supports_resume(self) -> bool:
+        """Whether this server advertised REST, the restart-marker command."""
+        return self._has_rest
 
     def _features(self) -> tuple[set[str], str]:
         """The FEAT keywords, plus the raw reply (some servers list SITE verbs)."""
@@ -217,23 +230,58 @@ class FTPFileSystem(RemoteFS):
         return entries
 
     def stat(self, path: str) -> RemoteStat:
-        """Use SIZE and MDTM when the server has them; else read the parent."""
-        size = self._size(path)
-        modified = self._modified(path)
-        if size or modified is not None:
-            return RemoteStat(path=path, is_dir=False, size=size, modified=modified)
+        """What one path is, in as few round trips as the server allows.
+
+        This used to ask SIZE and then MDTM, and report ``is_dir`` as False if
+        either of them answered - so a server willing to give a directory a
+        size described that directory as a file, and a directory that refused
+        both paid for two useless commands *before* falling back to reading the
+        parent listing anyway. Five round trips for a folder, three for a file,
+        and a wrong answer on some servers.
+
+        Both replacements are authoritative about type, which is the thing SIZE
+        can never be. MLST is one command and says outright what the path is.
+        Without it the parent listing (CWD + MLSD/LIST, two commands) settles
+        it, and that is still fewer round trips than the pair of guesses it
+        replaces - on a link where the round trips are the cost, which is the
+        only kind this app is used over.
+        """
+        if self._has_mlst:
+            found = self._mlst(path)
+            if found is not None:
+                return found
         return super().stat(path)
 
-    def _modified(self, path: str) -> float | None:
+    def _mlst(self, path: str) -> RemoteStat | None:
+        """One MLST command. None when the server would not answer it."""
         ftp = self._require()
         try:
-            response = ftp.sendcmd(f"MDTM {path}")
+            response = ftp.sendcmd(f"MLST {path}")
         except ftplib.all_errors:
             return None
-        parts = response.strip().split()
-        if len(parts) < 2:
-            return None
-        return _parse_mlsd_time(parts[1])
+        # 250-Listing /x \r\n <facts> /x \r\n 250 End. The facts are on the
+        # indented middle line; the path follows the first space after them.
+        for line in response.splitlines():
+            if not line.startswith(" "):
+                continue
+            facts_text = line.strip().split(" ", 1)[0]
+            facts: dict[str, str] = {}
+            for part in facts_text.split(";"):
+                if "=" in part:
+                    key, _, value = part.partition("=")
+                    facts[key.strip().lower()] = value.strip()
+            if not facts:
+                continue
+            kind = facts.get("type", "file").lower()
+            is_dir = kind in ("dir", "cdir", "pdir")
+            return RemoteStat(
+                path=path,
+                is_dir=is_dir,
+                size=0 if is_dir else _as_int(facts.get("size")),
+                modified=_parse_mlsd_time(facts.get("modify")),
+                mode=_as_mode(facts.get("unix.mode")),
+            )
+        return None
 
     # ----- mutations ------------------------------------------------------
     def mkdir(self, path: str) -> None:
@@ -278,13 +326,27 @@ class FTPFileSystem(RemoteFS):
 
     # ----- transfers ------------------------------------------------------
     def download(
-        self, remote: str, local: str, progress: ProgressCallback | None = None
+        self,
+        remote: str,
+        local: str,
+        progress: ProgressCallback | None = None,
+        *,
+        resume_from: int = 0,
+        keep_partial: bool = False,
     ) -> None:
         ftp = self._require()
         total = self._size(remote)
-        transferred = 0
+        start = resume_from if resume_from > 0 and self._has_rest else 0
+        transferred = start
         try:
-            with open(local, "wb") as handle:
+            # "r+b" seeks into what is already there; "wb" starts a fresh file.
+            # Truncating at the mark matters as much as seeking to it: the tail
+            # of an interrupted download is whatever arrived of the last block,
+            # and REST counts from the mark, not from that.
+            with open(local, "r+b" if start else "wb") as handle:
+                if start:
+                    handle.seek(start)
+                    handle.truncate(start)
 
                 def write(chunk: bytes) -> None:
                     nonlocal transferred
@@ -293,24 +355,34 @@ class FTPFileSystem(RemoteFS):
                     if progress is not None:
                         progress(transferred, total)
 
-                ftp.retrbinary(f"RETR {remote}", write, blocksize=CHUNK)
+                ftp.retrbinary(
+                    f"RETR {remote}", write, blocksize=CHUNK, rest=start or None
+                )
         except ftplib.all_errors as exc:
-            # Leave no half-written file behind.
-            try:
-                os.unlink(local)
-            except OSError:
-                pass
+            if not keep_partial:
+                try:
+                    os.unlink(local)
+                except OSError:
+                    pass
             raise TransferError(_describe(exc)) from exc
 
     def upload(
-        self, local: str, remote: str, progress: ProgressCallback | None = None
+        self,
+        local: str,
+        remote: str,
+        progress: ProgressCallback | None = None,
+        *,
+        resume_from: int = 0,
     ) -> None:
         ftp = self._require()
         try:
             total = os.path.getsize(local)
         except OSError as exc:
             raise TransferError(_describe(exc)) from exc
-        transferred = 0
+        start = resume_from if resume_from > 0 and self._has_rest else 0
+        if start >= total:
+            return  # everything is already up there
+        transferred = start
 
         def sent(chunk: bytes) -> None:
             nonlocal transferred
@@ -320,7 +392,14 @@ class FTPFileSystem(RemoteFS):
 
         try:
             with open(local, "rb") as handle:
-                ftp.storbinary(f"STOR {remote}", handle, blocksize=CHUNK, callback=sent)
+                handle.seek(start)
+                ftp.storbinary(
+                    f"STOR {remote}",
+                    handle,
+                    blocksize=CHUNK,
+                    callback=sent,
+                    rest=start or None,
+                )
         except ftplib.all_errors as exc:
             raise TransferError(_describe(exc)) from exc
 

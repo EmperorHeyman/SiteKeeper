@@ -3,14 +3,24 @@
 Every FTP/SFTP call blocks on the network, so the file-manager tab owns one of
 these on its own QThread and talks to it exclusively through signals.
 
-Three separate channels keep the window responsive:
+Four separate channels keep the window responsive:
 
 * the **navigation** connection - the one this object owns - handles listings
-  and single operations, so browsing never waits behind anything,
+  and the operations that finish in a round trip or two, so browsing never
+  waits behind anything,
 * the **transfer pool** (see ``transfer/pool.py``) opens its own connections
-  for the queue, and
+  for the queue,
 * a **tools** connection runs the slow read-only jobs (comparisons, folder
-  statistics, searches) on a plain background thread.
+  statistics, searches) on a plain background thread, and
+* an **operations** connection runs the slow *writing* jobs - deleting a
+  tree, a recursive chmod, fetching a file to edit - one after another.
+
+The last of those is the newest and was the last thing still able to lock the
+window up. Deleting a folder is not one operation, it is one per file in it
+and one per directory, strictly in order because a directory cannot go until
+it is empty; on the navigation connection that meant the pane you were looking
+at stopped answering for as long as the tree took. Nothing that walks a tree
+belongs on the connection the panes browse with.
 
 That is why a comparison of ten thousand files does not freeze the pane you
 are looking at, and why a running queue does not stop you browsing.
@@ -21,12 +31,14 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from mysql_runner.storage.models import ConnectionKind
 from mysql_runner.transfer.base import RemoteFS, TransferError, Unsupported
+from mysql_runner.transfer import hostkeys
 from mysql_runner.transfer.history import HistoryStore
 from mysql_runner.transfer.ignore import IgnoreRules
 from mysql_runner.transfer.pool import (
@@ -37,9 +49,18 @@ from mysql_runner.transfer.pool import (
     expand_local,
     expand_remote,
 )
+from mysql_runner.transfer.removal import delete_paths
 
 #: Message used whenever an operation arrives before the connection is up.
 NOT_CONNECTED = "Not connected."
+
+#: Shortest gap between two status-line messages from one long operation.
+OPS_PROGRESS_INTERVAL = 0.3
+
+#: Shortest gap between two queue-stats updates while transfers are running.
+#: The panel's rate and time-remaining want refreshing often enough to look
+#: live and rarely enough that measuring them is free.
+STATS_INTERVAL = 0.4
 
 
 class ToolCancelled(Exception):
@@ -57,6 +78,17 @@ class ConnectionSpec:
     password: str
     private_key_path: str = ""
     passive: bool = True
+    #: SSH authentication beyond a password or a named key file.
+    use_agent: bool = True
+    use_default_keys: bool = False
+    #: What to do about a host key nobody has seen before. The application
+    #: asks; headless callers, which build their backends directly rather
+    #: than through a spec, record it and carry on.
+    host_key_mode: str = hostkeys.PROMPT
+    #: The bastion to reach this server through, already resolved from
+    #: whichever profile was named - a spec has to be plain data.
+    jump: object = None
+    proxy_command: str = ""
 
     def build(self) -> RemoteFS:
         """Instantiate the matching backend. Called on the worker thread."""
@@ -69,6 +101,11 @@ class ConnectionSpec:
                 self.username,
                 self.password,
                 private_key_path=self.private_key_path,
+                use_agent=self.use_agent,
+                use_default_keys=self.use_default_keys,
+                host_key_mode=self.host_key_mode,
+                jump=self.jump,
+                proxy_command=self.proxy_command,
             )
         from mysql_runner.transfer.ftp_client import FTPFileSystem
 
@@ -110,6 +147,10 @@ class TransferWorker(QObject):
     capabilities_ready = pyqtSignal(object)
     #: Connection could not be established (fatal for the tab).
     failed = pyqtSignal(str)
+    #: This server has never been connected to, so nothing has confirmed it is
+    #: the right one. Carries a hostkeys.HostKeyUnknown for the tab to put to
+    #: the user; answering yes and reconnecting is the whole of the flow.
+    host_key_unknown = pyqtSignal(object)
     #: A directory listing completed: (path, list[RemoteEntry]).
     listing = pyqtSignal(str, object)
     #: Internal: re-list a directory once the queue has drained. The pool
@@ -131,6 +172,13 @@ class TransferWorker(QObject):
     file_finished = pyqtSignal(str)
     #: The whole queue finished: (completed_count, failed_count, cancelled).
     queue_finished = pyqtSignal(int, int, bool)
+    #: One MCP-bridge operation finished: (request id, succeeded, message).
+    #: Deleting and creating a folder report through op_done/op_failed, which
+    #: carry no idea of *which* request they belong to - fine for a status
+    #: line, useless to a caller blocked on one particular answer while the
+    #: user is deleting something else in the same tab.
+    bridge_op = pyqtSignal(str, bool, str)
+
     #: One queue entry changed state (a TransferItem snapshot).
     queue_item = pyqtSignal(object)
     #: Queue totals, for the panel header.
@@ -173,8 +221,17 @@ class TransferWorker(QObject):
         self._tool_busy = ""
         self._browse_fs: RemoteFS | None = None
         self._browse_lock = threading.Lock()
+        self._ops_fs: RemoteFS | None = None
+        self._ops_lock = threading.Lock()
+        # Set by close_connection so a side channel still working
+        # closes its own session rather than being waited on.
+        self._channels_closing = False
         self._queue_totals = [0, 0, 0]  # queued, completed, failed
         self._last_listing = ""        # refreshed after a queue drains
+        # When the queue stats were last sent to the panel. Progress arrives
+        # thousands of times a second; the header showing a rate and a time
+        # remaining wants a few updates a second and no more.
+        self._stats_sent = 0.0
         # Queued explicitly: the emit comes from a pool thread and the
         # listing has to happen on the thread this object lives on.
         self._refresh_listing.connect(
@@ -199,6 +256,11 @@ class TransferWorker(QObject):
         try:
             fs = spec.build()
             banner = fs.connect()
+        except hostkeys.HostKeyUnknown as exc:
+            # Not a failure - a question. The tab asks it and, if the answer
+            # is yes, records the key and calls this again.
+            self.host_key_unknown.emit(exc)
+            return
         except TransferError as exc:
             self.failed.emit(str(exc))
             return
@@ -207,6 +269,7 @@ class TransferWorker(QObject):
             return
         self._fs = fs
         self._spec = spec
+        self._channels_closing = False
         self.connected.emit(banner)
         self.capabilities_ready.emit(fs.capabilities())
 
@@ -215,24 +278,43 @@ class TransferWorker(QObject):
         if self._pool is not None:
             self._pool.shutdown(wait=False)
             self._pool = None
-        with self._tool_lock:
-            if self._tool_fs is not None:
-                try:
-                    self._tool_fs.close()
-                except Exception:
-                    pass
-                self._tool_fs = None
-        with self._browse_lock:
-            if self._browse_fs is not None:
-                try:
-                    self._browse_fs.close()
-                except Exception:
-                    pass
-                self._browse_fs = None
+        # Tell the side channels to stop, then close whichever of them are
+        # idle. None of these waits: a comparison of a large site or an
+        # `rm -rf` of a big tree holds its lock for as long as the job takes,
+        # and closing a tab must not sit behind that - the tab teardown gives
+        # this three seconds before it abandons the thread, and the abandoned
+        # path then calls back in here from the GUI thread, which is the
+        # thread that must never block. A busy channel closes its own
+        # connection on the way out instead (see _run_ops and _run_tool).
+        self._channels_closing = True
+        self._close_channel(self._tool_lock, "_tool_fs")
+        self._close_channel(self._browse_lock, "_browse_fs")
+        self._close_channel(self._ops_lock, "_ops_fs")
         if self._fs is not None:
             self._fs.close()
             self._fs = None
         self.closed.emit()
+
+    def _close_channel(self, lock: threading.Lock, attribute: str) -> bool:
+        """Close one side channel if nothing is using it. Never waits."""
+        if not lock.acquire(blocking=False):
+            return False
+        try:
+            self._drop_channel(attribute)
+        finally:
+            lock.release()
+        return True
+
+    def _drop_channel(self, attribute: str) -> None:
+        """Close and forget one channel's session. The lock is already held."""
+        session = getattr(self, attribute, None)
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:
+            pass
+        setattr(self, attribute, None)
 
     @pyqtSlot()
     def request_home(self) -> None:
@@ -372,42 +454,150 @@ class TransferWorker(QObject):
         self.op_done.emit(f"Created {path}")
         self.list_dir(fs.parent(path))
 
-    @pyqtSlot(str, bool)
-    def delete_entry(self, path: str, is_dir: bool) -> None:
+    @pyqtSlot(object)
+    def delete_entries(self, entries: object) -> None:
+        """Delete a whole selection, then re-list the directory once.
+
+        Deleting used to arrive one path at a time, and each of those ended by
+        re-listing its parent - so a selection of thirty files cost thirty
+        deletes *and* thirty full directory listings, in order, on the
+        connection the panes browse with. The listings were most of the wait
+        and none of the work.
+
+        ``entries`` is a list of ``(path, is_dir)``. The caller has both in the
+        listing already, which saves a stat per entry; a symlinked directory
+        must arrive as ``is_dir=False`` so the link goes and not its target.
+        """
+        wanted = [
+            (str(path), bool(is_dir)) for path, is_dir in (entries or []) if path
+        ]
+        if not wanted:
+            return
         fs = self._fs
         if fs is None:
             self.op_failed.emit(NOT_CONNECTED)
             return
-        try:
-            if is_dir:
-                self._with_session(lambda fs: self._delete_tree(fs, path))
-            else:
-                self._with_session(lambda fs: fs.remove(path))
-        except TransferError as exc:
-            self.op_failed.emit(str(exc))
-            return
-        self.op_done.emit(f"Deleted {fs.basename(path)}")
-        self.list_dir(fs.parent(path))
+        showing = fs.parent(wanted[0][0])
+        total = len(wanted)
 
-    def _delete_tree(self, fs: RemoteFS, path: str) -> None:
-        """Remove a directory and everything in it.
+        def job(remote: RemoteFS) -> str:
+            removed, failures = delete_paths(
+                remote, wanted, on_progress=self._ops_ticker("Deleting")
+            )
+            for message in failures[:3]:
+                self.op_failed.emit(message)
+            if not removed:
+                return ""
+            if total == 1:
+                return f"Deleted {remote.basename(wanted[0][0])}"
+            kept = f", {len(failures)} kept" if failures else ""
+            return f"Deleted {removed} of {total} item(s){kept}"
 
-        rmdir only takes empty directories, so a folder with contents used to
-        fail with a bare "directory not empty". Children go first, deepest
-        last, and a symlinked directory is unlinked rather than followed.
+        self._run_ops("delete", job, refresh=showing)
+
+    @pyqtSlot(str, bool)
+    def delete_entry(self, path: str, is_dir: bool) -> None:
+        """One path, for callers that still have only one. See delete_entries."""
+        self.delete_entries([(path, is_dir)])
+
+    # ----- work submitted by the MCP bridge -------------------------------
+    # The same operations as above, answered to one caller rather than to the
+    # status line. They deliberately go through _ops_connection like every
+    # other operation, so a delete Claude asks for is a delete this tab made:
+    # journalled for Undo, and re-listed in the pane when it is done.
+    @pyqtSlot(str, object)
+    def bridge_delete(self, request_id: str, entries: object) -> None:
+        """Delete paths on behalf of the bridge and say what became of them.
+
+        ``is_dir`` may be None, which the file manager never sends because it
+        has the listing in front of it - the MCP server does not, and making
+        it open a connection purely to stat something it is about to hand over
+        would waste the round trip this whole bridge exists to save. Resolved
+        below on the connection that is about to do the deleting.
         """
-        try:
-            entries = fs.listdir(path)
-        except TransferError:
-            fs.rmdir(path)
+        raw = [(str(path), is_dir) for path, is_dir in (entries or []) if path]
+        if not raw:
+            self.bridge_op.emit(request_id, False, "nothing to delete")
             return
-        for entry in entries:
-            child = fs.join(path, entry.name)
-            if entry.is_dir and not entry.is_link:
-                self._delete_tree(fs, child)
-            else:
-                fs.remove(child)
-        fs.rmdir(path)
+        fs = self._fs
+        if fs is None:
+            self.bridge_op.emit(request_id, False, NOT_CONNECTED)
+            return
+        showing = fs.parent(raw[0][0])
+        total = len(raw)
+
+        def job(remote: RemoteFS) -> tuple[bool, str]:
+            wanted = []
+            for path, is_dir in raw:
+                if is_dir is None:
+                    info = remote.stat(path)
+                    # A symlinked directory has to go as the link it is, not
+                    # as the tree it points at - see delete_entries.
+                    is_dir = info.is_dir and not info.is_link
+                wanted.append((path, bool(is_dir)))
+            removed, failures = delete_paths(
+                remote, wanted, on_progress=self._ops_ticker("Deleting")
+            )
+            if failures:
+                detail = "; ".join(failures[:3])
+                if len(failures) > 3:
+                    detail += f"; and {len(failures) - 3} more"
+                return (removed > 0, f"Deleted {removed} of {total}: {detail}")
+            if total == 1:
+                return (True, f"Deleted {wanted[0][0]}")
+            return (True, f"Deleted {removed} item(s)")
+
+        self._run_bridge_op(request_id, "delete", job, refresh=showing)
+
+    @pyqtSlot(str, str)
+    def bridge_make_dir(self, request_id: str, path: str) -> None:
+        """Create a folder and its parents on behalf of the bridge."""
+        fs = self._fs
+        if fs is None:
+            self.bridge_op.emit(request_id, False, NOT_CONNECTED)
+            return
+        parent = fs.parent(path)
+
+        def job(remote: RemoteFS) -> tuple[bool, str]:
+            remote.makedirs(path)
+            return (True, f"Created {path} (and any missing parents)")
+
+        self._run_bridge_op(request_id, "mkdir", job, refresh=parent)
+
+    def _run_bridge_op(self, request_id: str, label: str, job, *, refresh: str = "") -> None:
+        """_run_ops, but the outcome goes to one waiting caller.
+
+        Every path out of here emits bridge_op exactly once, including the
+        failures: the caller is blocked on it, so a silent return would be a
+        caller waiting out its whole timeout for an answer that was decided
+        immediately.
+        """
+
+        def runner() -> None:
+            with self._ops_lock:
+                try:
+                    ok, message = job(self._ops_connection())
+                except Unsupported as exc:
+                    self.bridge_op.emit(request_id, False, str(exc))
+                    return
+                except (TransferError, OSError) as exc:
+                    self.bridge_op.emit(request_id, False, str(exc))
+                    return
+                except Exception as exc:
+                    self.bridge_op.emit(
+                        request_id, False, str(exc) or exc.__class__.__name__
+                    )
+                    return
+                finally:
+                    if self._channels_closing:
+                        self._drop_channel("_ops_fs")
+            self.bridge_op.emit(request_id, bool(ok), str(message))
+            if refresh:
+                self._refresh_listing.emit(refresh)
+
+        threading.Thread(
+            target=runner, name=f"bridge-{label}", daemon=True
+        ).start()
 
     @pyqtSlot(str, str)
     def rename_entry(self, source: str, target: str) -> None:
@@ -429,21 +619,29 @@ class TransferWorker(QObject):
         if fs is None:
             self.op_failed.emit(NOT_CONNECTED)
             return
-        try:
-            if recursive:
-                from mysql_runner.transfer.remote_exec import chmod_tree
-
-                chmod_tree(fs, path, mode, scope=scope)
-            else:
-                fs.chmod(path, mode)
-        except TransferError as exc:
-            self.op_failed.emit(str(exc))
-            return
         from mysql_runner.transfer.permissions import to_octal
 
-        suffix = " (recursively)" if recursive else ""
-        self.op_done.emit(f"{fs.basename(path)} is now {to_octal(mode)}{suffix}")
-        self.list_dir(fs.parent(path))
+        if not recursive:
+            # One round trip; it belongs where the click came from.
+            try:
+                self._with_session(lambda session: session.chmod(path, mode))
+            except TransferError as exc:
+                self.op_failed.emit(str(exc))
+                return
+            self.op_done.emit(f"{fs.basename(path)} is now {to_octal(mode)}")
+            self.list_dir(fs.parent(path))
+            return
+
+        parent = fs.parent(path)
+        name = fs.basename(path)
+
+        def job(remote: RemoteFS) -> str:
+            from mysql_runner.transfer.remote_exec import chmod_tree
+
+            chmod_tree(remote, path, mode, scope=scope)
+            return f"{name} is now {to_octal(mode)} (recursively)"
+
+        self._run_ops("chmod", job, refresh=parent)
 
     @pyqtSlot(str, str)
     def request_symlink(self, target: str, link_path: str) -> None:
@@ -515,21 +713,28 @@ class TransferWorker(QObject):
     def fetch_for_edit(self, remote: str, local: str) -> None:
         """Download one file so it can be edited locally.
 
-        Runs on the navigation connection - an edit begins from a click in the
-        listing, so the pane is idle at that moment anyway - and the tab keeps
-        watching the local copy afterwards to upload each save.
+        On the operations connection rather than the navigation one. "The pane
+        is idle at that moment anyway" was true of the click and not of the
+        download: open a 40 MB log to look at the end of it and browsing
+        stopped until the whole thing had come down. The tab keeps watching the
+        local copy afterwards to upload each save.
         """
         fs = self._fs
         if fs is None:
             self.op_failed.emit(NOT_CONNECTED)
             return
-        try:
-            os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
-            self._with_session(lambda fs: fs.download(remote, local))
-        except (TransferError, OSError) as exc:
-            self.op_failed.emit(f"{fs.basename(remote)}: {exc}")
-            return
-        self.edit_ready.emit(local, remote)
+        name = fs.basename(remote)
+
+        def job(session: RemoteFS) -> str:
+            try:
+                os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+                session.download(remote, local)
+            except (TransferError, OSError) as exc:
+                raise TransferError(f"{name}: {exc}") from exc
+            self.edit_ready.emit(local, remote)
+            return ""
+
+        self._run_ops("edit", job)
 
     @pyqtSlot(str)
     def request_undo(self, entry_id: str) -> None:
@@ -584,6 +789,18 @@ class TransferWorker(QObject):
 
     def _on_pool_progress(self, item) -> None:
         self.progress.emit(item.name, item.transferred, item.size)
+        # The panel's header carries a live rate and a time remaining, and
+        # nothing else on this path would ever refresh it: stats used to be
+        # sent only when the queue changed shape - a file finishing, a pause -
+        # so between two large files the figure simply stopped. Throttled,
+        # because this runs on every worker several times a second.
+        now = time.monotonic()
+        if now - self._stats_sent < STATS_INTERVAL:
+            return
+        self._stats_sent = now
+        pool = self._pool
+        if pool is not None:
+            self.queue_stats.emit(pool.stats())
 
     def _on_pool_idle(self, stats: dict) -> None:
         """The queue drained. Runs on whichever pool thread finished last.
@@ -711,13 +928,14 @@ class TransferWorker(QObject):
                 fs.makedirs(remote_dir)
             except TransferError:
                 pass  # a real problem surfaces when the first file lands
-        for path in directories:
-            try:
-                fs.mkdir(path)
-            except TransferError:
-                # Almost always "already exists", which is fine here. A real
-                # permission problem surfaces when the first file lands.
-                pass
+        # One call for every directory in the push, not one round trip each:
+        # where the account has a shell they go up in a single `mkdir -p`.
+        try:
+            fs.makedirs_many(directories)
+        except TransferError:
+            # Almost always "already exists", which is fine here. A real
+            # permission problem surfaces when the first file lands.
+            pass
         self._last_listing = remote_dir
         self._start_queue(pool, jobs, skipped, origin)
 
@@ -755,11 +973,10 @@ class TransferWorker(QObject):
                 fs.makedirs(remote_dir)
             except TransferError:
                 pass  # a real problem surfaces when the first file lands
-        for path in directories:
-            try:
-                fs.mkdir(path)
-            except TransferError:
-                pass
+        try:
+            fs.makedirs_many(directories)
+        except TransferError:
+            pass  # a real problem surfaces when the first file lands
         self._start_queue(pool, jobs, skipped, origin)
 
     @pyqtSlot(object, str, bool)
@@ -792,9 +1009,13 @@ class TransferWorker(QObject):
         self._cancelled = False
         jobs: list[TransferItem] = []
         skipped: list[str] = []
-        # One attempt per directory across the whole push. Sibling groups
-        # share every parent above them, and makedirs walks that chain.
-        made: set[str] = set()
+        # Every directory the whole push needs, collected before any of them
+        # is made. Sibling groups share every parent above them, so the set
+        # both removes the duplicates and lets the lot go up in one call -
+        # on a server with a shell, one `mkdir -p` for a site of two hundred
+        # folders instead of two hundred round trips taken in turn.
+        wanted: list[str] = []
+        seen: set[str] = set()
         for target, sources in groups:
             batch, directories, missed = expand_local(
                 fs, sources, target, rules=rules
@@ -804,20 +1025,15 @@ class TransferWorker(QObject):
             # A sync can aim files at a directory that does not exist yet -
             # a commit that adds a folder. The directory on show obviously
             # exists, so it is not paid for.
-            if target and target not in made and target != self._last_listing:
-                made.add(target)
-                try:
-                    fs.makedirs(target)
-                except TransferError:
-                    pass  # a real problem surfaces when the first file lands
-            for path in directories:
-                if path in made:
+            for path in [target, *directories]:
+                if not path or path in seen or path == self._last_listing:
                     continue
-                made.add(path)
-                try:
-                    fs.mkdir(path)
-                except TransferError:
-                    pass  # almost always "already exists"
+                seen.add(path)
+                wanted.append(path)
+        try:
+            fs.makedirs_many(wanted)
+        except TransferError:
+            pass  # a real problem surfaces when the first file lands
         if not quiet and remote_dir:
             # The base of the push, not whichever sub-directory happened to
             # go up last: that used to leave the pane inside an arbitrary
@@ -928,7 +1144,10 @@ class TransferWorker(QObject):
             return
         self._options = options.sane()
         if self._pool is not None:
-            self._pool.set_workers(self._options.workers)
+            # The whole set, not just the worker count: a speed limit reached
+            # for in the middle of a large upload is somebody asking for their
+            # link back now, not at the end of the queue.
+            self._pool.update_options(self._options)
 
     # ----- the folder picker's channel ------------------------------------
     # Deliberately neither the navigation session nor the tool channel. The
@@ -974,6 +1193,9 @@ class TransferWorker(QObject):
                         target, str(exc) or exc.__class__.__name__
                     )
                     return
+                if self._channels_closing:
+                    self._drop_channel("_browse_fs")
+                    return
             names = sorted(
                 (entry.name for entry in entries if entry.is_dir),
                 key=str.lower,
@@ -981,6 +1203,86 @@ class TransferWorker(QObject):
             self.folders_listed.emit(target, names)
 
         threading.Thread(target=runner, name="browse-folders", daemon=True).start()
+
+    # ----- operations (their own connection, one at a time) ---------------
+    # The write-side twin of the tool channel. Kept apart from it because the
+    # two must not block each other - a comparison of a large site can hold the
+    # tool connection for a minute, and "delete this folder" should not wait
+    # for it - and apart from the navigation connection because these jobs walk
+    # trees, which is exactly what browsing must never queue behind.
+    def _ops_connection(self) -> RemoteFS:
+        """The mutating jobs' own session. Call with ``_ops_lock`` held."""
+        if self._ops_fs is not None:
+            if self._ops_fs.alive():
+                return self._ops_fs
+            try:
+                self._ops_fs.close()
+            except Exception:
+                pass
+            self._ops_fs = None
+        spec = self._spec
+        if spec is None or self._channels_closing:
+            raise TransferError(NOT_CONNECTED)
+        self._ops_fs = spec.connected()
+        return self._ops_fs
+
+    def _run_ops(self, label: str, job, *, refresh: str = "") -> None:
+        """Run ``job(fs)`` off the worker thread and report what it returned.
+
+        Serialised rather than refused: two deletes in a row are a perfectly
+        ordinary thing to ask for, and the second one waiting a moment is a
+        better answer than "still busy with the previous job".
+
+        ``refresh`` names a directory to re-list afterwards - once, at the end,
+        which is the entire point. The listing is emitted rather than called,
+        because it has to happen on the thread that owns the navigation
+        connection and this is not that thread.
+        """
+
+        def runner() -> None:
+            message = ""
+            with self._ops_lock:
+                try:
+                    message = job(self._ops_connection())
+                except Unsupported as exc:
+                    self.op_failed.emit(str(exc))
+                    return
+                except (TransferError, OSError) as exc:
+                    self.op_failed.emit(str(exc))
+                    return
+                except Exception as exc:
+                    self.op_failed.emit(str(exc) or exc.__class__.__name__)
+                    return
+                finally:
+                    # close_connection will not wait for a job this long, so
+                    # the job is what closes the session it was using.
+                    if self._channels_closing:
+                        self._drop_channel("_ops_fs")
+            if message:
+                self.op_done.emit(str(message))
+            if refresh:
+                self._refresh_listing.emit(refresh)
+
+        threading.Thread(target=runner, name=f"ops-{label}", daemon=True).start()
+
+    def _ops_ticker(self, verb: str):
+        """A progress callback for an ops job, throttled to the status line.
+
+        A thousand-file delete would otherwise send a thousand messages to a
+        line that can show one, and every one of them crosses a thread.
+        """
+        state = {"last": 0.0}
+
+        def report(done: int, total: int, name: str) -> None:
+            if total <= 1:
+                return
+            now = time.monotonic()
+            if now - state["last"] < OPS_PROGRESS_INTERVAL:
+                return
+            state["last"] = now
+            self.op_done.emit(f"{verb} {done} of {total}: {name}")
+
+        return report
 
     # ----- tool jobs (their own connection, their own thread) -------------
     def _tool_connection(self) -> RemoteFS:
@@ -1030,6 +1332,11 @@ class TransferWorker(QObject):
                 self.tool_result.emit(kind, payload)
             finally:
                 self._tool_busy = ""
+                if self._channels_closing:
+                    # As in _run_ops: nobody is waiting on this channel's lock
+                    # any more, so the job closes its own session.
+                    with self._tool_lock:
+                        self._drop_channel("_tool_fs")
 
         threading.Thread(target=runner, name=f"tool-{kind}", daemon=True).start()
 
@@ -1145,43 +1452,33 @@ class TransferWorker(QObject):
     def delete_quietly(self, paths: object) -> None:
         """Delete remote paths without moving the pane the user is looking at.
 
-        :meth:`delete_entry` re-lists the parent of what it deleted, which is
+        :meth:`delete_entries` re-lists the parent of what it deleted, which is
         right for a deliberate delete and wrong for a background sync - it would
         yank the remote pane off to wherever the deleted file happened to live.
         This deletes the lot, then refreshes only the directory already on show.
         """
         if not isinstance(paths, list) or not paths:
             return
-        fs = self._ensure_session()
-        if fs is None:
+        if self._spec is None:
             self.op_failed.emit(NOT_CONNECTED)
             return
-        removed = 0
-        failed: list[str] = []
-        for path in paths:
-            try:
-                stat = fs.stat(path)
-            except TransferError:
-                continue  # already gone: the sync has nothing to do
-            try:
-                if stat.is_dir and not stat.is_link:
-                    self._delete_tree(fs, path)
-                else:
-                    fs.remove(path)
-            except TransferError as exc:
-                failed.append(f"{fs.basename(path)}: {exc}")
-                continue
-            removed += 1
-        if removed:
-            self.op_done.emit(f"Removed {removed} file(s) on the server")
-        for message in failed[:3]:
-            self.op_failed.emit(message)
-        showing = self._last_listing
-        if removed and showing:
-            try:
-                self.list_dir(showing)
-            except TransferError:
-                pass
+        wanted = [str(path) for path in paths if path]
+        if not wanted:
+            return
+
+        def job(remote: RemoteFS) -> str:
+            removed, failures = delete_paths(
+                remote, wanted, on_progress=self._ops_ticker("Removing")
+            )
+            for message in failures[:3]:
+                self.op_failed.emit(message)
+            if removed and self._last_listing:
+                # Only the directory already on show, and only when something
+                # actually went: a background sync must not move the pane.
+                self._refresh_listing.emit(self._last_listing)
+            return f"Removed {removed} file(s) on the server" if removed else ""
+
+        self._run_ops("sync-delete", job)
 
     @pyqtSlot(str)
     def request_digest(self, remote_path: str) -> None:

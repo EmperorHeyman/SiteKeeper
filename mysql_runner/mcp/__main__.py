@@ -2,10 +2,18 @@
 
 Register it with Claude Code from anywhere:
 
-    claude mcp add sitekeeper -- python -m mysql_runner.mcp --allow-write
+    claude mcp add sitekeeper -- python -m mysql_runner.mcp
 
-(or the equivalent block in Claude Desktop's config). Every permission is
-off until its flag grants it, so the default server can look but not touch.
+There is nothing else to put on that line. What Claude may do is decided in
+Sitekeeper's "Connect Claude" window and read from the app's own grants file
+on every tool call - see ``mcp/policy.py`` for why it moved off the command
+line, and ``mcp/tools.py`` for what each grant covers.
+
+The old ``--allow-*`` and ``--profiles`` flags are still accepted so that
+registrations written against earlier versions keep starting, but they no
+longer decide anything. Refusing to start on them would break every existing
+config on upgrade; acting on them would leave two places to look for the same
+answer, which is the problem being fixed.
 """
 
 from __future__ import annotations
@@ -13,8 +21,17 @@ from __future__ import annotations
 import argparse
 import sys
 
+from mysql_runner.mcp.policy import McpPolicy
 from mysql_runner.mcp.server import MCPServer
-from mysql_runner.mcp.tools import AppAccess, Policy
+from mysql_runner.mcp.tools import AppAccess
+
+#: Flags earlier versions took. Kept parseable, deliberately inert.
+LEGACY_FLAGS = (
+    "--allow-write",
+    "--allow-delete",
+    "--allow-sql-write",
+    "--allow-production",
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,47 +39,40 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m mysql_runner.mcp",
         description=(
             "MCP server exposing Sitekeeper's stored FTP/FTPS/SFTP and MySQL "
-            "profiles to Claude. Read-only unless flags below say otherwise."
+            "connections to Claude. What it may do is set in the app, under "
+            "Tools -> Connect Claude."
         ),
     )
-    parser.add_argument(
-        "--allow-write",
-        action="store_true",
-        help="allow uploads and creating remote directories",
-    )
-    parser.add_argument(
-        "--allow-delete",
-        action="store_true",
-        help="allow deleting remote files and directories",
-    )
-    parser.add_argument(
-        "--allow-sql-write",
-        action="store_true",
-        help="allow SQL statements that change data (default: SELECT-style only)",
-    )
-    parser.add_argument(
-        "--allow-production",
-        action="store_true",
-        help="let the flags above act on profiles marked PRODUCTION",
-    )
+    for flag in LEGACY_FLAGS:
+        parser.add_argument(
+            flag,
+            action="store_true",
+            help="accepted for compatibility and ignored; set this in the app",
+        )
     parser.add_argument(
         "--profiles",
         default="",
         metavar="LABELS",
-        help="comma-separated profile labels this server may use (default: all)",
+        help="accepted for compatibility and ignored; set this in the app",
     )
     args = parser.parse_args(argv)
-    policy = Policy(
-        allow_write=args.allow_write,
-        allow_delete=args.allow_delete,
-        allow_sql_write=args.allow_sql_write,
-        allow_production=args.allow_production,
-        profiles=tuple(
-            label.strip() for label in args.profiles.split(",") if label.strip()
-        ),
-    )
-    print(f"sitekeeper mcp: {policy.describe()}", file=sys.stderr)
-    MCPServer(AppAccess(policy)).serve()
+
+    # stdout is the protocol, so every word to a human goes to stderr. This
+    # one earns its place: somebody whose config still carries the flags is
+    # exactly the person about to wonder why they stopped mattering.
+    passed = [flag for flag in LEGACY_FLAGS if getattr(args, flag[2:].replace("-", "_"))]
+    if args.profiles:
+        passed.append("--profiles")
+    if passed:
+        print(
+            "sitekeeper mcp: ignoring "
+            + ", ".join(passed)
+            + " - permissions now come from the app (Tools -> Connect Claude), "
+            "so they are the same in every project and change without a restart.",
+            file=sys.stderr,
+        )
+    print(f"sitekeeper mcp: {McpPolicy.load().describe()}", file=sys.stderr)
+    MCPServer(AppAccess()).serve()
     return 0
 
 

@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "mysqlrunner"
-version = "1.8.2"
+version = "1.10.1"
 dependencies = [
  "rand",
  "serde",

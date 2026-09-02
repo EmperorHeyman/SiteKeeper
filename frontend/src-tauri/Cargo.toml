@@ -1,6 +1,6 @@
 [package]
 name = "mysqlrunner"
-version = "1.8.2"
+version = "1.10.1"
 description = "Sitekeeper desktop shell"
 authors = ["RAPL Group, s.r.o."]
 edition = "2021"

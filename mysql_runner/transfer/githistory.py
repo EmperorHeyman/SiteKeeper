@@ -145,6 +145,22 @@ def commit_log(
     return commits
 
 
+def commit_subject(repo: str, sha: str) -> str:
+    """The one-line message of one commit, or "" when git cannot say.
+
+    Cheap enough to ask for on every commit a watched folder sees: one
+    ``git log -1``, no diff and no tree walk. "" is not an error - a headline
+    without the subject is the behaviour there was before it could be had.
+    """
+    if not sha:
+        return ""
+    out = _run(repo, ["log", "-1", "--format=%s", sha], timeout=15.0)
+    if not out:
+        return ""
+    lines = out.decode("utf-8", errors="replace").splitlines()
+    return lines[0].strip() if lines else ""
+
+
 def commit_files(repo: str, sha: str) -> list[tuple[str, str]] | None:
     """(status, path) for everything one commit changed.
 

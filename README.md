@@ -119,6 +119,15 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
     below it), into the `.deployignore` your transfers actually read - and anything already
     watching re-reads it at once. `.gitignore` is never written to: what you deploy is not
     what git tracks.
+  - **Open in VS Code** - right-click a remote file and it comes down as a scratch copy,
+    opens in VS Code, and every save goes back to the server while the tab is open.
+    Right-click a remote *folder* on SFTP and VS Code opens it on the server itself over
+    Remote-SSH: nothing is downloaded, and its search, git and terminal are the server's.
+    VS Code makes that connection itself, so it asks for the key or password rather than
+    taking this app's; on a production connection Sitekeeper asks first, because from then
+    on the editor writes straight to the live box. Insiders, Cursor, VSCodium and Windsurf
+    work too (*Settings ▸ File transfer* picks between them), and the local pane has the
+    same entry beside *Open in Explorer*.
   - **Watch a folder** - the tab notices files as your editor saves them, and can upload each
     one straight away. A file is only sent once its size and timestamp have settled, so a
     half-written save never goes up.
@@ -173,7 +182,8 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
   place; content search via ripgrep or grep; an ncdu-style disk-usage view you can walk into;
   a `tail -f` log viewer with a filter; an embedded SSH shell that opens in the directory you
   are looking at (`Ctrl+T`); a one-command runner (`Ctrl+P`); a library of parameterised
-  snippets; and a button that hands the session to PuTTY, Windows Terminal, ssh.exe or WSL.
+  snippets; a button that hands the session to PuTTY, Windows Terminal, ssh.exe or WSL; and
+  one that hands the directory you are looking at to VS Code over Remote-SSH.
   The app probes once at connect time, so accounts that are SFTP-only simply do not show
   these buttons rather than failing when pressed.
 - **Adopt an existing WinSCP install** - File ▸ *Import from WinSCP or a URL list* finds your
@@ -255,27 +265,56 @@ to have the key sealed to your Windows account instead. Then:
 
 Sitekeeper ships an [MCP](https://modelcontextprotocol.io/) server, so Claude Code and
 Claude Desktop can browse, deploy to and query the same servers the app manages -
-against the same encrypted vault, with nothing re-configured. Register it once:
+against the same encrypted vault, with nothing re-configured. Register it once, with
+nothing on the line but the program:
 
 ```powershell
 cd mysql-runner
-claude mcp add sitekeeper -- python -m mysql_runner.mcp --allow-write
+claude mcp add sitekeeper -- python -m mysql_runner.mcp
 ```
 
 Claude then gets tools to list your profiles, read and list remote files, download,
 upload files and folders (`.deployignore`/`.gitignore` are honoured), and run MySQL
 queries with `mysql`-client-style output.
 
-**Everything is read-only until a flag grants more:**
+### What Claude may do is set in the app
 
-| Flag | Grants |
+Open **Tools → Connect Claude**. The ticks *are* the permission: they are read on every
+tool call, so they take effect at once, in every project, with nothing restarted.
+
+| Ticked | Grants |
 | --- | --- |
-| *(none)* | listings, file reads, downloads, `SELECT`-style SQL |
-| `--allow-write` | uploads and creating remote directories |
-| `--allow-delete` | deleting remote files and directories |
-| `--allow-sql-write` | SQL that changes data |
-| `--allow-production` | lets the flags above touch profiles marked **PROD** |
-| `--profiles "A,B"` | restricts the server to the named profiles |
+| *(nothing)* | listings, file reads, downloads, `SELECT`-style SQL |
+| Upload files and create folders | uploads and creating remote directories |
+| Delete files and folders | deleting remote files and directories |
+| Run SQL that changes data | anything past `SELECT`/`SHOW`/`DESCRIBE`/`EXPLAIN` |
+
+Connections marked **PROD** are granted one at a time, beside that connection, so
+deploying to one live site does not arm the rest. The same window limits which
+connections Claude can see at all.
+
+This used to be `--allow-*` flags on the registration. Those are still accepted and
+ignored, with a note on stderr, so existing registrations keep starting - but they no
+longer decide anything, and everything begins read-only until it is granted in the app.
+The flags were per-project (Claude Code keeps a config per folder, so the same server
+was read-only in one and could delete in another), invisible from the app, and
+changeable only by restarting the server.
+
+### Claude's work happens in the app
+
+While Sitekeeper is running, everything Claude does to a server is carried out by the
+tab that already holds that connection, over a loopback socket:
+
+- **uploads and downloads** become transfer-queue rows - cancellable, rate-limited, and
+  undoable with **Undo replace**;
+- **deletes** go through the tab that owns the shadow-backup journal, so they can be
+  restored from **History**;
+- **queries** run in the SQL console open on that connection, statement and output
+  landing in the transcript, marked as Claude's.
+
+Each call waits for the work to really finish, so Claude reports what happened rather
+than that it submitted something. With the app closed, or with no suitable tab open,
+the server does the work itself as before and says which of the two it did.
 
 The vault unlocks the way the app does: a password-free vault opens via Windows data
 protection, a password vault via the key cached at your last unlock (or the
@@ -322,7 +361,7 @@ installer once ended up wrapping a 1.1.0 exe.
 ```powershell
 .\build_release.ps1                  # -> dist_onefile_upx\Sitekeeper.exe + release\*.zip
 powershell -ExecutionPolicy Bypass -File installer\build.ps1
-                                     # -> installer\Sitekeeper-1.8.2-Setup.exe
+                                     # -> installer\Sitekeeper-1.10.1-Setup.exe
 ```
 
 It builds from the virtual environment at `%USERPROFILE%\.venvs\mysqlrunner`, which needs
@@ -386,6 +425,7 @@ mysql_runner/
   transfer/githistory.py         Reading the log, and a file as it was at a commit
   transfer/connstr.py            Connection strings and WinSCP.ini import/export
   transfer/spawn.py              PuTTY / Windows Terminal / ssh.exe launcher
+  transfer/editors.py            VS Code family: discovery, ssh-remote+ authority
   web/profile_factory.py         Isolated in-memory profile per tab
   web/browser_tab.py             QWebEngineView + auto-login + dark mode + startup SQL
   web/autologin.py               phpMyAdmin login / dark-mode / startup JavaScript

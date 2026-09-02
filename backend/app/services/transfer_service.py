@@ -26,6 +26,7 @@ from mysql_runner.storage.settings import Settings
 from mysql_runner.transfer.base import Capability, RemoteFS, TransferError
 from mysql_runner.transfer.history import HistoryStore
 from mysql_runner.transfer.ignore import IgnoreRules
+from mysql_runner.transfer.removal import delete_tree
 from mysql_runner.transfer.pool import (
     Overwrite,
     PoolEvents,
@@ -78,6 +79,7 @@ def _options_from_settings(settings: Settings) -> PoolOptions:
         keep_backups=settings.shadow_backups,
         overwrite=Overwrite.ALWAYS,
         verify=settings.verify_uploads,
+        rate_limit=max(0, settings.transfer_rate_kb) * 1024,
     ).sane()
 
 
@@ -231,7 +233,7 @@ class TransferSession:
         with self._lock:
             fs = self._require()
             if is_dir:
-                _delete_tree(fs, path)
+                delete_tree(fs, path)
             else:
                 fs.remove(path)
 
@@ -559,22 +561,6 @@ class TransferSession:
         with self._lock:
             fs = self._require()
             return store.undo(entry_id, fs)
-
-
-def _delete_tree(fs: RemoteFS, path: str) -> None:
-    """Remove a directory and everything in it (rmdir only takes empty ones)."""
-    try:
-        entries = fs.listdir(path)
-    except TransferError:
-        fs.rmdir(path)
-        return
-    for entry in entries:
-        child = fs.join(path, entry.name)
-        if entry.is_dir and not entry.is_link:
-            _delete_tree(fs, child)
-        else:
-            fs.remove(child)
-    fs.rmdir(path)
 
 
 def _common_parent(items: list[tuple[str, bool]]) -> str:
