@@ -28,6 +28,7 @@ ROOT = Path().resolve()
 hiddenimports = [
     # Loaded lazily, or by name, so static analysis cannot see them.
     "pymysql",
+    "pyodbc",
     "paramiko",
     "keyring",
     "keyring.backends.Windows",

@@ -5,7 +5,7 @@
 
   let { profile = null, defaultPorts = {}, onSave, onCancel } = $props()
 
-  const KINDS = ['phpmyadmin', 'mysql', 'sftp', 'ftp', 'ftps']
+  const KINDS = ['phpmyadmin', 'mysql', 'mssql', 'sftp', 'ftp', 'ftps']
 
   const BLANK = {
     label: '',
@@ -24,6 +24,10 @@
     local_dir: '',
     private_key_path: '',
     passive: true,
+    mssql_instance: '',
+    mssql_windows_auth: false,
+    mssql_encrypt: true,
+    mssql_trust_cert: true,
   }
 
   let form = $state({ ...BLANK })
@@ -37,6 +41,8 @@
 
   const isWeb = $derived(form.kind === 'phpmyadmin')
   const isMysql = $derived(form.kind === 'mysql')
+  const isMssql = $derived(form.kind === 'mssql')
+  const isSql = $derived(isMysql || isMssql)
   const isSftp = $derived(form.kind === 'sftp')
   const isFtp = $derived(form.kind === 'ftp' || form.kind === 'ftps')
   const isTransfer = $derived(isSftp || isFtp)
@@ -110,9 +116,27 @@
       </label>
     {/if}
 
-    {#if isMysql}
+    {#if isSql}
       <label class="wide">Database
         <input bind:value={form.database} placeholder="optional starting database" />
+      </label>
+    {/if}
+
+    {#if isMssql}
+      <label>Instance
+        <input bind:value={form.mssql_instance} placeholder="e.g. SQLEXPRESS" />
+      </label>
+      <label class="check wide">
+        <input type="checkbox" bind:checked={form.mssql_windows_auth} />
+        <span>Windows Authentication (log in as me)</span>
+      </label>
+      <label class="check wide">
+        <input type="checkbox" bind:checked={form.mssql_encrypt} />
+        <span>Encrypt the connection</span>
+      </label>
+      <label class="check wide">
+        <input type="checkbox" bind:checked={form.mssql_trust_cert} />
+        <span>Trust the server's certificate without checking who signed it</span>
       </label>
     {/if}
 
@@ -147,7 +171,7 @@
       </label>
     {/if}
 
-    {#if isWeb || isMysql}
+    {#if isWeb || isSql}
       <label class="wide">Startup SQL
         <textarea rows="3" bind:value={form.startup_script} placeholder="SET NAMES utf8;"
         ></textarea>

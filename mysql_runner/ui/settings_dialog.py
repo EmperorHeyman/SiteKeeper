@@ -28,7 +28,7 @@ from mysql_runner.storage.settings import (
 from mysql_runner.transfer import editors
 from mysql_runner.transfer import spawn
 
-# (label, minutes) — 0 means "never auto-lock".
+# (label, minutes) - 0 means "never auto-lock".
 _LOCK_CHOICES = [
     ("Never", 0),
     ("After 1 minute", 1),
@@ -40,7 +40,7 @@ _LOCK_CHOICES = [
 
 _PROTECTION_CHOICES = [
     ("Master password", vault_mod.PROTECTION_PASSWORD),
-    ("No password — tied to this Windows account", vault_mod.PROTECTION_WINDOWS),
+    ("No password - tied to this Windows account", vault_mod.PROTECTION_WINDOWS),
 ]
 
 #: Object name the application stylesheet renders as a grey note.
@@ -53,7 +53,7 @@ _PROTECTION_HINT = {
     ),
     vault_mod.PROTECTION_WINDOWS: (
         "No prompt, ever. Your saved connections stay encrypted, but the key is "
-        "sealed to this Windows user account — anyone who can log in as you (or "
+        "sealed to this Windows user account - anyone who can log in as you (or "
         "run code as you) can open them. Copies of the files are useless on "
         "another account or machine."
     ),
@@ -127,7 +127,7 @@ class SettingsDialog(QDialog):
 
         stay_hint = QLabel(
             "Keeps you signed in until you click “Lock” or quit. Your "
-            "connections stay encrypted — this just stops the app from "
+            "connections stay encrypted - this just stops the app from "
             "re-asking for the master password."
         )
         stay_hint.setWordWrap(True)

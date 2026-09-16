@@ -45,16 +45,21 @@ export async function openProfile(profile) {
     sessionId: null,
   }
 
-  if (profile.kind === 'mysql') {
+  if (profile.kind === 'mysql' || profile.kind === 'mssql') {
     const tab = adopt({ ...base, kind: 'sql' })
     try {
       const info = await sqlApi.open(profile.id)
       tab.sessionId = info.session_id
       tab.status = 'open'
+      tab.engine = info.engine
+      tab.prompt = info.prompt
+      // The server composes this now: it is the one that knows whether a
+      // connection id is called a session id, and what the server is.
       tab.banner =
+        info.banner ||
         `Connected to ${info.target} as ${profile.username}.\n` +
-        `Server version: ${info.server_version}   Connection id: ${info.connection_id}   ` +
-        `Database: ${info.database || '(none)'}`
+          `Server version: ${info.server_version}   Connection id: ${info.connection_id}   ` +
+          `Database: ${info.database || '(none)'}`
       tab.database = info.database
     } catch (error) {
       tab.status = 'failed'

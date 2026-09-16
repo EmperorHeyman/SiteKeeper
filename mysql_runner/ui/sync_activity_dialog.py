@@ -55,7 +55,7 @@ class SyncActivityDialog(QDialog):
         self, profile_label: str, *, dark: bool = False, parent=None
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Sync activity — {profile_label}")
+        self.setWindowTitle(f"Sync activity - {profile_label}")
         self.setModal(False)
         self.resize(760, 460)
         self._dark = dark
@@ -156,11 +156,11 @@ class SyncActivityDialog(QDialog):
         if row is None:
             return
         if item.state == JobState.FAILED:
-            text = f"failed — {item.error}" if item.error else "failed"
+            text = f"failed - {item.error}" if item.error else "failed"
         else:
             text = _STATE_TEXT.get(item.state, item.state.value)
             if item.state == JobState.SKIPPED and item.note:
-                text = f"skipped — {item.note}"
+                text = f"skipped - {item.note}"
         row.setText(2, text)
         row.setToolTip(2, item.error or item.note or "")
         colour = self._colour(item.state.value)

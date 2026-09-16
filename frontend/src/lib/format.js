@@ -33,6 +33,7 @@ export const ENV_COLOR = {
 export const KIND_LABEL = {
   phpmyadmin: 'phpMyAdmin',
   mysql: 'MySQL',
+  mssql: 'SQL Server',
   sftp: 'SFTP',
   ftp: 'FTP',
   ftps: 'FTPS',
@@ -41,6 +42,7 @@ export const KIND_LABEL = {
 export const KIND_BADGE = {
   phpmyadmin: 'pma',
   mysql: 'sql',
+  mssql: 'mssql',
   sftp: 'sftp',
   ftp: 'ftp',
   ftps: 'ftps',

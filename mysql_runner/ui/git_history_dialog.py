@@ -228,7 +228,7 @@ class GitHistoryDialog(QDialog):
         name = os.path.basename(self._repo.rstrip("\\/")) or self._repo
         target = self._remote or "the folder open on the right"
         self._heading.setText(
-            f"{name} — publishing goes to {target}, as the files were at the "
+            f"{name} - publishing goes to {target}, as the files were at the "
             "commit you pick. Your working copy is never touched."
         )
 

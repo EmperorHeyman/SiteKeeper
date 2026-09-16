@@ -3,6 +3,10 @@ PyQt6-WebEngine>=6.6
 cryptography>=42.0
 # Native MySQL connections for the SQL console tab.
 PyMySQL>=1.1
+# Microsoft SQL Server connections, through the ODBC driver SSMS installs.
+# Optional: without it the app starts and everything else works, and only
+# SQL Server console tabs say why they cannot connect.
+pyodbc>=5.1
 # SFTP for the file-manager tab (FTP/FTPS use the standard library).
 paramiko>=3.4
 # Optional: caches the vault key in Windows Credential Manager.

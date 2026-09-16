@@ -115,7 +115,7 @@ class CompareDialog(QDialog):
         if report is None:
             return
         self._summary.setText(
-            f"{report.summary()} — compared by {report.compared_by}."
+            f"{report.summary()} - compared by {report.compared_by}."
         )
         colours = theme.diff_colours(self._dark)
         for status, heading in _GROUPS:

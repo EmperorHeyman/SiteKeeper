@@ -1,4 +1,4 @@
-"""Native MySQL console endpoints."""
+"""Native SQL console endpoints: MySQL and Microsoft SQL Server."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ from pydantic import BaseModel
 
 from app.api.deps import require_unlocked, verify_token
 from app.services import mysql_service
+from mysql_runner.db import engines
 from mysql_runner.db.driver import MySQLUnavailable, describe_error, driver_available
+from mysql_runner.db.mssql_driver import MSSQLUnavailable
 from mysql_runner.db.sqlsplit import is_complete
-from mysql_runner.storage.models import ConnectionKind
 
 router = APIRouter(prefix="/sql", tags=["sql"], dependencies=[Depends(verify_token)])
 
@@ -25,11 +26,29 @@ class RunRequest(BaseModel):
 
 class CompleteRequest(BaseModel):
     text: str
+    #: Which dialect the text is in: "mysql" (the default) or "mssql".
+    engine: str = engines.MYSQL
 
 
 @router.get("/capabilities")
 def capabilities() -> dict:
-    return {"driver_available": driver_available()}
+    """Which servers this build can actually open a console on."""
+    return {
+        # The original key, kept as it was: it means MySQL.
+        "driver_available": driver_available(),
+        "engines": {
+            key: {
+                "name": engine.name,
+                "available": engine.available(),
+                "prompt": engine.prompt,
+                "problem": engine.missing_message(),
+            }
+            for key, engine in (
+                (engines.MYSQL, engines.engine(engines.MYSQL)),
+                (engines.MSSQL, engines.engine(engines.MSSQL)),
+            )
+        },
+    }
 
 
 @router.get("/sessions")
@@ -42,14 +61,14 @@ def open_session(request: OpenRequest, state=Depends(require_unlocked)) -> dict:
     profile = state.store().get(request.profile_id)
     if profile is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such server")
-    if profile.kind != ConnectionKind.MYSQL:
+    if not profile.kind.is_sql:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="this connection is not a MySQL console profile",
+            detail="this connection is not a SQL console profile",
         )
     try:
         info = mysql_service.manager.open(profile)
-    except MySQLUnavailable as exc:
+    except (MySQLUnavailable, MSSQLUnavailable) as exc:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc)
         ) from exc
@@ -77,7 +96,11 @@ def run(request: RunRequest) -> dict:
 @router.post("/complete")
 def complete(request: CompleteRequest) -> dict:
     """Whether buffered console input looks terminated (drives the -> prompt)."""
-    return {"complete": is_complete(request.text)}
+    return {
+        "complete": is_complete(
+            request.text, tsql=engines.engine(request.engine).tsql
+        )
+    }
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)

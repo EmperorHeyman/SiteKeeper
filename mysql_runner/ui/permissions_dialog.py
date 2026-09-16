@@ -43,7 +43,7 @@ class PermissionsDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Permissions — {name}")
+        self.setWindowTitle(f"Permissions - {name}")
         self.setModal(True)
         self._is_dir = is_dir
         self._mode = mode if mode is not None else perm.suggest(is_dir=is_dir)

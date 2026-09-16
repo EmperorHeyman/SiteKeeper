@@ -370,10 +370,10 @@ _kind_icon_cache: dict[tuple[str, bool, int], QIcon] = {}
 def kind_icon(kind: str, dark: bool, *, size: int = 16) -> QIcon:
     """The glyph for one connection kind, painted like every other icon.
 
-    ``phpmyadmin`` is a globe (it is a website), ``mysql`` a database
-    cylinder, ``ftp`` a pair of transfer arrows, and ``ftps``/``sftp`` the
-    same arrows carrying a green padlock - encryption being the difference
-    worth seeing at a glance.
+    ``phpmyadmin`` is a globe (it is a website), ``mysql`` and ``mssql`` a
+    database cylinder, ``ftp`` a pair of transfer arrows, and ``ftps``/
+    ``sftp`` the same arrows carrying a green padlock - encryption being the
+    difference worth seeing at a glance.
     """
     key = (kind, dark, size)
     cached = _kind_icon_cache.get(key)
@@ -389,7 +389,7 @@ def kind_icon(kind: str, dark: bool, *, size: int = 16) -> QIcon:
     colour = QColor(c.text_dim)
     if kind == "phpmyadmin":
         _paint_globe(painter, box, colour, scale)
-    elif kind == "mysql":
+    elif kind in ("mysql", "mssql"):
         _paint_database(painter, box, colour, scale)
     else:
         _paint_transfer(
@@ -617,6 +617,10 @@ QLabel#pill {{
 QLabel#pill[state="busy"] {{ color: {c.amber}; border-color: {c.amber}; }}
 QLabel#pill[state="ok"] {{ color: {c.green}; border-color: {c.green}; }}
 QLabel#pill[state="fail"] {{ color: {c.red}; border-color: {c.red}; }}
+/* A connection test's third answer: it connected, and something typed
+   alongside the credentials is wrong. Amber, the same as busy, because both
+   mean "not settled yet" and a fourth colour would be one nobody can read. */
+QLabel#pill[state="warn"] {{ color: {c.amber}; border-color: {c.amber}; }}
 
 /* ----- buttons -------------------------------------------------------- */
 QPushButton {{

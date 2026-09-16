@@ -1,4 +1,4 @@
-"""Native MySQL sessions for the console, without Qt.
+"""Native SQL sessions for the console, without Qt.
 
 The Qt build drove PyMySQL from a QObject worker on a QThread. The backend
 needs the same behaviour reachable over HTTP, so this keeps a dictionary of open
@@ -15,20 +15,16 @@ import threading
 import time
 import uuid
 
-from mysql_runner.db.driver import (
-    MAX_ROWS,
-    connect_kwargs,
-    database_from_use,
-    describe_error,
-    import_driver,
-)
+from mysql_runner.db import engines
+from mysql_runner.db.driver import MAX_ROWS
+from mysql_runner.db.engines import ConnectionParams, RawResult
 from mysql_runner.db.resultformat import (
     format_summary,
     format_table,
     format_vertical,
     render_value,
 )
-from mysql_runner.db.sqlsplit import Statement, split_statements
+from mysql_runner.db.sqlsplit import Statement
 from mysql_runner.storage.models import ServerProfile
 
 
@@ -37,10 +33,16 @@ class SessionNotFound(KeyError):
 
 
 class MySQLSession:
-    """One live PyMySQL connection plus the state the console needs."""
+    """One live database connection plus the state the console needs.
+
+    Named for MySQL because that is all it spoke when it was written; the
+    dialect now comes from the profile's engine, so the same session type
+    serves SQL Server too.
+    """
 
     def __init__(self, profile: ServerProfile) -> None:
         self.id = uuid.uuid4().hex
+        self.engine = engines.engine_for(profile.kind)
         self.profile_id = profile.id
         self.label = profile.label
         self.target = profile.describe_target()
@@ -49,30 +51,20 @@ class MySQLSession:
         self._lock = threading.Lock()
         self._conn = None
         self._server_version = "unknown"
-        self._thread_id: int | None = None
+        self._thread_id: str = ""
+        self._banner = ""
 
     # ----- lifecycle ------------------------------------------------------
     def open(self, profile: ServerProfile) -> dict:
-        pymysql = import_driver()
-        self._conn = pymysql.connect(
-            **connect_kwargs(
-                profile.host,
-                profile.effective_port,
-                profile.username,
-                profile.password,
-                profile.database,
-            )
-        )
-        try:
-            with self._conn.cursor() as cursor:
-                cursor.execute("SELECT VERSION()")
-                row = cursor.fetchone()
-                if row:
-                    self._server_version = str(row[0])
-            self._thread_id = self._conn.thread_id()
-        except Exception:
-            # A banner is cosmetic; never fail the connection over it.
-            pass
+        params = ConnectionParams.from_profile(profile)
+        self._conn = self.engine.connect(params)
+        version, connection_id, database = self.engine.server_facts(self._conn)
+        self._server_version = version or "unknown"
+        self._thread_id = connection_id
+        self.database = database or self.database
+        # Sent whole as well, so a client does not have to know that SQL
+        # Server calls a connection id a session id.
+        self._banner = self.engine.banner(self._conn, params)
         return self.info()
 
     def close(self) -> None:
@@ -95,6 +87,9 @@ class MySQLSession:
             "label": self.label,
             "target": self.target,
             "database": self.database,
+            "engine": self.engine.key,
+            "prompt": self.engine.prompt,
+            "banner": self._banner,
             "server_version": self._server_version,
             "connection_id": self._thread_id,
             "opened_at": self.opened_at,
@@ -113,68 +108,73 @@ class MySQLSession:
             ]
         results: list[dict] = []
         with self._lock:
-            for statement in split_statements(sql):
-                results.append(self._execute(statement))
+            for statement in self.engine.split(sql):
+                for _ in range(max(1, statement.repeat)):
+                    results.extend(self._execute(statement))
         return results
 
-    def _execute(self, statement: Statement) -> dict:
+    def _execute(self, statement: Statement) -> list[dict]:
+        """Run one statement. A list, because a T-SQL batch can return
+        several result sets and showing only the first would lose the rest.
+        """
         started = time.perf_counter()
         try:
-            with self._conn.cursor() as cursor:
-                cursor.execute(statement.sql)
-                elapsed = (time.perf_counter() - started) * 1000
-                if cursor.description:
-                    return self._result_set(cursor, statement, elapsed)
-                affected = cursor.rowcount
-                self._track_database(statement.sql)
-                summary = format_summary(affected, elapsed, False)
-                return {
+            raw = self.engine.execute(
+                self._conn, statement.sql, max_rows=MAX_ROWS
+            )
+        except Exception as exc:
+            elapsed = (time.perf_counter() - started) * 1000
+            message = self.engine.describe_error(exc)
+            return [
+                {
                     "statement": statement.sql,
                     "columns": [],
                     "rows": [],
-                    "rowcount": affected,
+                    "rowcount": 0,
                     "duration_ms": elapsed,
                     "truncated": False,
                     "vertical": statement.vertical,
-                    "text": summary,
-                    "summary": summary,
-                    "database": self.database,
+                    "error": message,
+                    "text": message,
                 }
-        except Exception as exc:
-            elapsed = (time.perf_counter() - started) * 1000
-            message = describe_error(exc)
+            ]
+        self._track_database(statement.sql)
+        return [self._rendered(result, statement) for result in raw]
+
+    def _rendered(self, result: RawResult, statement: Statement) -> dict:
+        if not result.is_result_set:
+            summary = format_summary(
+                result.rowcount, result.duration_ms, False
+            )
             return {
                 "statement": statement.sql,
                 "columns": [],
                 "rows": [],
-                "rowcount": 0,
-                "duration_ms": elapsed,
+                "rowcount": result.rowcount,
+                "duration_ms": result.duration_ms,
                 "truncated": False,
                 "vertical": statement.vertical,
-                "error": message,
-                "text": message,
+                "text": summary,
+                "summary": summary,
+                "database": self.database,
             }
-
-    def _result_set(self, cursor, statement: Statement, elapsed: float) -> dict:
-        columns = [str(col[0]) for col in cursor.description]
-        raw = cursor.fetchmany(MAX_ROWS)
-        truncated = len(raw) == MAX_ROWS and bool(cursor.fetchone())
-        tuples = [tuple(r) for r in raw]
         body = (
-            format_vertical(columns, tuples)
+            format_vertical(result.columns, result.rows)
             if statement.vertical
-            else format_table(columns, tuples)
+            else format_table(result.columns, result.rows)
         )
-        summary = format_summary(len(tuples), elapsed, True)
+        summary = format_summary(result.rowcount, result.duration_ms, True)
         return {
             "statement": statement.sql,
-            "columns": columns,
+            "columns": result.columns,
             # Rendered strings, so the UI can show a grid without re-deriving
-            # MySQL's own formatting for dates, NULL, TIME and binary columns.
-            "rows": [[render_value(value) for value in row] for row in tuples],
-            "rowcount": len(tuples),
-            "duration_ms": elapsed,
-            "truncated": truncated,
+            # the client's own formatting for dates, NULL, TIME and binary.
+            "rows": [
+                [render_value(value) for value in row] for row in result.rows
+            ],
+            "rowcount": result.rowcount,
+            "duration_ms": result.duration_ms,
+            "truncated": result.truncated,
             "vertical": statement.vertical,
             "text": f"{body}\n{summary}" if body else summary,
             "summary": summary,
@@ -182,7 +182,7 @@ class MySQLSession:
         }
 
     def _track_database(self, sql: str) -> None:
-        database = database_from_use(sql)
+        database = self.engine.database_from_use(sql)
         if database:
             self.database = database
 

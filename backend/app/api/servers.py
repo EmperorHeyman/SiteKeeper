@@ -67,6 +67,7 @@ def _serialize(profile: ServerProfile, *, reveal_password: bool = False) -> dict
     data["target"] = profile.describe_target()
     data["effective_port"] = profile.effective_port
     data["is_transfer"] = profile.kind.is_transfer
+    data["is_sql"] = profile.kind.is_sql
     if not reveal_password:
         # The list view never needs the secret; keep it out of the webview.
         data["password"] = ""

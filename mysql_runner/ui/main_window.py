@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import QSize, Qt, QUrl
+from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -43,9 +43,11 @@ from PyQt6.QtWidgets import (
 
 from mysql_runner import __version__
 from mysql_runner.crypto import vault as vault_mod
-from mysql_runner.db import mysql_client
+from mysql_runner import connectiontest
+from mysql_runner.db import engines
 from mysql_runner.runtime_mode import running_elevated
 from mysql_runner.storage.models import ConnectionKind, Environment, ServerProfile
+from mysql_runner.storage import provisioning
 from mysql_runner.storage.portable import PortableError, export_profiles, import_profiles
 from mysql_runner.storage.settings import MIN_SIDEBAR_WIDTH, Settings
 from mysql_runner.storage.store import ServerStore
@@ -58,13 +60,15 @@ from mysql_runner.ui.master_password_dialog import (
     CreateMasterPasswordDialog,
     UnlockDialog,
 )
+from mysql_runner.ui import provision_dialog
 from mysql_runner.ui.server_dialog import ServerDialog
 from mysql_runner.ui.settings_dialog import SettingsDialog
 from mysql_runner.ui.shell_target_dialog import ask_ssh_port
 from mysql_runner.ui import theme
 from mysql_runner.ui.sql_console_tab import SqlConsoleTab
+from mysql_runner.ui.testrunner import TestRunner
 from mysql_runner.ui.ssh_terminal_tab import SshTerminalTab
-from mysql_runner.transfer import sftp_client
+from mysql_runner.transfer import backends, sftp_client
 from mysql_runner.web.browser_tab import BrowserTab
 
 _NO_SELECTION = "No selection"
@@ -72,6 +76,11 @@ _NO_SELECTION = "No selection"
 #: Used when a bridge request asks for a command without saying how long it
 #: may take. The MCP server always says; a hand-written caller might not.
 DEFAULT_BRIDGE_EXEC_TIMEOUT = 120.0
+
+#: How long a console asked for over the bridge gets to connect before the
+#: caller is told it did not. Longer than a handshake, shorter than the
+#: bridge's own patience, so the answer is a reason and not a timeout.
+_CONSOLE_OPEN_TIMEOUT = 30.0
 
 #: The category a connection falls into when it has no group of its own.
 #: The sidebar used to file everything under one "Ungrouped" heading, which
@@ -81,6 +90,7 @@ DEFAULT_BRIDGE_EXEC_TIMEOUT = 120.0
 _DEFAULT_CATEGORIES = (
     ("phpMyAdmin", (ConnectionKind.PHPMYADMIN,)),
     ("MySQL", (ConnectionKind.MYSQL,)),
+    ("SQL Server", (ConnectionKind.MSSQL,)),
     (
         "Other (FTP/SFTP)",
         (ConnectionKind.FTP, ConnectionKind.FTPS, ConnectionKind.SFTP),
@@ -111,6 +121,7 @@ _ENV_COLORS = {
 
 _KIND_BADGES = {
     ConnectionKind.MYSQL: "sql",
+    ConnectionKind.MSSQL: "mssql",
     ConnectionKind.FTP: "ftp",
     ConnectionKind.FTPS: "ftps",
     ConnectionKind.SFTP: "sftp",
@@ -138,6 +149,13 @@ class MainWindow(QMainWindow):
         self._active_pane = 0
         #: Set by _start_bridge, at the very end of construction.
         self._bridge = None
+        #: Testing a connection from the list: the runner, which connection is
+        #: being tested, and whether a host key question has already been put
+        #: for this press.
+        self._tester = TestRunner(self)
+        self._tester.finished.connect(self._on_test_finished)
+        self._testing_profile = None
+        self._test_retried = False
         self.setWindowTitle("Sitekeeper")
         self._size_to_screen()
 
@@ -375,6 +393,11 @@ class MainWindow(QMainWindow):
         winscp_action.triggered.connect(self._on_import_winscp)
         paste_action = QAction("Add from a connection &string…", self)
         paste_action.triggered.connect(self._on_paste_connection)
+        provision_action = QAction("Add from a &hosting provider link…", self)
+        provision_action.setToolTip(
+            "Redeem a sitekeeper:// handover link, or a .skc file, from your host"
+        )
+        provision_action.triggered.connect(self._on_provision)
         winscp_export_action = QAction("Export &for WinSCP…", self)
         winscp_export_action.triggered.connect(self._on_export_winscp)
         settings_action = QAction("&Settings…", self)
@@ -390,6 +413,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(winscp_action)
         file_menu.addAction(paste_action)
+        file_menu.addAction(provision_action)
         file_menu.addAction(winscp_export_action)
         file_menu.addSeparator()
         file_menu.addAction(settings_action)
@@ -689,6 +713,11 @@ class MainWindow(QMainWindow):
         menu = QMenu(self._tree)
         connect = menu.addAction("Connect", self._on_connect)
         connect.setEnabled(profile is not None)
+        # Beside Connect, because it answers the question Connect asks: the
+        # two failures a saved connection has are "it is wrong" and "it is
+        # down", and opening a tab cannot tell them apart.
+        test = menu.addAction("Test connection", self._on_test_connection)
+        test.setEnabled(profile is not None)
         # A terminal without opening the file manager first. It is listed for
         # every transfer connection, FTP included: those borrow SSH on the
         # same host, which is asked about once and then remembered.
@@ -700,6 +729,7 @@ class MainWindow(QMainWindow):
         external.setEnabled(profile is not None and shellaccess.has_shell(profile))
         menu.addSeparator()
         menu.addAction("Add…", self._on_add)
+        menu.addAction("Add from a hosting provider…", self._on_provision)
         edit = menu.addAction("Edit…", self._on_edit)
         edit.setEnabled(profile is not None)
         duplicate = menu.addAction("Duplicate", self._on_duplicate)
@@ -710,6 +740,60 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction("Move to a group…", self._on_change_group)
         menu.exec(self._tree.viewport().mapToGlobal(position))
+
+    # ----- testing a saved connection -------------------------------------
+    def _on_test_connection(self) -> None:
+        """Dial the selected connection and report what answered.
+
+        The same test the Add/Edit dialog runs, on what is in the vault. Worth
+        having in both places: the dialog answers "did I type this right", and
+        this answers "is it still true", which is the question you have when a
+        site that worked last week does not.
+        """
+        profile = self._selected_profile()
+        if profile is None:
+            return
+        if self._tester.busy:
+            self.statusBar().showMessage(
+                "Still testing the last connection…", 4000
+            )
+            return
+        jump, complaint = self._jump_for(profile)
+        if complaint:
+            QMessageBox.warning(self, "Jump host missing", complaint)
+            return
+        self._testing_profile = profile
+        self.statusBar().showMessage(f"Testing {profile.label}…")
+        self._tester.start(profile, jump)
+
+    def _on_test_finished(self, result: object) -> None:
+        profile, self._testing_profile = self._testing_profile, None
+        if profile is None or not isinstance(result, connectiontest.TestResult):
+            return
+        unknown = result.host_key
+        if unknown is not None and not self._test_retried:
+            from mysql_runner.ui.host_key_dialog import ask
+
+            if ask(unknown, self):
+                self._test_retried = True
+                self._testing_profile = profile
+                jump, _complaint = self._jump_for(profile)
+                self._tester.start(profile, jump)
+                return
+        self._test_retried = False
+        self.statusBar().showMessage(f"{profile.label}: {result.summary}", 8000)
+        box = QMessageBox(self)
+        box.setWindowTitle(f"Test: {profile.label}")
+        box.setIcon(
+            QMessageBox.Icon.Information
+            if result.ok
+            else QMessageBox.Icon.Warning
+        )
+        box.setText(result.summary)
+        body = "\n".join(line for line in result.facts if line)
+        if body:
+            box.setInformativeText(body)
+        box.exec()
 
     def _on_duplicate(self) -> None:
         """Copy a connection, credentials and all, under a new name."""
@@ -920,6 +1004,66 @@ class MainWindow(QMainWindow):
         self._refresh_server_list()
         self.statusBar().showMessage(f"Added {profile.label}", 4000)
 
+    # ----- handover from a hosting provider ------------------------------
+    def _on_provision(self) -> None:
+        """Take a handover link (or .skc file) the user pastes in by hand.
+
+        The usual way in is the browser: a click in a hosting panel opens the
+        app on the link. This exists for the times that does not happen - a
+        panel that mails the link, a browser that has decided custom schemes
+        are suspicious, a machine where the scheme was never registered
+        because the app was unzipped rather than installed.
+        """
+        text, ok = QInputDialog.getText(
+            self,
+            "Add from a hosting provider",
+            "Paste the handover link your hosting provider gave you:",
+            QLineEdit.EchoMode.Normal,
+            "sitekeeper://provision/v1?src=panel.example.com&t=…",
+        )
+        if not ok or not text.strip():
+            return
+        candidate = text.strip()
+        if not provisioning.looks_like_claim(candidate):
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Open a handover file",
+                "",
+                f"Sitekeeper claim (*{provisioning.CLAIM_SUFFIX});;All files (*)",
+            )
+            if not path:
+                return
+            candidate = path
+        try:
+            claim = provisioning.load_claim(candidate)
+        except provisioning.ProvisioningError as exc:
+            QMessageBox.critical(self, "That link cannot be used", str(exc))
+            return
+        self.handle_claim(claim)
+
+    def handle_claim(self, claim: "provisioning.Claim") -> None:
+        """Run a handover to its end: ask, fetch, review, save.
+
+        Public because the claim usually arrives from outside the window - the
+        command line on a cold start, or the single-instance socket when the
+        app was already running.
+        """
+        self.raise_()
+        self.activateWindow()
+        offer = provision_dialog.ask(claim, self._settings.dark_mode, self)
+        if offer is None:
+            return
+        problems = provisioning.store_keys(offer)
+        count = self._store.add_many(offer.profiles)
+        self._refresh_server_list()
+        message = f"Added {count} connection(s) from {offer.issuer}."
+        if problems:
+            message += "\n\n" + "\n".join(problems[:5])
+        QMessageBox.information(self, "Connections added", message)
+        self.statusBar().showMessage(
+            f"Added {count} connection(s) from {offer.source}", 6000
+        )
+
     def _on_export_winscp(self) -> None:
         """Write the transfer connections out in WinSCP's own format."""
         profiles = [p for p in self._store.all() if p.kind.is_transfer]
@@ -932,7 +1076,7 @@ class MainWindow(QMainWindow):
             self,
             "Include passwords?",
             "Include the saved passwords?\n\nWinSCP stores them scrambled, not "
-            "encrypted — anyone with the file can read them back.",
+            "encrypted - anyone with the file can read them back.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) == QMessageBox.StandardButton.Yes
@@ -972,13 +1116,13 @@ class MainWindow(QMainWindow):
     def _build_tab(self, profile: ServerProfile) -> QWidget | None:
         """Create the right tab widget for this profile's kind."""
         dark = self._settings.dark_mode
-        if profile.kind == ConnectionKind.MYSQL:
-            if not mysql_client.driver_available():
+        if profile.kind.is_sql:
+            engine = engines.engine_for(profile.kind)
+            if not engine.available():
                 QMessageBox.critical(
                     self,
-                    "MySQL driver missing",
-                    "This build has no MySQL driver, so SQL console tabs cannot "
-                    "connect. Install PyMySQL and restart.",
+                    f"{engine.name} driver missing",
+                    engine.missing_message(),
                 )
                 return None
             return SqlConsoleTab(profile, dark_mode=dark)
@@ -1008,42 +1152,11 @@ class MainWindow(QMainWindow):
     def _jump_for(self, profile: ServerProfile):
         """Resolve the bastion a connection goes through: (jump, complaint).
 
-        A named jump host that has since been deleted or turned into something
-        that cannot forward is refused rather than ignored. Connecting straight
-        at a server somebody deliberately put behind a bastion is not a smaller
-        version of what they asked for - it is a different thing, and on a
-        private network it would only fail with a confusing timeout anyway.
-
-        One hop. Chains are not followed: the bastion is reached directly, even
-        if it names a jump host of its own.
+        The vault is the lookup; the rules are in transfer/backends.py, so the
+        Add/Edit dialog's Test button resolves a jump host the same way this
+        does rather than having its own opinion about deleted bastions.
         """
-        wanted = profile.jump_profile_id
-        if not wanted:
-            return None, ""
-        bastion = self._store.get(wanted)
-        if bastion is None:
-            return None, (
-                f"{profile.label} is set to connect through another saved "
-                "connection, but that connection no longer exists. Edit "
-                f"{profile.label} and pick a jump host, or clear the setting."
-            )
-        if bastion.kind != ConnectionKind.SFTP:
-            return None, (
-                f"{profile.label} is set to connect through {bastion.label}, "
-                f"which is a {bastion.kind.value} connection. Only SFTP "
-                "connections can forward for another."
-            )
-        from mysql_runner.transfer.sftp_client import JumpHost
-
-        return JumpHost(
-            host=bastion.host,
-            port=bastion.effective_port,
-            username=bastion.username,
-            password=bastion.password,
-            private_key_path=bastion.private_key_path,
-            use_agent=bastion.use_agent,
-            label=bastion.label,
-        ), ""
+        return backends.jump_for(profile, self._store.get)
 
     def _on_profile_changed(self, profile: object) -> None:
         """A tab changed something worth keeping - write it to the vault."""
@@ -1176,7 +1289,7 @@ class MainWindow(QMainWindow):
             settings=self._settings,
         )
         pane = self._pane()
-        index = pane.addTab(tab, f"{profile.label} — shell")
+        index = pane.addTab(tab, f"{profile.label} - shell")
         self._install_close_button(pane, index)
         self._style_tab(pane, index, profile)
         pane.setCurrentIndex(index)
@@ -1255,7 +1368,7 @@ class MainWindow(QMainWindow):
             pane.tabBar().setTabTextColor(index, color)
             pane.setTabText(index, f"● {pane.tabText(index)}")
             if profile.environment == Environment.PROD:
-                pane.setTabToolTip(index, "PRODUCTION — be careful!")
+                pane.setTabToolTip(index, "PRODUCTION - be careful!")
 
     def _update_tab_title(self, tab: QWidget, title: str) -> None:
         for pane, index, widget in self._all_tabs():
@@ -1511,7 +1624,7 @@ class MainWindow(QMainWindow):
             self,
             "Turn off password protection",
             "Your saved connections will stay encrypted, but the key will be "
-            "sealed to this Windows account instead of a password — anyone who "
+            "sealed to this Windows account instead of a password - anyone who "
             "can log in as you will be able to open them.\n\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -1649,6 +1762,9 @@ class MainWindow(QMainWindow):
         if request.op == "query":
             self._route_bridge_query(request)
             return
+        if request.op == "open_console":
+            self._open_bridge_console(request)
+            return
         if request.op not in ("upload", "download", "delete", "mkdir", "exec"):
             request.fail(
                 f"Sitekeeper does not handle {request.op!r} requests.",
@@ -1707,6 +1823,103 @@ class MainWindow(QMainWindow):
         if refusal:
             request.fail(refusal, unavailable=True)
 
+    def _open_bridge_console(self, request) -> None:
+        """Open a SQL console tab so Claude's queries can run in it.
+
+        Claude could already hand a query to a console that happened to be
+        open, and could open nothing itself - so whether its work showed up
+        in this window depended on what someone had clicked earlier. This
+        is the missing half: ask for the tab, and the answer comes back
+        once it has actually connected, because "opening" is not something
+        a caller can act on.
+        """
+        profile_id = str(request.payload.get("profile_id", ""))
+        existing = self._console_tab(profile_id)
+        if existing is not None:
+            self._focus_tab(existing)
+            request.finish(
+                {
+                    "ok": True,
+                    "detail": (
+                        f"A SQL console for {existing.server_profile.label} "
+                        "was already open; it is now the visible tab."
+                    ),
+                }
+            )
+            return
+        profile = self._store.get(profile_id)
+        if profile is None:
+            request.fail("no such connection in this vault", unavailable=True)
+            return
+        if not profile.kind.is_sql:
+            request.fail(
+                f"{profile.label} is a {profile.kind.value} connection, "
+                "which has no SQL console",
+                unavailable=True,
+            )
+            return
+        self._open_tab(profile)
+        tab = self._tab_of_kind(profile.id, SqlConsoleTab)
+        if tab is None:
+            request.fail(
+                "the console tab could not be created - the driver for "
+                "that server is probably missing from this build",
+                unavailable=True,
+            )
+            return
+        self._await_console(request, tab, profile)
+
+    def _await_console(self, request, tab, profile, waited: float = 0.0) -> None:
+        """Answer once the new tab has connected, or given up trying.
+
+        Polled rather than wired to a signal because a failed connection
+        emits a different one from a successful one, and both end the wait:
+        what the caller needs to know is whether there is now a console to
+        run things in, not which way it got there.
+        """
+        if tab.is_connected:
+            request.finish(
+                {
+                    "ok": True,
+                    "detail": (
+                        f"Opened a SQL console on {profile.label} "
+                        f"({profile.describe_target()}). Queries for this "
+                        "connection now run in it and appear in its "
+                        "transcript."
+                    ),
+                }
+            )
+            return
+        if waited >= _CONSOLE_OPEN_TIMEOUT:
+            request.fail(
+                f"the console for {profile.label} did not connect: "
+                + (tab.last_error or "no reason was given"),
+                unavailable=True,
+            )
+            return
+        step = 0.25
+        QTimer.singleShot(
+            int(step * 1000),
+            lambda: self._await_console(request, tab, profile, waited + step),
+        )
+
+    def _focus_tab(self, widget) -> None:
+        """Bring an already-open tab to the front of its pane."""
+        for pane, index, candidate in self._all_tabs():
+            if candidate is widget:
+                pane.setCurrentIndex(index)
+                return
+
+    def _tab_of_kind(self, profile_id: str, kind):
+        """Any open tab of ``kind`` on this connection, connected or not."""
+        for _pane, _index, widget in self._all_tabs():
+            profile = getattr(widget, "_profile", None)
+            if isinstance(widget, kind) and profile is not None and (
+                profile.id == profile_id
+            ):
+                return widget
+        return None
+
     def _route_bridge_query(self, request) -> None:
         """Run one statement in the SQL console open on that connection."""
         console = self._console_tab(str(request.payload.get("profile_id", "")))
@@ -1757,6 +1970,7 @@ class MainWindow(QMainWindow):
         """Stop worker threads before the window goes away."""
         if self._bridge is not None:
             self._bridge.stop()
+        self._tester.stop()
         for pane in self._panes:
             for index in reversed(range(pane.count())):
                 widget = pane.widget(index)
@@ -1781,7 +1995,7 @@ def _startup_message() -> str:
     if not running_elevated():
         return "Ready"
     return (
-        "Ready — but Sitekeeper is running as administrator, so Windows hides "
+        "Ready - but Sitekeeper is running as administrator, so Windows hides "
         "mapped network drives (Z:, Y:…) from it. Start it normally to browse "
         "them, or use \\\\server\\share paths."
     )

@@ -50,7 +50,14 @@ from dataclasses import replace
 
 from mysql_runner.mcp.policy import LivePolicy, McpPolicy
 from mysql_runner.storage.models import ConnectionKind, Environment, ServerProfile
-from mysql_runner.transfer import bridge, longlist, remote_exec, shellaccess
+from mysql_runner.transfer import (
+    backends,
+    bridge,
+    hostkeys,
+    longlist,
+    remote_exec,
+    shellaccess,
+)
 from mysql_runner.transfer.base import (
     Capability,
     RemoteFS,
@@ -239,28 +246,12 @@ class AppAccess:
 
     @staticmethod
     def _build(profile: ServerProfile) -> RemoteFS:
-        # The same wiring as the app's ConnectionSpec, which lives next to Qt
-        # and therefore cannot be imported here.
-        if profile.kind == ConnectionKind.SFTP:
-            from mysql_runner.transfer.sftp_client import SFTPFileSystem
-
-            return SFTPFileSystem(
-                profile.host,
-                profile.effective_port,
-                profile.username,
-                profile.password,
-                private_key_path=profile.private_key_path,
-            )
-        from mysql_runner.transfer.ftp_client import FTPFileSystem
-
-        return FTPFileSystem(
-            profile.host,
-            profile.effective_port,
-            profile.username,
-            profile.password,
-            use_tls=profile.kind == ConnectionKind.FTPS,
-            passive=profile.passive,
-        )
+        # The same wiring the app uses, from the module both share. AUTO
+        # because there is nobody here to show a fingerprint to: a server
+        # this process has never seen is recorded and connected to, which
+        # is the documented behaviour for a headless caller and the reason
+        # the policy is an argument rather than a default.
+        return backends.for_profile(profile, host_key_mode=hostkeys.AUTO)
 
     def close(self) -> None:
         for fs in self._remotes.values():
@@ -394,6 +385,9 @@ def _hand_op(profile, op: str, **fields) -> str | None:
     if op == "query":
         # The output is the answer; the note says where it ran.
         return f"{detail}\n\n(run in Sitekeeper's SQL console for {profile.label})"
+    if op == "open_console":
+        # Nothing happened on the server; the detail is the whole answer.
+        return detail
     return f"{detail} (through Sitekeeper, so it is in this tab's history)"
 
 
@@ -537,7 +531,7 @@ def list_profiles(access: AppAccess, _args: dict) -> str:
         # saying so about here rather than only when a write is refused.
         if p.environment == Environment.PROD and not policy.allows_production(p):
             env += " (read-only: production not granted)"
-        lines.append(f"- {p.label} — {p.kind.value} {p.describe_target()}{env}")
+        lines.append(f"- {p.label} - {p.kind.value} {p.describe_target()}{env}")
         warning = label_mismatch(p)
         if warning:
             lines.append(f"  ⚠ {warning}")
@@ -596,7 +590,7 @@ def list_remote_dir(access: AppAccess, args: dict) -> str:
     if depth > 1:
         return _list_tree(fs, path, depth, detail)
     entries = _detailed(fs, path, detail)
-    lines = [f"{path} — {len(entries)} entr(y/ies):", _listing_header(entries)]
+    lines = [f"{path} - {len(entries)} entr(y/ies):", _listing_header(entries)]
     lines += [_listing_row(entry) for entry in entries[:MAX_LISTING_ROWS]]
     if len(entries) > MAX_LISTING_ROWS:
         lines.append(f"… and {len(entries) - MAX_LISTING_ROWS} more, not listed")
@@ -677,9 +671,9 @@ def _list_tree(fs: RemoteFS, root: str, depth: int, detail: bool) -> str:
         try:
             entries = _detailed(fs, current, detail)
         except TransferError as exc:
-            lines.append(f"{current} — not listed: {exc}")
+            lines.append(f"{current} - not listed: {exc}")
             continue
-        lines.append(f"{current} — {len(entries)} entr(y/ies):")
+        lines.append(f"{current} - {len(entries)} entr(y/ies):")
         lines += [_listing_row(entry) for entry in entries[:MAX_LISTING_ROWS]]
         if len(entries) > MAX_LISTING_ROWS:
             lines.append(f"… and {len(entries) - MAX_LISTING_ROWS} more, not listed")
@@ -1308,7 +1302,7 @@ def _access_lines(path: str, facts: dict, user) -> list[str]:
             "x",
         ))
     )
-    lines.append(f"  {user.name}: {verdict} — it {why}")
+    lines.append(f"  {user.name}: {verdict} - it {why}")
 
     blocked = _blocked_ancestor(path, facts, user)
     if blocked:
@@ -1846,17 +1840,93 @@ def _exec_timeout(value: object) -> float:
     return min(wanted, MAX_EXEC_TIMEOUT)
 
 
+def test_connection(access: AppAccess, args: dict) -> str:
+    """Dial a connection and report what answered, without using it.
+
+    The read-only diagnostic. "It does not work" arrives as often as any
+    request here, and every tool that could investigate it has to open the
+    connection first - so the failure comes back wearing the name of whatever
+    was being attempted rather than its own. This connects, reports, and
+    disconnects: the host, the login, the certificate, the start folder and
+    the database are each either proven or named as the thing that is not.
+
+    Needs no grant beyond the connection being in scope. It changes nothing:
+    no file is written, no statement is run, and an SSH server this machine
+    has never confirmed is reported rather than trusted.
+    """
+    from mysql_runner import connectiontest
+
+    profile = access.profile(str(args.get("profile", "")))
+    # Through the bastion if there is one. A test that quietly went direct
+    # would fail on a private network for a reason that is not the one it
+    # would report, which is worse than not testing at all.
+    jump, complaint = backends.jump_for(
+        profile, lambda wanted: access.store().get(wanted)
+    )
+    if complaint:
+        raise ToolError(complaint)
+    result = connectiontest.run(
+        profile, jump=jump, host_key_mode=hostkeys.PROMPT
+    )
+    verdict = {
+        connectiontest.OK: "WORKS",
+        connectiontest.WARN: "PARTLY",
+        connectiontest.FAIL: "FAILED",
+    }.get(result.state, "FAILED")
+    lines = [f"{verdict}: {profile.label} - {result.summary}"]
+    lines += [f"  {fact}" for fact in result.facts if fact]
+    if result.host_key is not None:
+        lines.append(
+            "  Confirm this server's fingerprint in Sitekeeper once (open "
+            "the connection, or right-click it and choose Test connection); "
+            "recording it is a decision for the person at the machine."
+        )
+    return "\n".join(lines)
+
+
+def open_console(access: AppAccess, args: dict) -> str:
+    """Ask the running app to open a SQL console on a connection.
+
+    Without this, whether a query Claude runs appears in Sitekeeper depended
+    on whether someone had happened to open that tab first: with a console
+    open, run_query goes through it and lands in the transcript; with none,
+    the MCP process opens a connection of its own and the window shows
+    nothing. Opening the tab is now something the caller can ask for, which
+    makes "run this where I can see it" a thing it can arrange rather than a
+    thing it can only hope for.
+
+    Read-only as far as the database is concerned - connecting is not
+    changing anything - so it needs no grant beyond the connection being in
+    scope at all. It does need Sitekeeper to be running: there is no window
+    to open a tab in otherwise.
+    """
+    profile = access.profile(str(args.get("profile", "")))
+    if not profile.kind.is_sql:
+        raise ToolError(
+            f"{profile.label} is a {profile.kind.value} connection, which "
+            "has no SQL console. Name a MySQL or SQL Server profile."
+        )
+    handed = _hand_op(profile, "open_console")
+    if handed is None:
+        raise ToolError(
+            "Sitekeeper is not running, so there is no window to open a "
+            "console in. run_query still works without it - it opens a "
+            "connection of its own - but nothing will appear in the app."
+        )
+    return handed
+
+
 def run_query(access: AppAccess, args: dict) -> str:
-    from mysql_runner.db.driver import connect_kwargs, describe_error, import_driver
-    from mysql_runner.db.resultformat import format_summary, format_table
-    from mysql_runner.db.sqlsplit import split_statements
+    from mysql_runner.db import engines
+    from mysql_runner.db.engines import ConnectionParams
 
     profile = access.profile(str(args.get("profile", "")))
     via = str(args.get("via", "")).strip()
     sql = str(args.get("sql", "")).strip()
     if not sql:
         raise ToolError("Say what to run (sql).")
-    statements = split_statements(sql)
+    engine = engines.engine_for(profile.kind)
+    statements = engine.split(sql)
     if not statements:
         raise ToolError("No statement found in that SQL.")
     writes = [
@@ -1865,19 +1935,22 @@ def run_query(access: AppAccess, args: dict) -> str:
     ]
     if via:
         return _query_through_server(access, profile, via, sql, bool(writes), args)
-    if profile.kind != ConnectionKind.MYSQL:
-        mysql_labels = [
-            p.label for p in access.profiles() if p.kind == ConnectionKind.MYSQL
+    if not profile.kind.is_sql:
+        sql_labels = [
+            f"{p.label} ({p.kind.value})"
+            for p in access.profiles()
+            if p.kind.is_sql
         ]
         raise ToolError(
             f"{profile.label} is a {profile.kind.value} profile, so there is "
-            "no database connection to open. Either name a native MySQL "
-            "profile, or pass 'via' with an SFTP/FTP profile on the same "
-            "server and the query will run through that server's own mysql "
-            "client using these credentials - which is the way in when the "
-            "database only listens on localhost, as a shared host's does. "
-            + (f"MySQL profiles available: {', '.join(mysql_labels)}." if mysql_labels
-               else "No MySQL profiles are stored.")
+            "no database connection to open. Either name a native MySQL or "
+            "SQL Server profile, or pass 'via' with an SFTP/FTP profile on "
+            "the same server and the query will run through that server's "
+            "own command-line client using these credentials - which is the "
+            "way in when the database only listens on localhost, as a shared "
+            "host's does. "
+            + (f"Database profiles available: {', '.join(sql_labels)}."
+               if sql_labels else "No database profiles are stored.")
         )
     if writes:
         access.guard(profile, "SQL that changes data", "allow_sql_write")
@@ -1889,40 +1962,24 @@ def run_query(access: AppAccess, args: dict) -> str:
         handed = _hand_op(profile, "query", sql=sql)
         if handed is not None:
             return handed
-    database = database or profile.database
-    pymysql = import_driver()
-    try:
-        connection = pymysql.connect(
-            **connect_kwargs(
-                profile.host, profile.effective_port, profile.username,
-                profile.password, database,
-            )
+    if not engine.available():
+        raise ToolError(
+            engine.missing_message()
+            or f"No {engine.name} driver is available in this build."
         )
+    params = ConnectionParams.from_profile(
+        profile, database=database or profile.database
+    )
+    try:
+        connection = engine.connect(params)
     except Exception as exc:
-        raise ToolError(describe_error(exc)) from exc
-    import time as _time
+        raise ToolError(engine.describe_error(exc)) from exc
 
     blocks: list[str] = []
     try:
         for statement in statements:
-            started = _time.perf_counter()
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(statement.sql)
-                    elapsed = (_time.perf_counter() - started) * 1000
-                    if cursor.description:
-                        columns = [str(col[0]) for col in cursor.description]
-                        rows = cursor.fetchmany(MAX_RESULT_ROWS)
-                        more = bool(cursor.fetchone())
-                        block = format_table(columns, [tuple(r) for r in rows])
-                        block += "\n" + format_summary(len(rows), elapsed, True)
-                        if more:
-                            block += f"\n(only the first {MAX_RESULT_ROWS} rows are shown)"
-                    else:
-                        block = format_summary(cursor.rowcount, elapsed, False)
-            except Exception as exc:
-                block = f"{describe_error(exc)}"
-            blocks.append(f"mysql> {statement.sql.strip()}\n{block}")
+            for _ in range(max(1, statement.repeat)):
+                blocks.extend(_query_blocks(engine, connection, statement))
     finally:
         try:
             connection.close()
@@ -1931,10 +1988,39 @@ def run_query(access: AppAccess, args: dict) -> str:
     return "\n\n".join(blocks)
 
 
+def _query_blocks(engine, connection, statement) -> list[str]:
+    """One statement's output, as the mysql client would have printed it.
+
+    A list because one T-SQL batch can return several result sets, and an
+    answer that showed the first and dropped the rest would be wrong in a way
+    nobody could see.
+    """
+    from mysql_runner.db.resultformat import format_summary, format_table
+
+    prompt = engine.prompt
+    try:
+        results = engine.execute(connection, statement.sql, max_rows=MAX_RESULT_ROWS + 1)
+    except Exception as exc:
+        return [f"{prompt}{statement.sql.strip()}\n{engine.describe_error(exc)}"]
+    blocks = []
+    for result in results:
+        if result.is_result_set:
+            rows = result.rows[:MAX_RESULT_ROWS]
+            more = result.truncated or len(result.rows) > MAX_RESULT_ROWS
+            block = format_table(result.columns, rows)
+            block += "\n" + format_summary(len(rows), result.duration_ms, True)
+            if more:
+                block += f"\n(only the first {MAX_RESULT_ROWS} rows are shown)"
+        else:
+            block = format_summary(result.rowcount, result.duration_ms, False)
+        blocks.append(f"{prompt}{statement.sql.strip()}\n{block}")
+    return blocks
+
+
 def _query_through_server(
     access: AppAccess, profile, via: str, sql: str, writes: bool, args: dict
 ) -> str:
-    """Run SQL with the server's own mysql client, over its shell.
+    """Run SQL with the server's own command-line client, over its shell.
 
     This is the way into a database that only listens on localhost, which is
     every shared host: the credentials are in the vault - a phpMyAdmin
@@ -1957,33 +2043,59 @@ def _query_through_server(
     if writes:
         access.guard(profile, "SQL that changes data", "allow_sql_write")
     user = profile.username
+    mssql = profile.kind == ConnectionKind.MSSQL
+    client = "sqlcmd" if mssql else "mysql"
     if not user:
         raise ToolError(
             f"{profile.label} has no username saved, so there is nothing to "
-            "log in to MySQL with."
+            f"log in to {'SQL Server' if mssql else 'MySQL'} with."
         )
     database = str(args.get("database", "")).strip() or profile.database
     host = str(args.get("db_host", "")).strip()
     if not host:
-        # A MySQL profile names its host, and from the server that name may
-        # well resolve to something internal. A phpMyAdmin profile names a
-        # web address, which is not a database host - from the server itself
-        # the answer is almost always localhost.
-        host = profile.host if profile.kind == ConnectionKind.MYSQL else "localhost"
+        # A MySQL or SQL Server profile names its host, and from the server
+        # that name may well resolve to something internal. A phpMyAdmin
+        # profile names a web address, which is not a database host - from
+        # the server itself the answer is almost always localhost.
+        host = profile.host if profile.kind.is_sql else "localhost"
     quote = remote_exec.quote
-    parts = [
-        f"MYSQL_PWD={quote(profile.password)}",
-        "mysql",
-        f"--host={quote(host)}",
-        f"--user={quote(user)}",
-        "--batch",
-        "--table",
-    ]
-    if profile.kind == ConnectionKind.MYSQL and profile.effective_port:
-        parts.append(f"--port={profile.effective_port}")
-    if database:
-        parts.append(f"--database={quote(database)}")
-    parts.append(f"--execute={quote(sql)}")
+    if mssql:
+        # SQLCMDPASSWORD rather than -P for the same reason MySQL gets
+        # MYSQL_PWD: an argument is visible to every other process on that
+        # machine for as long as the query runs, and an environment variable
+        # is not.
+        target = host
+        if profile.mssql_instance:
+            target += "\\" + profile.mssql_instance
+        elif profile.effective_port:
+            target += f",{profile.effective_port}"
+        parts = [
+            f"SQLCMDPASSWORD={quote(profile.password)}",
+            "sqlcmd",
+            "-S", quote(target),
+            "-U", quote(user),
+            # -b makes a failed statement a non-zero exit, -C trusts a
+            # self-signed certificate the way the console does, and -W trims
+            # the padding sqlcmd would otherwise put on every column.
+            "-b", "-C", "-W",
+        ]
+        if database:
+            parts += ["-d", quote(database)]
+        parts += ["-Q", quote(sql)]
+    else:
+        parts = [
+            f"MYSQL_PWD={quote(profile.password)}",
+            "mysql",
+            f"--host={quote(host)}",
+            f"--user={quote(user)}",
+            "--batch",
+            "--table",
+        ]
+        if profile.kind == ConnectionKind.MYSQL and profile.effective_port:
+            parts.append(f"--port={profile.effective_port}")
+        if database:
+            parts.append(f"--database={quote(database)}")
+        parts.append(f"--execute={quote(sql)}")
     try:
         result = remote_exec.run(fs, " ".join(parts), timeout=_exec_timeout(
             args.get("timeout")
@@ -1997,13 +2109,14 @@ def _query_through_server(
     if not result.ok and not body:
         raise ToolError(
             f"{profile.label} on {host_profile.label}: "
-            + (problem or f"mysql exited {result.exit_status}")
+            + (problem or f"{client} exited {result.exit_status}")
         )
-    lines = [f"mysql> {sql.strip()}", body or "(no rows)"]
+    prompt = "mssql> " if mssql else "mysql> "
+    lines = [f"{prompt}{sql.strip()}", body or "(no rows)"]
     if problem:
         lines.append(f"[{problem}]")
     lines.append(
-        f"(run by {host_profile.label}'s own mysql client as "
+        f"(run by {host_profile.label}'s own {client} client as "
         f"{user}@{host}{'/' + database if database else ''})"
     )
     return "\n".join(lines)
@@ -2521,31 +2634,80 @@ TOOLS: dict[str, tuple] = {
             "required": ["profile", "command"],
         },
     ),
+    "test_connection": (
+        test_connection,
+        "Connect to a saved connection, report what answered, and "
+        "disconnect. Read only: nothing is written, no SQL is run, and an "
+        "SSH server this machine has not confirmed is reported rather than "
+        "trusted. Works for every kind - phpMyAdmin (fetches the page and "
+        "logs in), MySQL and SQL Server (logs in and reads the version), "
+        "FTP/FTPS/SFTP (logs in, opens the start folder, and says what the "
+        "account is allowed to do). Use it before concluding that something "
+        "else is broken: it separates a wrong password from a server that "
+        "is down from a start folder that does not exist.",
+        {
+            "type": "object",
+            "properties": {
+                "profile": {
+                    "type": "string",
+                    "description": "Profile label (see list_profiles)",
+                },
+            },
+            "required": ["profile"],
+        },
+    ),
+    "open_console": (
+        open_console,
+        "Open a SQL console tab in the running Sitekeeper window for a "
+        "MySQL or SQL Server connection, and wait until it has connected. "
+        "Changes nothing on the server - it connects, nothing more. Do this "
+        "first when you want your queries to be visible to the person at the "
+        "machine: with a console open, run_query runs on THAT connection and "
+        "every statement appears in its transcript marked as yours. Answers "
+        "with an error if Sitekeeper is not running.",
+        {
+            "type": "object",
+            "properties": {
+                "profile": {
+                    "type": "string",
+                    "description": "Profile label (see list_profiles)",
+                },
+            },
+            "required": ["profile"],
+        },
+    ),
     "run_query": (
         run_query,
-        "Run SQL on a native MySQL profile and get mysql-client-style "
-        "output. SELECT/SHOW/DESCRIBE/EXPLAIN always work; statements that "
-        "change data need \"Run SQL that changes data\". A phpMyAdmin "
+        "Run SQL on a native MySQL or Microsoft SQL Server profile and get "
+        "mysql-client-style output. SELECT/SHOW/DESCRIBE/EXPLAIN always "
+        "work; statements that change data need \"Run SQL that changes "
+        "data\". SQL Server profiles take T-SQL, so GO separates batches, "
+        "[brackets] quote identifiers and #temp is a table rather than a "
+        "comment. When a SQL console tab for that connection is open in "
+        "Sitekeeper, the statement runs on THAT connection and appears in "
+        "its transcript marked as Claude's, unless a database is named here "
+        "- open one with open_console first if you want that. A phpMyAdmin "
         "profile has no database connection of its own, but its username and "
         "password ARE MySQL's: pass via=<an SFTP/FTP profile on that server> "
-        "and the query runs through the server's own mysql client with those "
-        "credentials, which is how to reach a database that only listens on "
-        "localhost.",
+        "and the query runs through the server's own mysql (or sqlcmd) "
+        "client with those credentials, which is how to reach a database "
+        "that only listens on localhost.",
         {
             "type": "object",
             "properties": {
                 "profile": {"type": "string"},
-                "sql": {"type": "string", "description": "One or more statements, ; separated"},
-                "database": {"type": "string", "description": "Schema to use (defaults to the profile's)"},
+                "sql": {"type": "string", "description": "One or more statements, ; separated (GO also separates batches on SQL Server)"},
+                "database": {"type": "string", "description": "Schema to use (defaults to the profile's). Naming one opens a separate connection rather than using an open console tab."},
                 "via": {
                     "type": "string",
                     "description": (
                         "An SFTP/FTP profile on the same server. With this, "
-                        "the query runs through that server's own mysql "
-                        "client using the named profile's credentials - the "
-                        "way in when the database only listens on localhost, "
-                        "and what makes a phpMyAdmin profile usable here. "
-                        "Needs \"Run commands on the server\" as well."
+                        "the query runs through that server's own mysql or "
+                        "sqlcmd client using the named profile's credentials "
+                        "- the way in when the database only listens on "
+                        "localhost, and what makes a phpMyAdmin profile "
+                        "usable here. Needs \"Run commands on the server\" "
+                        "as well."
                     ),
                 },
                 "db_host": {

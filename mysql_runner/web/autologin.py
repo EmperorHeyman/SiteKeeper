@@ -78,7 +78,7 @@ def build_login_form_present_script() -> str:
 """
 
 
-# Dark mode is delegated to Dark Reader (https://darkreader.org) — the same
+# Dark mode is delegated to Dark Reader (https://darkreader.org) - the same
 # open-source engine behind the browser extension. It reads each element's
 # *computed* colours at runtime and generates correct dark equivalents (text,
 # backgrounds, borders, even images), watching the DOM for changes. That avoids

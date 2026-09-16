@@ -4,6 +4,156 @@ All notable changes to Sitekeeper are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [1.13.0] - 2026-09-16
+
+### Added
+- **Test connection, on every kind of connection.** Saving a connection used to
+  be an act of faith: you typed six fields out of a hosting email, pressed OK,
+  and found out whether any of them were right the next time you needed the
+  server - at which point the host, the port, the password, the protocol and
+  the folder were all suspect at once. The Add/Edit dialog now has a **Test
+  connection** button that dials what is typed, before anything is saved, and
+  the connection list has the same thing on its right-click menu for a
+  connection already in the vault.
+
+  What it proves depends on the kind, and it says which parts it proved:
+  phpMyAdmin is fetched and logged in to (the real login form, token and all,
+  or HTTP Basic if the server asks for it); MySQL and SQL Server are logged in
+  to and asked their version; FTP, FTPS and SFTP are logged in to, the start
+  folder is opened, and the answer says what that account is allowed to do.
+
+  There are three outcomes rather than two, because the middle one is the
+  useful one: it worked, it worked **but** something typed alongside the
+  credentials is wrong - a start folder that does not exist, a page that is
+  not phpMyAdmin - or it did not work, with the reason the server itself gave.
+  An SSH server nobody has confirmed asks for its fingerprint here the same way
+  it does when connecting, and carries on once you vouch for it. The test runs
+  on a thread of its own, so a server that will never answer does not freeze
+  the dialog, and nothing on the server is touched.
+
+- **`test_connection` over MCP**, with the same answers. Read only, no grant
+  beyond the connection being in scope: it connects, reports and disconnects,
+  and an SSH host this machine has not confirmed is reported rather than
+  trusted. Worth reaching for before concluding anything else is broken - it
+  separates a wrong password from a server that is down from a start folder
+  that does not exist.
+- **Microsoft SQL Server connections, beside the MySQL ones.** A new connection
+  type - *Microsoft SQL Server (SQL console)* - opens the same console tab
+  against the server SSMS opens, on port 1433 or a named instance. It speaks
+  T-SQL properly rather than MySQL with the labels changed: `GO` on its own
+  line ends a batch (and `GO 5` runs it five times), `[brackets]` quote an
+  identifier, `#temp` is a temporary table rather than the start of a comment,
+  and a batch that returns several result sets prints all of them instead of
+  the first.
+
+  It connects through the Microsoft ODBC driver, which is what makes the
+  awkward half of SSMS's login dialog work here too: **Windows
+  Authentication** (no password stored anywhere - the server trusts the
+  account you are signed in as), **named instances** such as
+  `MACHINE\SQLEXPRESS` reached through the SQL Browser, and the encryption
+  settings that driver 18 made mandatory. Trusting a self-signed certificate
+  is on by default, because an in-house SQL Server almost always has one and
+  driver 18 refuses to connect to it otherwise.
+
+  Everything the MySQL console already had comes with it: the vault, groups
+  and PRODUCTION marking, startup SQL, the transcript, and the connection
+  string import/export (`mssql://user@host:1433/database`).
+
+- **`open_console`, so Claude can ask for the tab rather than hope for one.**
+  A query Claude ran already went through Sitekeeper's own console when one
+  happened to be open on that connection, and opened an invisible connection
+  of its own when none was - which meant whether you could see its work
+  depended on what you had clicked earlier. It can now open the console
+  itself, wait for it to connect, and then run everything in front of you.
+  Changes nothing on the server, so it needs no new grant.
+
+- **`run_query` reaches SQL Server too**, directly or - with `via` - through
+  the server's own `sqlcmd`, the way it already did with `mysql` for a
+  database that only listens on localhost. The password travels in
+  `SQLCMDPASSWORD` rather than on the command line, where every other process
+  on that machine could read it.
+
+- **Tab completes in the SQL console**: the dialect's keywords plus the tables
+  and schemas read from the catalogue when the connection opened. One match
+  fills it in, several fill in as far as they agree, and past that it lists
+  them the way a shell does.
+
+### Fixed
+- **Tab completion in the terminal, which had never once run.** The terminal
+  has completed remote paths and command names since it was written, and
+  pressing Tab moved the focus to the Send button instead: Qt answers Tab in
+  `QWidget::event` and only calls `keyPressEvent` for the keys it did not
+  claim, so the handler was unreachable. Both consoles now take the key before
+  the focus chain sees it.
+- **Pressing Test and closing the window before it answered killed the app.**
+  Found by the test suite for the button itself, on the second most likely
+  thing anyone will do with it. The thread woke up, reached for a worker that
+  the teardown had already cleared, and an unhandled exception in a Qt slot
+  ends the process.
+- **Closing a console or terminal tab while it was still connecting could take
+  the whole application down.** A driver dialling a host that never answers
+  cannot be interrupted, the three-second wait ran out, and Qt's response to a
+  QThread destroyed while running is to abort the process. A thread that will
+  not stop in time is now retired instead of destroyed, and unwinds on its own
+  (`ui/threadwatch.py`).
+
+### Changed
+- One module decides how a stored profile is dialled (`transfer/backends.py`).
+  The app, the MCP server and the new connection test had three copies of that
+  wiring between them, and the MCP copy had already drifted: it ignored a
+  profile's SSH-agent, default-keys and proxy-command settings.
+
+## [1.12.0] - 2026-09-15
+
+### Added
+- **Connections handed over by your hosting provider, in one click.** A customer
+  who buys hosting gets six facts - host, port, username, password, protocol,
+  directory - and retypes all six into a transfer client, usually wrongly. That
+  is the first support ticket of most accounts' lives. Providers can now put an
+  *Open in Sitekeeper* button in their control panel instead: clicking it opens
+  Sitekeeper, which asks whether that host may add connections, shows exactly
+  what is being offered, and saves it to the vault. Nothing is typed and nothing
+  is pasted.
+
+  The link itself carries no credential. It is a **claim ticket** -
+  `sitekeeper://provision/v1?src=panel.example.com&t=<ticket>` - and the
+  credentials come back over HTTPS from a fixed path on that host, once, in
+  answer to the ticket. That indirection is the whole design: a URL handed to a
+  shell handler lands in browser history, in the address bar, in the panel's
+  access log, in the referrer header, in the clipboard the moment anyone copies
+  the link, and on Windows in a process command line other processes can read.
+  A ticket in all those places is worthless ten minutes later.
+
+  The same ticket also travels as a **`.skc` file**, which the installer
+  associates, for browsers that have got stricter about custom schemes and for
+  panels that would rather mail it. Both land on the same code.
+
+  What the app refuses is as much of the feature as what it accepts. Only HTTPS
+  with a chain the system trusts; only a hostname, never an IP literal and never
+  a name that resolves onto loopback or a private range, so a link cannot aim
+  the app at your own network; at most two redirects and never off the host you
+  were shown; a fixed endpoint path rather than a URL the link supplies, because
+  a caller-chosen URL in a link anyone can send is exactly the hole this design
+  closes. The payload goes through an allowlist: `proxy_command` (a local shell
+  command on connect), `local_dir`, `startup_script`, `private_key_path`,
+  `jump_profile_id`, `id` and `order` are dropped whatever a provider sends, and
+  the review screen says which were dropped so you can tell them.
+
+  Providers may ship an SSH key instead of a password; it is written into
+  `%APPDATA%\Sitekeeper\keys` only after you accept, never before.
+
+  There is no "always allow this provider" and there will not be one. The
+  confirmation dialog is the entire security boundary on this machine.
+  *File ▸ Add from a hosting provider link…*, or right-click the connection
+  list, redeems a link by hand when the browser did not. The contract providers
+  implement is in [HOSTING_PROVIDERS.md](HOSTING_PROVIDERS.md).
+
+- **A second launch on a handover link joins the running app.** Opening one of
+  these links while Sitekeeper is already up hands it to that window rather than
+  starting a second copy with its own vault prompt - which was the wrong answer
+  to "add this to the list I am already looking at". Only handover links are
+  forwarded; launching the app twice on purpose still gives you two windows.
+
 ## [1.11.0] - 2026-09-02
 
 ### Added
@@ -599,7 +749,7 @@ All notable changes to Sitekeeper are documented here. This project follows
   your side are remembered separately. Every session with a server used to
   begin with the same four clicks to the same two folders.
 - **The queue says what started a batch.** A headline now reads
-  `14:32 — 7 file(s) · git sync`, so an upload nobody pressed a button for can
+  `14:32 - 7 file(s) · git sync`, so an upload nobody pressed a button for can
   be told from one you did. The trigger travels with the transfer: git sync,
   folder sync, watched save, edit in place, compare, published from git.
 
@@ -1059,7 +1209,7 @@ All notable changes to Sitekeeper are documented here. This project follows
   Delete deletes - handled inside the listing itself, so pressing Delete
   while typing in a filter or path box can never mean "delete files".
 - **Each pane counts itself**: "3 folder(s), 24 file(s)" beside the title,
-  turning into "5 selected — 1.2 MB" while anything is selected.
+  turning into "5 selected - 1.2 MB" while anything is selected.
 - **A Sync activity window** (Sync menu → Sync activity…) answers the two
   questions a background sync leaves hanging: did it see my commit, and did
   everything actually go up? Every commit and save a watcher notices becomes
@@ -1071,7 +1221,7 @@ All notable changes to Sitekeeper are documented here. This project follows
   opening it after the fact still shows the whole session.
 - **The transfer queue groups each run into a timestamped batch.** A new
   transfer folds the previous batches up into their headline -
-  "14:32:05 — 7 file(s)" with "7/7 done" or "1 failed" alongside - so an
+  "14:32:05 - 7 file(s)" with "7/7 done" or "1 failed" alongside - so an
   afternoon of deploys stays one screen tall while every failure is still one
   click away. The pool also forgets its finished items when a new run starts,
   so the counters speak about the work at hand; old batches with nothing
@@ -1468,8 +1618,8 @@ what things are.
 
 ### Changed
 - **Dark mode rewritten.** Dropped the full-page `invert(1) hue-rotate()` CSS
-  filter — which only produced a washed-out grey negative and miscoloured
-  images — in favour of the bundled [Dark Reader](https://darkreader.org)
+  filter - which only produced a washed-out grey negative and miscoloured
+  images - in favour of the bundled [Dark Reader](https://darkreader.org)
   engine. It reads each element's computed colours at runtime and generates
   proper dark equivalents (text, backgrounds, borders, images), watching the
   DOM for changes, so there are no more white-on-white elements or smudged

@@ -34,7 +34,15 @@ import re
 import shlex
 import time
 
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QThread,
+    QTimer,
+    Qt,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import QColor, QKeySequence, QPainter, QShortcut
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -53,7 +61,7 @@ from mysql_runner.transfer import hostkeys
 from mysql_runner.transfer.base import TransferError
 from mysql_runner.transfer.shellhistory import ShellHistory
 from mysql_runner.transfer.worker import ConnectionSpec
-from mysql_runner.ui import theme
+from mysql_runner.ui import theme, threadwatch
 
 #: How often to look for new output, in milliseconds.
 POLL_MS = 80
@@ -426,7 +434,7 @@ class _CommandLine(QLineEdit):
             self._set_text_quietly(self._search_matches[self._search_index])
             position = f" [{self._search_index + 1}/{len(self._search_matches)}]"
         else:
-            position = " — nothing found" if self._search_text else ""
+            position = " - nothing found" if self._search_text else ""
         self.search_state.emit(
             f"(reverse search) '{self._search_text}'{position}"
             "     Enter keeps it · Esc cancels · Ctrl+R for the one before"
@@ -449,6 +457,26 @@ class _CommandLine(QLineEdit):
         return self._search_active
 
     # ----- keys -----------------------------------------------------------
+    def event(self, event) -> bool:  # noqa: N802 - Qt naming
+        """Take Tab before Qt gives it to the focus chain.
+
+        Everything below has handled Tab since it was written, and none of it
+        ever ran. Qt answers Tab in QWidget::event by moving focus to the next
+        widget, and only calls keyPressEvent for the keys it did not claim -
+        so pressing Tab in the terminal jumped to the Send button instead of
+        completing a path, which is the one thing a shell's Tab must not do.
+        Claimed here and handed to keyPressEvent, which has the rest of the
+        line's state (a reverse search in progress, the history walk) and
+        needs to unwind it the same way any other key would.
+        """
+        if event.type() == QEvent.Type.KeyPress and event.key() in (
+            Qt.Key.Key_Tab,
+            Qt.Key.Key_Backtab,
+        ):
+            self.keyPressEvent(event)
+            return True
+        return super().event(event)
+
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
         key = event.key()
         control = event.modifiers() & Qt.KeyboardModifier.ControlModifier
@@ -494,7 +522,7 @@ class _CommandLine(QLineEdit):
         if key == Qt.Key.Key_Down:
             self._walk_forward()
             return
-        if key == Qt.Key.Key_Tab:
+        if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
             self.completion_requested.emit(self.text(), self.cursorPosition())
             return
         if key in (Qt.Key.Key_Right, Qt.Key.Key_End) and self._ghost:
@@ -602,7 +630,7 @@ class SshTerminalTab(QWidget):
         self._input.set_ghost_colour(theme.palette(enable).text_faint)
 
     def current_title(self) -> str:
-        return f"{self._profile.label} — shell"
+        return f"{self._profile.label} - shell"
 
     @property
     def server_profile(self) -> ServerProfile:
@@ -841,4 +869,7 @@ class SshTerminalTab(QWidget):
         except RuntimeError:
             pass
         self._thread.quit()
-        self._thread.wait(3000)
+        # A shell still opening its SSH connection cannot be interrupted;
+        # see ui/threadwatch.py for why destroying it anyway is fatal.
+        if not self._thread.wait(3000):
+            threadwatch.retire(self._thread, self._worker)

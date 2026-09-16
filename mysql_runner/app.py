@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import getpass
+import hashlib
 import sys
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication, QIcon
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 # Import WebEngine before QApplication construction for embedded browser tabs.
 from PyQt6 import QtWebEngineWidgets  # noqa: F401
@@ -14,6 +17,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from mysql_runner.crypto import dpapi
 from mysql_runner.crypto import vault as vault_mod
 from mysql_runner.paths import resource_path
+from mysql_runner.storage import provisioning
 from mysql_runner.storage.settings import Settings
 from mysql_runner.storage.store import ServerStore, StoreError, opens_store
 from mysql_runner.ui.idle_watcher import IdleWatcher
@@ -93,10 +97,94 @@ def _unlock_vault(use_keyring: bool = True) -> vault_mod.Vault | None:
     return None
 
 
+def _claim_argument(arguments: list[str]) -> str:
+    """The handover link or ``.skc`` path the app was started on, if any.
+
+    Windows hands a registered scheme over as a plain argument, and a double
+    -clicked file the same way, so both arrive here looking like the other.
+    """
+    for argument in arguments:
+        if argument.startswith("-"):
+            continue
+        if provisioning.looks_like_claim(argument):
+            return argument.strip().strip('"')
+    return ""
+
+
+def _claim_socket_name() -> str:
+    """Name of the pipe a running instance listens on, per Windows account.
+
+    Hashed rather than spelled out: the name is visible to everything on the
+    machine, and a username is not worth publishing to learn nothing.
+    """
+    digest = hashlib.sha256(getpass.getuser().encode("utf-8", "replace")).hexdigest()
+    return f"sitekeeper-claim-{digest[:16]}"
+
+
+def _hand_to_running_instance(claim_text: str) -> bool:
+    """Give an already-running Sitekeeper the claim. True when it took it.
+
+    A second copy of the app would open its own vault prompt and its own
+    window, which is the wrong answer to "add this connection to the list I am
+    already looking at". Only claims are forwarded: launching the app twice on
+    purpose still gives you two windows, as it always has.
+    """
+    socket = QLocalSocket()
+    socket.connectToServer(_claim_socket_name())
+    if not socket.waitForConnected(800):
+        return False
+    socket.write(claim_text.encode("utf-8"))
+    socket.flush()
+    delivered = socket.waitForBytesWritten(2000)
+    socket.disconnectFromServer()
+    return delivered
+
+
+def _listen_for_claims(deliver) -> QLocalServer | None:
+    """Accept claims forwarded by later launches. None when another app owns it."""
+    name = _claim_socket_name()
+    server = QLocalServer()
+    # A pipe left behind by a crash would otherwise make every later launch
+    # believe an instance is running and refuse to listen for the rest of the
+    # session. Probing first keeps us from stealing a live one.
+    probe = QLocalSocket()
+    probe.connectToServer(name)
+    if probe.waitForConnected(300):
+        probe.disconnectFromServer()
+        return None
+    QLocalServer.removeServer(name)
+    if not server.listen(name):
+        return None
+
+    def on_connection() -> None:
+        connection = server.nextPendingConnection()
+        if connection is None:
+            return
+
+        def read() -> None:
+            payload = bytes(connection.readAll()).decode("utf-8", "replace")
+            connection.disconnectFromServer()
+            text = payload.strip()
+            if text:
+                deliver(text)
+
+        connection.readyRead.connect(read)
+        connection.disconnected.connect(connection.deleteLater)
+
+    server.newConnection.connect(on_connection)
+    return server
+
+
 def run() -> int:
     QGuiApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("Sitekeeper")
+
+    # Forwarding happens before anything is unlocked: if another instance is
+    # up, this process has nothing to do but hand the link over and go.
+    claim_text = _claim_argument(sys.argv[1:])
+    if claim_text and _hand_to_running_instance(claim_text):
+        return 0
 
     icon_file = resource_path("icon.ico")
     if icon_file.exists():
@@ -129,6 +217,31 @@ def run() -> int:
     def on_settings_changed() -> None:
         # Re-arm the idle watcher whenever the timeout preference changes.
         idle_watcher.set_timeout(effective_idle_minutes(settings))
+
+    def deliver_claim(text: str) -> None:
+        """Put a handover link in front of whichever window is open now.
+
+        Parsing happens here rather than in the socket reader so that a
+        malformed link forwarded by another launch says so, instead of being
+        dropped into silence on a window the user is looking at.
+        """
+        window = window_holder.get("window")
+        if window is None:
+            # Locked, or between sessions. Asking a user to review connections
+            # they cannot yet see saved is worse than asking them to click the
+            # link again once they are in.
+            QMessageBox.information(
+                None,
+                "Sitekeeper is locked",
+                "Unlock Sitekeeper first, then use the handover link again.",
+            )
+            return
+        try:
+            claim = provisioning.load_claim(text)
+        except provisioning.ProvisioningError as exc:
+            QMessageBox.critical(window, "That link cannot be used", str(exc))
+            return
+        window.handle_claim(claim)
 
     def start_session(*, first_launch: bool = False) -> bool:
         # Honour "ask for password at start" only on the initial launch; an
@@ -169,7 +282,19 @@ def run() -> int:
     if not start_session(first_launch=True):
         return 0
 
-    return app.exec()
+    # Held for the process's lifetime: a QLocalServer that goes out of scope
+    # stops listening, and later launches would quietly open second windows.
+    claim_server = _listen_for_claims(deliver_claim)
+
+    if claim_text:
+        # After the event loop is running and the window is up, so the review
+        # dialog has a parent to be modal to.
+        QTimer.singleShot(0, lambda: deliver_claim(claim_text))
+
+    code = app.exec()
+    if claim_server is not None:
+        claim_server.close()
+    return code
 
 
 def _invoke(callback) -> None:

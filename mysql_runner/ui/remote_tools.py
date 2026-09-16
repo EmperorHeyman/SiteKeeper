@@ -147,7 +147,7 @@ class RemoteSearchDialog(QDialog):
             return
         text = f"{len(result.hits)} match(es) via {result.tool or 'grep'}"
         if result.truncated:
-            text += " — more were found than are shown"
+            text += " - more were found than are shown"
         self._status.setText(text)
 
     def show_error(self, message: str) -> None:
@@ -584,7 +584,7 @@ class LinkTargetDialog(QDialog):
 
     def __init__(self, name: str, target: str, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Link target — {name}")
+        self.setWindowTitle(f"Link target - {name}")
         self.setModal(True)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(f"{name} currently points at:"))

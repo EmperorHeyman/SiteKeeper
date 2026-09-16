@@ -1,15 +1,20 @@
-"""In-app MySQL command-line console.
+"""In-app SQL command-line console.
 
-A native connection to MySQL (port 3306) driven from a prompt, with the mysql
-client's look: an ASCII-table transcript, multi-line statement buffering, a
-history you can walk with the arrow keys, and the familiar backslash commands.
-The connection itself lives on a worker thread (see db/mysql_client.py), so a
-slow query never freezes the window.
+A native connection to the database - MySQL on 3306, Microsoft SQL Server on
+1433 - driven from a prompt, with the mysql client's look: an ASCII-table
+transcript, multi-line statement buffering, a history you can walk with the
+arrow keys, and the familiar backslash commands. The connection itself lives
+on a worker thread (see db/mysql_client.py), so a slow query never freezes the
+window.
+
+Which dialect is being typed is settled once, by the profile's kind, and
+answered by an engine from db/engines.py: the prompt, the statement
+terminator, the help text and what Tab completes all come from there.
 """
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QKeySequence, QShortcut, QTextCursor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -21,45 +26,92 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from mysql_runner.db import engines
 from mysql_runner.db.mysql_client import (
     ConnectionParams,
-    MySQLWorker,
     QueryOutcome,
+    SqlWorker,
 )
 from mysql_runner.db.resultformat import (
     format_summary,
     format_table,
     format_vertical,
 )
-from mysql_runner.db.sqlsplit import is_complete
 from mysql_runner.storage.models import Environment, ServerProfile
-from mysql_runner.ui import theme
+from mysql_runner.ui import theme, threadwatch
 
-_PROMPT = "mysql> "
-_CONTINUATION = "    -> "
 #: Keep the transcript bounded so a runaway SELECT cannot exhaust memory.
 _MAX_BLOCKS = 20_000
 
-_HELP = """\
-Commands (a statement can also span several lines and end with ;)
+#: Beyond this many matches, Tab lists them rather than filling the line.
+_COMPLETION_LIST_LIMIT = 60
+
+_HELP_HEAD = """\
+Commands (a statement can also span several lines)
 
   \\?  \\h  help    show this help
   \\c              clear the statement being typed
   \\s              connection status
   \\r              reconnect
   \\q  exit  quit  disconnect this console
-  clear  cls      clear the screen
-  <statement>\\G   run and print each row vertically
+  clear  cls      clear the screen"""
 
-Up / Down walks the history. Ctrl+L clears the screen."""
+_HELP_TAIL = """\
 
+Up / Down walks the history. Tab completes table names and keywords.
+Ctrl+L clears the screen."""
+
+
+def token_at(text: str, position: int) -> tuple[str, int]:
+    """The word being completed, and where in ``text`` it starts.
+
+    Broken on whitespace and on the punctuation that separates a name from
+    what surrounds it, so Tab after "SELECT * FROM " or "(" completes the
+    name rather than the whole line. The dot is deliberately kept: in SQL
+    Server a table is ``dbo.Orders`` and that is one name.
+    """
+    position = max(0, min(position, len(text)))
+    start = position
+    while start > 0 and text[start - 1] not in " \t\n,;()=<>+-*/'\"`[]":
+        start -= 1
+    return text[start:position], start
+
+
+def common_prefix(values: list[str]) -> str:
+    """The longest start every value shares, compared case-insensitively."""
+    if not values:
+        return ""
+    shortest = min(values, key=len)
+    for index, char in enumerate(shortest):
+        if any(value[index].casefold() != char.casefold() for value in values):
+            return shortest[:index]
+    return shortest
 
 
 class _PromptEdit(QLineEdit):
-    """Single-line input that walks the history with the arrow keys."""
+    """Single-line input that walks the history and completes with Tab."""
 
     history_back = pyqtSignal()
     history_forward = pyqtSignal()
+    #: The line as typed and where the cursor is, for Tab completion.
+    completion_requested = pyqtSignal(str, int)
+
+    def event(self, event) -> bool:  # noqa: N802 - Qt naming
+        """Take Tab before Qt hands it to the focus chain.
+
+        Qt answers Tab in QWidget::event, moving focus to the next widget,
+        and only calls keyPressEvent for keys it did not claim. So a Tab
+        handler in keyPressEvent - which is where this one used to be - never
+        runs: pressing Tab in a console jumped to the Disconnect button
+        instead of completing anything, which is exactly what it must not do.
+        """
+        if event.type() == QEvent.Type.KeyPress and event.key() in (
+            Qt.Key.Key_Tab,
+            Qt.Key.Key_Backtab,
+        ):
+            self.completion_requested.emit(self.text(), self.cursorPosition())
+            return True
+        return super().event(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
         if event.key() == Qt.Key.Key_Up:
@@ -72,7 +124,7 @@ class _PromptEdit(QLineEdit):
 
 
 class SqlConsoleTab(QWidget):
-    """A MySQL shell in a tab."""
+    """A database shell in a tab: MySQL or SQL Server."""
 
     status_message = pyqtSignal(str)
     title_changed = pyqtSignal(str)
@@ -80,6 +132,7 @@ class SqlConsoleTab(QWidget):
     # Requests handed to the worker thread.
     _open_requested = pyqtSignal(object)
     _sql_requested = pyqtSignal(str)
+    _completions_requested = pyqtSignal()
     _close_requested = pyqtSignal()
 
     def __init__(
@@ -91,11 +144,17 @@ class SqlConsoleTab(QWidget):
     ) -> None:
         super().__init__(parent)
         self._profile = profile
+        self._engine = engines.engine_for(profile.kind)
         self._pending: list[str] = []      # Lines of a half-typed statement.
         self._history: list[str] = []
         self._history_index = 0
         self._busy = False
         self._connected = False
+        #: Why the last attempt to connect failed, for whoever asked for
+        #: this tab to be opened and is waiting to hear.
+        self._last_error = ""
+        #: Names Tab can offer: keywords, then whatever the catalogue had.
+        self._names: list[str] = list(self._engine.keywords)
         #: A statement the MCP bridge is waiting on, and the outcomes it has
         #: produced so far. One at a time: see accept_bridge_query.
         self._bridge_query: dict | None = None
@@ -129,7 +188,7 @@ class SqlConsoleTab(QWidget):
                     "Statements run against the live database."
                 )
             )
-        self._prompt_label = QLabel(_PROMPT.strip())
+        self._prompt_label = QLabel(self._engine.prompt.strip())
         self._prompt_label.setObjectName("prompt")
         self._prompt_label.setFont(_mono_font())
         self._input = _PromptEdit()
@@ -139,6 +198,7 @@ class SqlConsoleTab(QWidget):
         self._input.returnPressed.connect(self._on_submit)
         self._input.history_back.connect(lambda: self._walk_history(-1))
         self._input.history_forward.connect(lambda: self._walk_history(1))
+        self._input.completion_requested.connect(self._on_complete)
         self._cancel_btn = QPushButton("Disconnect")
         self._cancel_btn.clicked.connect(self._on_disconnect_clicked)
         prompt_row.addWidget(self._prompt_label)
@@ -153,7 +213,22 @@ class SqlConsoleTab(QWidget):
         self.setStyleSheet(theme.console_stylesheet(enable))
 
     def current_title(self) -> str:
-        return f"{self._profile.label} — SQL"
+        return f"{self._profile.label} - SQL"
+
+    @property
+    def engine(self):
+        """Which dialect this console speaks. Read by the MCP bridge."""
+        return self._engine
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether there is a live connection behind this tab."""
+        return self._connected
+
+    @property
+    def last_error(self) -> str:
+        """Why the last connection attempt failed, if one did."""
+        return self._last_error
 
     @property
     def server_profile(self) -> ServerProfile:
@@ -162,17 +237,19 @@ class SqlConsoleTab(QWidget):
     # ----- worker wiring --------------------------------------------------
     def _start_worker(self) -> None:
         self._thread = QThread(self)
-        self._worker = MySQLWorker()
+        self._worker = SqlWorker()
         self._worker.moveToThread(self._thread)
 
         self._open_requested.connect(self._worker.open_connection)
         self._sql_requested.connect(self._worker.run_sql)
+        self._completions_requested.connect(self._worker.load_completions)
         self._close_requested.connect(self._worker.close_connection)
 
         self._worker.connected.connect(self._on_connected)
         self._worker.failed.connect(self._on_failed)
         self._worker.outcome.connect(self._on_outcome)
         self._worker.batch_finished.connect(self._on_batch_finished)
+        self._worker.completions.connect(self._on_completions)
         self._worker.closed.connect(self._on_closed)
 
         self._thread.start()
@@ -180,19 +257,12 @@ class SqlConsoleTab(QWidget):
     def _connect_to_server(self) -> None:
         profile = self._profile
         self._write(f"Connecting to {profile.describe_target()} …")
-        self._open_requested.emit(
-            ConnectionParams(
-                host=profile.host,
-                port=profile.effective_port,
-                username=profile.username,
-                password=profile.password,
-                database=profile.database,
-            )
-        )
+        self._open_requested.emit(ConnectionParams.from_profile(profile))
 
     # ----- worker callbacks -----------------------------------------------
     def _on_connected(self, banner: str) -> None:
         self._connected = True
+        self._last_error = ""
         self._write(banner)
         self._write("Type \\? for help.\n")
         self._input.setEnabled(True)
@@ -200,14 +270,21 @@ class SqlConsoleTab(QWidget):
         self._input.setFocus()
         self.status_message.emit(f"Connected to {self._profile.label}")
         self.title_changed.emit(self.current_title())
+        # Ask for the catalogue before anything else is queued, so Tab works
+        # from the first keystroke rather than after the first query.
+        self._completions_requested.emit()
         self._run_startup_script()
+
+    def _on_completions(self, names: object) -> None:
+        self._names = [str(name) for name in (names or [])]
 
     def _on_failed(self, message: str) -> None:
         self._connected = False
+        self._last_error = message
         self._write(message)
         self._write("")
         self._input.setEnabled(False)
-        self._input.setPlaceholderText("Not connected — press Reconnect")
+        self._input.setPlaceholderText("Not connected - press Reconnect")
         self._cancel_btn.setText("Reconnect")
         self.status_message.emit(f"{self._profile.label}: {message}")
 
@@ -234,7 +311,7 @@ class SqlConsoleTab(QWidget):
         )
         if outcome.truncated:
             self._write(
-                f"(output limited to the first {outcome.rowcount} rows — "
+                f"(output limited to the first {outcome.rowcount} rows - "
                 "add a LIMIT clause to see a specific slice)"
             )
         if outcome.message:
@@ -261,9 +338,11 @@ class SqlConsoleTab(QWidget):
         if not sql.strip():
             return "no SQL was given"
         self._bridge_query = {"on_done": on_done, "outcomes": []}
-        self._write(_PROMPT + "-- run by Claude", newline_before=True)
+        self._write(
+            self._engine.prompt + "-- run by Claude", newline_before=True
+        )
         for line in sql.strip().splitlines():
-            self._write(_CONTINUATION + line, newline_before=False)
+            self._write(self._engine.continuation + line, newline_before=False)
         self._set_busy(True)
         self._sql_requested.emit(sql)
         return ""
@@ -277,7 +356,13 @@ class SqlConsoleTab(QWidget):
         if abandoned:
             callback({"ok": False, "error": abandoned})
             return
-        callback({"ok": True, "detail": _render(pending["outcomes"])})
+        callback(
+            {
+                "ok": True,
+                "detail": _render(pending["outcomes"], self._engine.prompt),
+                "engine": self._engine.key,
+            }
+        )
 
     def _abandon_bridge_query(self, reason: str) -> None:
         self._finish_bridge_query(abandoned=reason)
@@ -286,7 +371,7 @@ class SqlConsoleTab(QWidget):
         self._connected = False
         self._abandon_bridge_query("the connection closed before it finished")
         self._input.setEnabled(False)
-        self._input.setPlaceholderText("Disconnected — press Reconnect")
+        self._input.setPlaceholderText("Disconnected - press Reconnect")
         self._cancel_btn.setText("Reconnect")
 
     # ----- input handling -------------------------------------------------
@@ -301,7 +386,9 @@ class SqlConsoleTab(QWidget):
 
         # Echo what was typed, at the prompt that was showing.
         self._write(
-            (_CONTINUATION if self._pending else _PROMPT) + line, newline_before=False
+            (self._engine.continuation if self._pending else self._engine.prompt)
+            + line,
+            newline_before=False,
         )
 
         # Backslash commands work anywhere - cancelling a half-typed statement
@@ -313,12 +400,12 @@ class SqlConsoleTab(QWidget):
 
         self._pending.append(line)
         buffered = "\n".join(self._pending)
-        if not is_complete(buffered):
-            self._prompt_label.setText(_CONTINUATION.strip())
+        if not self._engine.is_complete(buffered):
+            self._prompt_label.setText(self._engine.continuation.strip())
             return
 
         self._pending = []
-        self._prompt_label.setText(_PROMPT.strip())
+        self._prompt_label.setText(self._engine.prompt.strip())
         if not self._connected:
             self._write("Not connected.\n")
             return
@@ -333,11 +420,11 @@ class SqlConsoleTab(QWidget):
             self._close_requested.emit()
             return True
         if lowered in ("\\?", "\\h", "help"):
-            self._write(_HELP + "\n")
+            self._write(self._help_text() + "\n")
             return True
         if lowered == "\\c":
             self._pending = []
-            self._prompt_label.setText(_PROMPT.strip())
+            self._prompt_label.setText(self._engine.prompt.strip())
             return True
         if lowered == "\\s":
             self._write(self._status_text() + "\n")
@@ -350,13 +437,61 @@ class SqlConsoleTab(QWidget):
             return True
         return False
 
+    def _help_text(self) -> str:
+        """The help, with the bits that differ between dialects filled in."""
+        lines = [_HELP_HEAD]
+        if not self._engine.tsql:
+            lines.append("  <statement>\\G   run and print each row vertically")
+        lines.append("")
+        lines.append(f"  {self._engine.name}: {self._engine.terminator_help}.")
+        lines.append(_HELP_TAIL)
+        return "\n".join(lines)
+
     def _status_text(self) -> str:
         state = "connected" if self._connected else "not connected"
         return (
             f"Connection: {self._profile.describe_target()} ({state})\n"
             f"Profile:    {self._profile.label}\n"
+            f"Server:     {self._engine.name}\n"
             f"Environment: {self._profile.environment.value}"
         )
+
+    # ----- completion -----------------------------------------------------
+    # Tab used to move focus to the Disconnect button, which in a console is
+    # not a neutral thing to do: it is the key you press when you cannot
+    # remember the name of a table, and it took you away from the line you
+    # were typing. It now completes against the keywords of this dialect and
+    # the catalogue read when the connection opened.
+    def _on_complete(self, text: str, position: int) -> None:
+        token, start = token_at(text, position)
+        if not token:
+            return
+        needle = token.casefold()
+        matches = [name for name in self._names if name.casefold().startswith(needle)]
+        if not matches:
+            return
+        if len(matches) == 1:
+            self._fill(start, token, matches[0], finished=True)
+            return
+        shared = common_prefix(matches)
+        if len(shared) > len(token):
+            self._fill(start, token, shared, finished=False)
+            return
+        # Nothing more to fill in: show the choices the way a shell does,
+        # rather than silently doing nothing and looking broken.
+        shown = matches[:_COMPLETION_LIST_LIMIT]
+        self._write("   ".join(shown), newline_before=True)
+        if len(matches) > len(shown):
+            self._write(f"… and {len(matches) - len(shown)} more")
+        self._write("")
+
+    def _fill(self, start: int, token: str, value: str, *, finished: bool) -> None:
+        """Replace the word being completed with ``value``."""
+        text = self._input.text()
+        end = start + len(token)
+        tail = " " if finished else ""
+        self._input.setText(text[:start] + value + tail + text[end:])
+        self._input.setCursorPosition(start + len(value) + len(tail))
 
     def _walk_history(self, delta: int) -> None:
         if not self._history:
@@ -383,7 +518,9 @@ class SqlConsoleTab(QWidget):
         if self._startup_done or not script:
             return
         self._startup_done = True
-        self._write(_PROMPT + script.replace("\n", " "), newline_before=False)
+        self._write(
+            self._engine.prompt + script.replace("\n", " "), newline_before=False
+        )
         self._set_busy(True)
         self._sql_requested.emit(script)
 
@@ -427,10 +564,14 @@ class SqlConsoleTab(QWidget):
             pass
         self._thread.quit()
         # Give the worker a moment to unwind; it only has to close a socket.
-        self._thread.wait(3000)
+        # A connect that is still in flight cannot be interrupted, though,
+        # and destroying the thread under it aborts the process - so one
+        # that misses the deadline is retired rather than destroyed.
+        if not self._thread.wait(3000):
+            threadwatch.retire(self._thread, self._worker)
 
 
-def _render(outcomes) -> str:
+def _render(outcomes, prompt: str = "mysql> ") -> str:
     """The same output the transcript shows, as text for the caller.
 
     Deliberately the mysql-client shape the MCP server already returns for
@@ -440,7 +581,7 @@ def _render(outcomes) -> str:
     blocks = []
     for outcome in outcomes:
         if outcome.error:
-            blocks.append(f"mysql> {outcome.statement.strip()}\n{outcome.error}")
+            blocks.append(f"{prompt}{outcome.statement.strip()}\n{outcome.error}")
             continue
         body = ""
         if outcome.is_result_set:
@@ -457,7 +598,7 @@ def _render(outcomes) -> str:
             body += f"\n(only the first {outcome.rowcount} rows are shown)"
         if outcome.message:
             body += f"\n{outcome.message}"
-        blocks.append(f"mysql> {outcome.statement.strip()}\n{body}")
+        blocks.append(f"{prompt}{outcome.statement.strip()}\n{body}")
     return "\n\n".join(blocks) or "No output."
 
 

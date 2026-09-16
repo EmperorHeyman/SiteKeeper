@@ -1,0 +1,2064 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sitekeeper Handbook</title>
+<meta name="description" content="Everything Sitekeeper does, and how hosting providers hand connections to their customers in one click.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* ---------------------------------------------------------------------------
+   Sitekeeper Handbook.
+
+   The palette is the application's own (mysql_runner/ui/theme.py), and so is
+   the rule behind it: every grey is a true neutral, and exactly one hue is
+   allowed back in - on the action a screen is for. Red, amber and green are
+   never decoration here either. Red means production or destruction, amber
+   means in progress, green means connected. If a colour appears, it is saying
+   something.
+--------------------------------------------------------------------------- */
+
+:root {
+  /* Light. Graphite, warmed by nothing - the neutrals stay true. */
+ --bg: #fbfbfc;
+ --panel: #ffffff;
+ --panel-alt: #f7f7f9;
+ --card: #f2f2f5;
+ --border: #dcdce1;
+ --border-soft: #e9e9ee;
+ --text: #17171a;
+ --text-dim: #56565e;
+ --text-faint: #86868f;
+ --primary: #2563eb;
+ --primary-soft: #e8efff;
+ --primary-edge: #b9cdfb;
+ --on-primary: #ffffff;
+ --red: #c9252d;
+ --red-soft: #fdecec;
+ --amber: #a56206;
+ --amber-soft: #fdf1e0;
+ --green: #0c7a4f;
+ --green-soft: #e4f6ed;
+ --code-bg: #f4f4f7;
+ --shadow: 0 1px 2px rgba(15, 15, 20, .06), 0 8px 24px -16px rgba(15, 15, 20, .18);
+
+ --display: "Archivo", "Segoe UI", system-ui, sans-serif;
+ --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+ --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+ --rail: 272px;
+ --toc: 208px;
+ --bar: 56px;
+
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+ --bg: #0e0e0f;
+ --panel: #141415;
+ --panel-alt: #1a1a1c;
+ --card: #202023;
+ --border: #333338;
+ --border-soft: #28282c;
+ --text: #e6e6e8;
+ --text-dim: #a2a2a8;
+ --text-faint: #6e6e74;
+ --primary: #3d7eff;
+ --primary-soft: #16223d;
+ --primary-edge: #2a3f६e;
+ --primary-edge: #2a3f6e;
+ --on-primary: #0e1220;
+ --red: #e5484d;
+ --red-soft: #2a1618;
+ --amber: #f0a83c;
+ --amber-soft: #2a2013;
+ --green: #3ecf8e;
+ --green-soft: #12251d;
+ --code-bg: #1a1a1c;
+ --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 12px 32px -20px rgba(0, 0, 0, .9);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+ --bg: #0e0e0f;
+ --panel: #141415;
+ --panel-alt: #1a1a1c;
+ --card: #202023;
+ --border: #333338;
+ --border-soft: #28282c;
+ --text: #e6e6e8;
+ --text-dim: #a2a2a8;
+ --text-faint: #6e6e74;
+ --primary: #3d7eff;
+ --primary-soft: #16223d;
+ --primary-edge: #2a3f6e;
+ --on-primary: #0e1220;
+ --red: #e5484d;
+ --red-soft: #2a1618;
+ --amber: #f0a83c;
+ --amber-soft: #2a2013;
+ --green: #3ecf8e;
+ --green-soft: #12251d;
+ --code-bg: #1a1a1c;
+ --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 12px 32px -20px rgba(0, 0, 0, .9);
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 400 15px/1.65 var(--body);
+ -webkit-text-size-adjust: 100%;
+}
+
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+
+a { color: var(--primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* ----- top bar ---------------------------------------------------------- */
+.topbar {
+  position: sticky;
+  top: env(safe-area-inset-top, 0px);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: var(--bar);
+  padding: 0 16px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font: 700 16px/1 var(--display);
+  letter-spacing: -.01em;
+  color: var(--text);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.brand:hover { text-decoration: none; }
+.brand svg { display: block; }
+
+.version {
+  font: 500 11px/1 var(--mono);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+
+.bar-spacer { flex: 1; }
+
+.filter {
+  position: relative;
+  width: min(320px, 44vw);
+}
+.filter input {
+  width: 100%;
+  font: 400 13px/1 var(--body);
+  color: var(--text);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 9px 11px 9px 30px;
+}
+.filter input::placeholder { color: var(--text-faint); }
+.filter svg {
+  position: absolute;
+  left: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+.icon-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 34px;
+  background: var(--card);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+.icon-btn:hover { color: var(--text); }
+
+/* ----- shell ------------------------------------------------------------ */
+.shell {
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr) var(--toc);
+  gap: 40px;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 16px;
+  align-items: start;
+}
+
+.rail {
+  position: sticky;
+  top: calc(var(--bar) + env(safe-area-inset-top, 0px));
+  max-height: calc(100vh - var(--bar));
+  overflow-y: auto;
+  padding-block: 28px 48px;
+  font-size: 13.5px;
+}
+.rail h4 {
+  margin: 22px 0 7px;
+  font: 600 10.5px/1 var(--body);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.rail h4:first-child { margin-top: 0; }
+.rail a {
+  display: block;
+  padding: 5px 10px;
+  margin-left: -10px;
+  border-radius: 6px;
+  color: var(--text-dim);
+  border-left: 2px solid transparent;
+}
+.rail a:hover { color: var(--text); background: var(--panel-alt); text-decoration: none; }
+.rail a.on {
+  color: var(--text);
+  font-weight: 600;
+  border-left-color: var(--primary);
+  background: var(--primary-soft);
+}
+.rail .no-hits {
+  padding: 10px;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+
+main {
+  min-width: 0;
+  padding-block: 28px 96px;
+}
+
+.toc {
+  position: sticky;
+  top: calc(var(--bar) + env(safe-area-inset-top, 0px));
+  max-height: calc(100vh - var(--bar));
+  overflow-y: auto;
+  padding-block: 28px 48px;
+  font-size: 12.5px;
+  border-left: 1px solid var(--border-soft);
+  padding-left: 16px;
+}
+.toc strong {
+  display: block;
+  font: 600 10.5px/1 var(--body);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 9px;
+}
+.toc a { display: block; padding: 4px 0; color: var(--text-dim); }
+.toc a:hover { color: var(--text); text-decoration: none; }
+.toc a.on { color: var(--primary); }
+
+/* ----- typography ------------------------------------------------------- */
+.lede {
+  max-width: 62ch;
+  font-size: 17px;
+  color: var(--text-dim);
+}
+
+section { scroll-margin-top: calc(var(--bar) + 16px); }
+section + section { margin-top: 52px; }
+
+h1 {
+  font: 700 clamp(30px, 5vw, 42px)/1.1 var(--display);
+  letter-spacing: -.025em;
+  margin: 0 0 14px;
+  text-wrap: balance;
+}
+h2 {
+  font: 700 25px/1.2 var(--display);
+  letter-spacing: -.018em;
+  margin: 0 0 6px;
+  text-wrap: balance;
+  scroll-margin-top: calc(var(--bar) + 16px);
+}
+h3 {
+  font: 600 17px/1.3 var(--display);
+  letter-spacing: -.01em;
+  margin: 30px 0 6px;
+  text-wrap: balance;
+  scroll-margin-top: calc(var(--bar) + 16px);
+}
+h4 {
+  font: 600 14px/1.4 var(--body);
+  margin: 22px 0 4px;
+  color: var(--text);
+}
+p, ul, ol { margin: 0 0 14px; max-width: 68ch; }
+li { margin-bottom: 5px; }
+li > ul, li > ol { margin-top: 5px; margin-bottom: 8px; }
+strong { font-weight: 600; }
+
+.eyebrow {
+  font: 600 10.5px/1 var(--body);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 9px;
+}
+
+.section-note {
+  max-width: 68ch;
+  color: var(--text-dim);
+  margin-bottom: 20px;
+  font-size: 15.5px;
+}
+
+hr.rule {
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+  margin: 44px 0;
+}
+
+/* ----- code ------------------------------------------------------------- */
+code {
+  font: 400 .87em/1.5 var(--mono);
+  background: var(--code-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: .1em .34em;
+  word-break: break-word;
+}
+pre {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  background: var(--code-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  overflow-x: auto;
+  font: 400 12.5px/1.65 var(--mono);
+  color: var(--text);
+}
+pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+pre .c { color: var(--text-faint); }
+pre .k { color: var(--primary); }
+pre .s { color: var(--green); }
+
+/* ----- tables ----------------------------------------------------------- */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  margin-bottom: 16px;
+  background: var(--panel);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 460px;
+}
+th, td {
+  text-align: left;
+  padding: 9px 13px;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+th {
+  font: 600 11px/1.4 var(--body);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: var(--panel-alt);
+  white-space: nowrap;
+}
+tr:last-child td { border-bottom: 0; }
+td code { font-size: 12px; }
+.kbd-table td:first-child { white-space: nowrap; width: 1%; }
+
+/* ----- keys ------------------------------------------------------------- */
+kbd {
+  display: inline-block;
+  font: 500 11.5px/1 var(--mono);
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 4px 6px;
+  white-space: nowrap;
+}
+
+/* ----- callouts --------------------------------------------------------- */
+.note {
+  max-width: 68ch;
+  border-left: 3px solid var(--border);
+  background: var(--panel-alt);
+  border-radius: 0 8px 8px 0;
+  padding: 13px 16px;
+  margin: 0 0 16px;
+  font-size: 14px;
+  color: var(--text-dim);
+}
+.note > :last-child { margin-bottom: 0; }
+.note strong { color: var(--text); }
+.note.danger { border-left-color: var(--red); background: var(--red-soft); }
+.note.safe { border-left-color: var(--green); background: var(--green-soft); }
+.note.key { border-left-color: var(--primary); background: var(--primary-soft); }
+
+/* ----- pills and badges ------------------------------------------------- */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: 500 11px/1 var(--mono);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 9px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.pill.prod { color: var(--red); border-color: var(--red); }
+.pill.busy { color: var(--amber); border-color: var(--amber); }
+.pill.ok { color: var(--green); border-color: var(--green); }
+.pill.new { color: var(--primary); border-color: var(--primary-edge); background: var(--primary-soft); }
+.pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+
+/* ----- connection type cards -------------------------------------------- */
+.kinds {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.kind {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 15px;
+  background: var(--panel);
+}
+.kind-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 7px;
+}
+.kind-head h4 { margin: 0; font: 600 14px/1 var(--display); }
+.kind p { margin: 0; font-size: 13.5px; color: var(--text-dim); max-width: none; }
+
+/* ----- flow diagram ----------------------------------------------------- */
+.flow {
+  display: grid;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 18px;
+  background: var(--panel);
+  counter-reset: step;
+}
+.step {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 13px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.step:last-child { border-bottom: 0; }
+.step::before {
+  counter-increment: step;
+  content: counter(step);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  font: 500 12px/1 var(--mono);
+  color: var(--text-dim);
+}
+/* The counter is grid item one and takes column one, so every real child has
+   to be told to sit in column two. Without this the heading lands beside the
+   number and everything after it wraps onto the next row - into the 30px
+   column, one word per line. */
+.step > * { grid-column: 2; }
+.step h4 { margin: 2px 0 3px; }
+.step p { margin: 0; font-size: 13.5px; color: var(--text-dim); max-width: none; }
+.step p + p { margin-top: 6px; }
+.step pre { margin: 9px 0 0; font-size: 12px; }
+
+/* ----- checklist -------------------------------------------------------- */
+.checklist { list-style: none; padding: 0; max-width: 68ch; }
+.checklist li {
+  position: relative;
+  padding-left: 26px;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+.checklist li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4px;
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+}
+
+/* ----- footer ----------------------------------------------------------- */
+footer {
+  border-top: 1px solid var(--border-soft);
+  padding: 22px 0 8px;
+  margin-top: 56px;
+  font-size: 13px;
+  color: var(--text-faint);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+}
+
+/* ----- narrow ----------------------------------------------------------- */
+@media (max-width: 1180px) {
+  .shell { grid-template-columns: var(--rail) minmax(0, 1fr); gap: 32px; }
+  .toc { display: none; }
+}
+@media (max-width: 900px) {
+  .shell { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .icon-btn { display: flex; }
+  .rail {
+    position: fixed;
+    inset: calc(var(--bar) + env(safe-area-inset-top, 0px)) 0 0 0;
+    max-height: none;
+    z-index: 35;
+    background: var(--bg);
+    border-right: 1px solid var(--border);
+    padding: 20px 20px 60px;
+    overflow-y: auto;
+  }
+  .rail[hidden] { display: none !important; }
+  main { padding-block: 22px 72px; }
+  .version { display: none; }
+  .filter { width: 100%; }
+}
+@media (max-width: 560px) {
+  .brand span { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+html { scroll-behavior: smooth; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <button class="icon-btn" id="menu" aria-label="Open the index" aria-expanded="false">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+      <path d="M2 4h12M2 8h12M2 12h12"/>
+    </svg>
+  </button>
+  <a class="brand" href="#top">
+    <svg width="19" height="19" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <rect x="1.4" y="1.4" width="17.2" height="17.2" rx="4.4" stroke="currentColor" stroke-width="1.5"/>
+      <path d="M6.4 7.6 L9.3 10 L6.4 12.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M10.8 12.9 H14" stroke="#3d7eff" stroke-width="1.6" stroke-linecap="round"/>
+    </svg>
+    <span>Sitekeeper</span>
+  </a>
+  <span class="version">v1.12.0</span>
+  <span class="bar-spacer"></span>
+  <div class="filter">
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+      <circle cx="7" cy="7" r="4.6"/><path d="M10.5 10.5 L14 14" stroke-linecap="round"/>
+    </svg>
+    <label for="q" class="sr-only" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Filter the index</label>
+    <input id="q" type="search" placeholder="Filter the index…" autocomplete="off" spellcheck="false">
+  </div>
+</header>
+
+<div class="shell">
+
+<nav class="rail" id="rail" aria-label="Handbook index">
+  <h4>Start</h4>
+  <a href="#top">What Sitekeeper is</a>
+  <a href="#install">Installing and first launch</a>
+  <a href="#adding">Adding connections</a>
+  <a href="#handover">Connections from your host</a>
+
+  <h4>The connection list</h4>
+  <a href="#list">Groups, categories, search</a>
+  <a href="#environments">Environments and the production guard</a>
+
+  <h4>Sessions</h4>
+  <a href="#phpmyadmin">phpMyAdmin tabs</a>
+  <a href="#console">The MySQL console</a>
+  <a href="#terminal">Terminals</a>
+  <a href="#server-tools">Server-side tools</a>
+
+  <h4>File transfers</h4>
+  <a href="#panes">The dual pane</a>
+  <a href="#queue">The transfer queue</a>
+  <a href="#deploys">Safe deploys and undo</a>
+  <a href="#compare">Comparing both sides</a>
+  <a href="#ignore">Deploy-ignore rules</a>
+  <a href="#sync">Watched and synced folders</a>
+  <a href="#git">Publishing from git history</a>
+  <a href="#editor">Editors and VS Code</a>
+  <a href="#permissions">Permissions and symlinks</a>
+
+  <h4>Automation</h4>
+  <a href="#mcp">Letting Claude use your servers</a>
+  <a href="#grants">What Claude may do</a>
+
+  <h4>Safety</h4>
+  <a href="#vault">The vault</a>
+  <a href="#hostkeys">Host keys</a>
+  <a href="#files">Files on disk</a>
+
+  <h4>For hosting providers</h4>
+  <a href="#hosts-why">Why offer this</a>
+  <a href="#hosts-flow">The claim ticket flow</a>
+  <a href="#hosts-endpoint">The endpoint</a>
+  <a href="#hosts-payload">The connection payload</a>
+  <a href="#hosts-refused">What is always refused</a>
+  <a href="#hosts-ticket">Ticket rules</a>
+  <a href="#hosts-credentials">Which credential to send</a>
+  <a href="#hosts-fallback">When it is not installed</a>
+  <a href="#hosts-php">A working endpoint</a>
+  <a href="#hosts-security">Security checklist</a>
+  <a href="#hosts-testing">Testing your integration</a>
+
+  <h4>Reference</h4>
+  <a href="#shortcuts">Keyboard shortcuts</a>
+  <a href="#legacy">Older ways in</a>
+</nav>
+
+<main>
+
+<section id="top">
+  <p class="eyebrow">Handbook · version 1.12.0</p>
+  <h1>Sitekeeper</h1>
+  <p class="lede">
+    Save a server once - encrypted locally - then double-click it. What opens
+    depends on what you saved: an auto-logging-in phpMyAdmin tab, a real
+    <code>mysql&gt;</code> prompt, or a two-pane file manager that can keep a
+    folder deployed on every save or every git commit. Open as many as you like
+    at once, in tabs, two side by side.
+  </p>
+  <div class="pill-row">
+    <span class="pill">Windows</span>
+    <span class="pill">Python 3.10+</span>
+    <span class="pill">MIT licensed</span>
+    <span class="pill new">1.12.0 · one-click handover from hosting providers</span>
+  </div>
+
+  <div class="kinds">
+    <div class="kind">
+      <div class="kind-head">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="#8a8a92" stroke-width="1.5" aria-hidden="true">
+          <circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4"/><ellipse cx="10" cy="10" rx="3.4" ry="7.2"/>
+        </svg>
+        <h4>phpMyAdmin</h4>
+      </div>
+      <p>A browser tab that fills in the login form for you and keeps its own isolated session.</p>
+    </div>
+    <div class="kind">
+      <div class="kind-head">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="#8a8a92" stroke-width="1.5" aria-hidden="true">
+          <ellipse cx="10" cy="5.2" rx="6.4" ry="2.6"/>
+          <path d="M3.6 5.2v9.6c0 1.44 2.87 2.6 6.4 2.6s6.4-1.16 6.4-2.6V5.2"/>
+          <path d="M3.6 10c0 1.44 2.87 2.6 6.4 2.6s6.4-1.16 6.4-2.6"/>
+        </svg>
+        <h4>MySQL</h4>
+      </div>
+      <p>A real prompt on port 3306: ASCII result tables, multi-line statements, history, <code>\G</code>. No phpMyAdmin involved.</p>
+    </div>
+    <div class="kind">
+      <div class="kind-head">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <path d="M6 15V5.6M6 5.6 3.4 8.4M6 5.6 8.6 8.4" stroke="#8a8a92" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M13.4 5v9.4M13.4 14.4l-2.6-2.8M13.4 14.4l2.6-2.8" stroke="#8a8a92" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="14.2" y="2.4" width="4.4" height="3.4" rx="1" fill="#3ecf8e"/>
+        </svg>
+        <h4>SFTP / FTP / FTPS</h4>
+      </div>
+      <p>Local on the left, remote on the right: recursive transfers, hash comparison, and folders that deploy themselves.</p>
+    </div>
+  </div>
+
+  <p>
+    Sitekeeper was called <strong>MySQL Runner</strong> until 1.3.0. It stopped
+    being only about MySQL some releases ago and the name caught up. Saved
+    connections come across on first launch.
+  </p>
+</section>
+
+<hr class="rule">
+
+<section id="install">
+  <h2>Installing and first launch</h2>
+  <p class="section-note">
+    Windows only, 64-bit. Either run the installer, or run it from source with
+    Python 3.10 or newer.
+  </p>
+
+<pre><code><span class="c"># from source</span>
+python -m pip install -r requirements.txt
+python main.py</code></pre>
+
+  <h3>The master password, or no password at all</h3>
+  <p>
+    On first launch you choose how the vault is protected. Both options encrypt
+    your credentials on disk; they differ in what unlocks the key.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Choice</th><th>What happens</th><th>Cost</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Master password</strong></td>
+          <td>The key is derived from it with PBKDF2-HMAC-SHA256 and cached in the Windows Credential Manager, so you rarely retype it.</td>
+          <td>Nobody can recover your connections from the files alone - including you, if you forget it.</td>
+        </tr>
+        <tr>
+          <td><strong>No master password</strong></td>
+          <td>The key is sealed to your Windows account with DPAPI. The files stay encrypted and are useless on another account or machine.</td>
+          <td>Anyone who can run code as you on this machine can open them. Auto-lock is switched off, since re-unlocking would be instant.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p>You can switch between the two later in Settings; the stored servers survive either way.</p>
+</section>
+
+<section id="adding">
+  <h2>Adding connections</h2>
+  <p class="section-note">Five ways in, in rough order of how much typing they cost you.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Route</th><th>Where</th><th>Good for</th></tr></thead>
+      <tbody>
+        <tr><td><strong>From your hosting provider</strong></td><td>A button in their control panel</td><td>A new account. Nothing is typed - <a href="#handover">see below</a></td></tr>
+        <tr><td><strong>Add…</strong></td><td>The button under the list, or right-click ▸ <em>Add…</em></td><td>One connection, by hand</td></tr>
+        <tr><td><strong>A connection string</strong></td><td>File ▸ <em>Add from a connection string…</em></td><td>A URL someone sent you: <code>sftp://user:pass@host:22/var/www</code></td></tr>
+        <tr><td><strong>WinSCP</strong></td><td>File ▸ <em>Import from WinSCP or a URL list…</em></td><td>Adopting an existing install, passwords included</td></tr>
+        <tr><td><strong>An <code>.mrx</code> bundle</strong></td><td>File ▸ <em>Import connections…</em></td><td>Moving your own connections between machines</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    Whichever route, a connection carries: a label, the connection type, host
+    and port (or a phpMyAdmin URL), username and password, optionally a group,
+    an environment level, a starting directory on each side, and - for MySQL -
+    a database and a startup query to run on connect.
+  </p>
+
+  <h3>Harder-to-reach servers</h3>
+  <p>
+    A connection can reach its server <strong>through another saved
+    connection</strong> - name a bastion and its stored credentials are the ones
+    used, rather than repeating a host here. Anything stranger takes an
+    OpenSSH-style <code>ProxyCommand</code>, where <code>%h</code>,
+    <code>%p</code> and <code>%r</code> are replaced with the host, port and
+    username.
+  </p>
+</section>
+
+<section id="handover">
+  <h2>Connections from your host <span class="pill new">new in 1.12.0</span></h2>
+  <p class="section-note">
+    If your hosting company supports it, you never type any of this. Click
+    <strong>Open in Sitekeeper</strong> in their control panel and the account
+    appears in your sidebar - right host, right port, right protocol, opening
+    straight into your document root, tinted red if it is production.
+  </p>
+
+  <div class="flow">
+    <div class="step">
+      <h4>You click the button in your panel</h4>
+      <p>Your browser hands Sitekeeper a link. The link contains a single-use <em>ticket</em> and the name of the host that issued it. It contains no password - that is the whole point of the design.</p>
+    </div>
+    <div class="step">
+      <h4>Sitekeeper asks whether that host may add connections</h4>
+      <p>You see one thing at this stage: the hostname. Nothing has left your machine yet, and a name is the only claim a link makes that TLS is about to check. If you did not click anything, or do not recognise the address, cancel.</p>
+    </div>
+    <div class="step">
+      <h4>It presents the ticket over HTTPS</h4>
+      <p>The connection details come back from your provider, once, in answer to the ticket. The ticket is then spent.</p>
+    </div>
+    <div class="step">
+      <h4>You review exactly what is on offer</h4>
+      <p>Every connection is listed with its label, where it points, the folder it will open in and whether it is marked production - before a single credential reaches your vault.</p>
+    </div>
+  </div>
+
+  <h3>What Sitekeeper refuses on your behalf</h3>
+  <p>
+    A handover link can be sent to you by anyone, so the app treats every one of
+    them as hostile until you accept:
+  </p>
+  <ul>
+    <li>HTTPS only, with a certificate chain your system trusts. A certificate that does not check out means nothing is sent.</li>
+    <li>A hostname only - never a bare IP, and never a name that resolves onto loopback or a private range. A link cannot aim the app at your own network.</li>
+    <li>At most two redirects, and never off the host you were shown.</li>
+    <li>A fixed endpoint path, not one the link chooses.</li>
+    <li>An allowlist over what arrives. Settings that could <em>run</em> something - a local command on connect, a SQL script on connect, a folder on your PC - are dropped whatever the provider sends, and the review screen tells you which were dropped.</li>
+  </ul>
+
+  <div class="note key">
+    <p>
+      <strong>There is no "always allow this provider", and there will not be
+      one.</strong> The confirmation appears every time. Everything before it is
+      a string somebody else wrote; everything after it is a saved credential.
+    </p>
+  </div>
+
+  <h3>If the browser does nothing</h3>
+  <p>
+    Some browsers refuse custom links, and the scheme is only registered by the
+    1.12.0 installer. Your provider can hand you the same ticket as a
+    <strong><code>.skc</code> file</strong> instead - download it, open it, same
+    confirmation. Or paste the link by hand: <strong>File ▸ Add from a hosting
+    provider link…</strong>, also on the connection list's right-click menu.
+  </p>
+  <p>
+    Opening a handover link while Sitekeeper is already running hands it to that
+    window rather than starting a second copy with its own vault prompt.
+  </p>
+  <p>
+    Hosting companies: the contract you implement is in
+    <a href="#hosts-why">For hosting providers</a>, further down this page.
+  </p>
+</section>
+
+<hr class="rule">
+
+<section id="list">
+  <h2>Groups, categories, search</h2>
+  <p class="section-note">
+    Connections are filed by what they are - <strong>phpMyAdmin</strong>,
+    <strong>MySQL</strong> and <strong>Other (FTP/SFTP)</strong> - each heading
+    carrying its count, and empty categories are never drawn.
+  </p>
+  <p>
+    Give a connection a group of its own (Production, Client A…) and that wins
+    instead. <em>Move to a group…</em> on the right-click menu offers the groups
+    you already use. Drag rows to arrange a group by hand; a group nobody has
+    dragged stays alphabetical, so arranging one does not scramble the rest.
+  </p>
+  <p>
+    The search box matches <strong>hostnames as well as labels</strong>, so
+    <code>webhosting.cloudcore.cz</code> finds the account without your
+    remembering what you called it.
+  </p>
+  <p>
+    Right-click a connection to connect, open a terminal on it, hand it to PuTTY
+    or Windows Terminal, edit, duplicate it (credentials and all), move it to a
+    group, or delete it.
+  </p>
+
+  <h3>Sidebar and layout</h3>
+  <ul>
+    <li><kbd>Ctrl</kbd>+<kbd>B</kbd> collapses the sidebar to a slim rail that keeps an expand button in reach; <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> hides it outright. Its width is remembered, and dragging the divider almost shut snaps it to the rail.</li>
+    <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>S</kbd> splits the tab area in two, so you can watch a query in one pane and a file listing in the other. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd> throws the current tab to the other side.</li>
+    <li>The app is dark by default. <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> toggles the app theme; <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> separately themes phpMyAdmin's own pages with the bundled Dark Reader engine, which computes proper dark colours per element rather than inverting.</li>
+  </ul>
+</section>
+
+<section id="environments">
+  <h2>Environments and the production guard</h2>
+  <p class="section-note">
+    Mark a connection <strong>Dev</strong>, <strong>Staging</strong> or
+    <strong>Production</strong>. It is one field, and it changes how the app
+    behaves around that server.
+  </p>
+  <div class="pill-row">
+    <span class="pill">dev</span>
+    <span class="pill busy">staging</span>
+    <span class="pill prod">production</span>
+  </div>
+  <p>On a production connection:</p>
+  <ul>
+    <li>its tab gets a red dot and tint, and the transfer pane's edge turns red instead of blue, so you always know where you are;</li>
+    <li>uploads, deletes, symlink changes, commands and watcher syncs all ask first;</li>
+    <li>handing the connection to VS Code over Remote-SSH asks first, because from then on the editor writes straight to the live box;</li>
+    <li>Claude is granted access to it one connection at a time, beside that connection, so deploying to one live site does not arm the rest.</li>
+  </ul>
+  <div class="note">
+    <p>
+      <strong>Startup SQL</strong> is a separate field: a query run automatically
+      after login, for things like <code>SET NAMES utf8;</code>. It is typed by
+      you and never accepted from an import.
+    </p>
+  </div>
+</section>
+
+<hr class="rule">
+
+<section id="phpmyadmin">
+  <h2>phpMyAdmin tabs</h2>
+  <ul>
+    <li><strong>Auto-login</strong> - fills and submits the cookie login form, and answers HTTP Basic Auth prompts. The mode is auto-detected, or can be forced per server.</li>
+    <li><strong>Per-tab session isolation</strong> - each tab gets its own in-memory cookie jar, so the same server can be open twice without sharing a session. Closing a tab discards its cookies.</li>
+    <li><strong>Session cloning</strong> (<kbd>Ctrl</kbd>+<kbd>D</kbd>) - duplicates the current tab to get a second view into the <em>same</em> logged-in session. Inspect a table in one tab while a query runs in another.</li>
+  </ul>
+</section>
+
+<section id="console">
+  <h2>The MySQL console</h2>
+  <p class="section-note">
+    A native connection to port 3306 with the command-line client's behaviour,
+    inside a tab.
+  </p>
+  <ul>
+    <li>Bordered result tables, <code>Empty set</code> and <code>Query OK</code> summaries with timings.</li>
+    <li>Multi-line statements ending in <code>;</code>, and <code>\G</code> for vertical output.</li>
+    <li>Arrow-key history, plus the <code>\c</code>, <code>\s</code>, <code>\r</code> and <code>\q</code> backslash commands. <kbd>Ctrl</kbd>+<kbd>L</kbd> clears the screen.</li>
+    <li>Queries run on a worker thread, so the window never freezes, and oversized result sets are capped rather than swallowing your memory.</li>
+  </ul>
+</section>
+
+<section id="terminal">
+  <h2>Terminals</h2>
+  <p class="section-note">
+    Right-click any connection ▸ <em>Open a terminal</em> (or
+    <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd>) and you get a shell on that
+    server without opening the file manager first. Inside a transfer tab, the
+    <strong>Terminal</strong> button and <kbd>Ctrl</kbd>+<kbd>T</kbd> do the
+    same, starting in the directory you are looking at.
+  </p>
+  <p>
+    It is line-oriented on purpose. That is what lets it remember your commands
+    per server, suggest and complete them, <kbd>Ctrl</kbd>+<kbd>R</kbd> back
+    through them, and ask before something destructive on a production box. The
+    same menu hands the connection to PuTTY, Windows Terminal, <code>ssh.exe</code>
+    or WSL instead.
+  </p>
+  <div class="note">
+    <p>
+      <strong>FTP and FTPS connections get one too.</strong> FTP has no shell of
+      its own, but the server almost always answers on SSH with the same
+      account - which is usually how the files got there. Sitekeeper asks once
+      per connection before doing it, because that does send the saved password
+      to a different service, and then remembers the port you settle on
+      (<em>Edit ▸ SSH port for the terminal</em>).
+    </p>
+  </div>
+</section>
+
+<section id="server-tools">
+  <h2>Server-side tools</h2>
+  <p class="section-note">
+    Anything that would otherwise mean downloading a codebase is done on the
+    server instead. SFTP connections with a shell.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Archives</strong></td><td><code>tar.gz</code>, <code>tar.bz2</code>, <code>tar</code> and <code>zip</code> created and unpacked in place</td></tr>
+        <tr><td><strong>Content search</strong> <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd></td><td>ripgrep where it is installed, grep otherwise</td></tr>
+        <tr><td><strong>Disk usage</strong></td><td>An ncdu-style view you can walk into</td></tr>
+        <tr><td><strong>Log viewer</strong></td><td><code>tail -f</code> with a filter</td></tr>
+        <tr><td><strong>One command</strong> <kbd>Ctrl</kbd>+<kbd>P</kbd></td><td>Run a single command here and see its output</td></tr>
+        <tr><td><strong>Snippets</strong></td><td>A library of parameterised commands you keep</td></tr>
+        <tr><td><strong>Remote-SSH</strong></td><td>Hands the directory you are looking at to VS Code, on the server</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The app probes once at connect time, so accounts that are SFTP-only simply
+    do not show these buttons rather than failing when pressed. The Terminal
+    button stays, because a shell is a property of the server rather than of the
+    protocol you happen to be moving files with.
+  </p>
+</section>
+
+<hr class="rule">
+
+<section id="panes">
+  <h2>The dual pane</h2>
+  <p class="section-note">
+    SFTP, FTP and FTPS connections open a WinSCP-style two-pane view: local on
+    the left, remote on the right.
+  </p>
+  <ul>
+    <li>Browse both sides, transfer whole folders in either direction recursively, create directories, rename and delete.</li>
+    <li><strong>One obvious action at a time.</strong> Upload and Download sit in the same place always, and whichever pane you are working in decides which is <em>the</em> action: that one is filled blue and says what pressing it would do (<em>▲ Upload 12</em>, with the destination named), the other stays quiet. The server pane carries the same blue on its edge - red on a production connection - so the button and the folder it feeds are visibly a pair.</li>
+    <li>A pill in the corner is <span class="pill busy">connecting</span> then <span class="pill ok">connected</span>, or <span class="pill prod">not connected</span>.</li>
+    <li><strong>"Start here next time"</strong> - right-click any folder in either pane to make it where this connection opens. The two sides are remembered separately.</li>
+    <li><strong>Drag and drop, both ways.</strong> Drag rows between panes to copy them, and drop them <em>on a folder</em> to land inside it; the target tints as you hover. Hold a drag near the top or bottom edge and the listing scrolls itself. Local files can also be dragged out to Explorer or an editor, and dropped in from either.</li>
+    <li><strong>Back, Forward and a recent list</strong> per pane, plus mirrored navigation that keeps both sides on matching directories.</li>
+    <li><strong>Honest folder dates and sizes</strong> - a folder shows the newest timestamp anywhere below it and its real total size, instead of the server's own meaningless directory mtime. Sorting by <em>Modified</em> asks for that walk, so folders - which stay above files - are ordered by a date worth ordering by.</li>
+    <li><strong>Symlinks</strong> are shown in italics with their target, are navigable, and can be retargeted from the context menu. That is how you switch which release is live.</li>
+  </ul>
+</section>
+
+<section id="queue">
+  <h2>The transfer queue</h2>
+  <div class="note key">
+    <p>
+      <strong>A deploy of small files is limited by round trips, not
+      bandwidth.</strong> Each file costs an open, a write, a close and a rename
+      however small it is. So the queue runs on six separate connections by
+      default - configurable up to 16 - and the time divides almost exactly by
+      that number.
+    </p>
+  </div>
+  <ul>
+    <li>Ask for more connections than the server allows and Sitekeeper finds the ceiling and settles there, instead of failing the transfers into it.</li>
+    <li>Browsing keeps its own connection, so a running queue never blocks the panes.</li>
+    <li>Pause and resume mid-file, cancel one item or all of them, drag rows into the order you want, or push one to the front. <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> shows and hides it.</li>
+  </ul>
+</section>
+
+<section id="deploys">
+  <h2>Safe deploys and undo</h2>
+  <ul>
+    <li><strong>Nothing is served half-written.</strong> Uploads land on a scratch name and are renamed into place - atomically, where the server supports <code>posix-rename</code> - so a live request never sees a partial file.</li>
+    <li><strong>Undo an overwrite</strong> (<kbd>Ctrl</kbd>+<kbd>Z</kbd>). Whatever a transfer is about to replace is copied into a local cache first. The History window lists everything that was overwritten, with a Restore button per entry.</li>
+  </ul>
+  <div class="note">
+    <p>
+      Keeping the previous version means <em>downloading</em> it before the new
+      one goes up, which roughly doubles the time a redeploy takes. It is worth
+      having, and worth knowing about before a large one -
+      <em>Settings ▸ Transfers</em>.
+    </p>
+  </div>
+  <p>
+    Uploaded files are given your local modified date, which can be switched off
+    in the same place: it costs a round trip per file, and syncs compare content
+    rather than timestamps now, so it only affects how the dates read on the
+    server.
+  </p>
+</section>
+
+<section id="compare">
+  <h2>Comparing both sides</h2>
+  <p class="section-note">
+    <kbd>F9</kbd>, <em>Sync ▾</em>, or either pane's context menu.
+  </p>
+  <p>
+    Sitekeeper digests both sides, rolls folders up from their contents, and
+    marks every row <code>=</code>, <code>≠</code>, <code>→</code> or
+    <code>←</code>. The result window can upload or download exactly the files
+    you tick. On SFTP the hashing happens on the server.
+  </p>
+</section>
+
+<section id="ignore">
+  <h2>Deploy-ignore rules</h2>
+  <p class="section-note">
+    <code>.deployignore</code> or <code>.gitignore</code>, full gitignore
+    syntax, plus a built-in list: <code>node_modules</code>,
+    <code>vendor</code>, <code>.git</code>, caches, <code>.env</code>.
+  </p>
+  <p>
+    Rules apply to batch transfers, comparisons and the watcher. Right-click a
+    file or folder ▸ <em>Never deploy</em> writes the rule for you, anchored to
+    that exact path - a folder's rule takes everything below it - into the
+    <code>.deployignore</code> your transfers actually read, and anything
+    already watching re-reads it at once.
+  </p>
+  <div class="note">
+    <p>
+      <code>.gitignore</code> is read but <strong>never written to</strong>.
+      What you deploy is not what git tracks.
+    </p>
+  </div>
+</section>
+
+<section id="sync">
+  <h2>Watched and synced folders</h2>
+
+  <h3>Watch a folder</h3>
+  <p>
+    The tab notices files as your editor saves them and can upload each one
+    straight away. A file is only sent once its size and timestamp have settled,
+    so a half-written save never goes up.
+  </p>
+
+  <h3>Synced folders</h3>
+  <p>
+    Right-click a local folder ▸ <em>Sync folder</em> and pick when it should
+    reconcile itself:
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Trigger</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>On save</strong></td><td>Every file goes up as your editor writes it.</td></tr>
+        <tr><td><strong>On git commit</strong></td><td>The folder waits for the repository to record a commit, then compares the whole tree with the server and uploads what differs.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    A commit is the honest signal for a deploy: it means "this tree is the one I
+    want live", not "this one file changed".
+  </p>
+  <p>
+    Rules are remembered per connection and armed again next time you open the
+    tab. Synced folders are marked <code>⟳</code> in the pane, and
+    <em>Synced folders…</em> lists everything with its trigger.
+    <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> syncs the folder you are
+    looking at once, without arming it.
+  </p>
+
+  <h4>Scope</h4>
+  <p>
+    A rule can cover a folder <strong>with its subfolders</strong>, or
+    <strong>only the files sitting in it</strong> - which is how a site root gets
+    synced without dragging every subfolder up with it. Sync the root that way
+    and the loose files at the top (<code>index.php</code>, <code>.env</code>)
+    stay up to date while <code>assets/</code>, <code>includes/</code> and the
+    rest are left to their own rules. Arm a folder that already has synced
+    folders under it and it picks files-only by itself.
+  </p>
+
+  <h4>Removals</h4>
+  <div class="note danger">
+    <p>
+      Deleting a file locally deletes it on the server - but only ever inside a
+      folder that has a rule, and never below its scope. A full sync shows you
+      what only the server has before touching it. Put <code>uploads/</code>,
+      <code>logs/</code> and the like in <code>.deployignore</code> and no sync
+      will go near them.
+    </p>
+  </div>
+
+  <h4>Why comparison is by content, not timestamp</h4>
+  <p>
+    A modified time says when git wrote the file, not when its contents were
+    written. After a clone, a pull or a checkout - or with two people deploying
+    one repository from two machines - identical files look newer than the
+    copies already on the server, and every sync re-uploads the whole tree. So
+    Sitekeeper compares digests. On a server with a shell the whole remote side
+    is hashed by one command. <em>Settings ▸ Transfers</em> keeps the old
+    size-and-timestamp behaviour for the case where hashing is too slow and the
+    timestamps can be trusted.
+  </p>
+</section>
+
+<section id="git">
+  <h2>Publishing from git history</h2>
+  <p class="section-note"><em>Sync ▾ ▸ Git history…</em></p>
+  <p>
+    Reads the repository's log and sends any file <strong>as it was at any
+    commit</strong>: what one commit changed, for putting a single file back the
+    way it was before a bad change, or every file at that commit, for rolling a
+    folder back to a known-good release.
+  </p>
+  <p>
+    Nothing is checked out to do it. The old bytes are extracted to a scratch
+    folder and uploaded from there, so <code>HEAD</code> never moves and your
+    working copy is untouched.
+  </p>
+</section>
+
+<section id="editor">
+  <h2>Editors and VS Code</h2>
+  <ul>
+    <li><strong>A remote file</strong> - right-click it and it comes down as a scratch copy, opens in VS Code, and every save goes back to the server while the tab is open.</li>
+    <li><strong>A remote folder, on SFTP</strong> - VS Code opens it on the server itself over Remote-SSH. Nothing is downloaded, and its search, git and terminal are the server's.</li>
+  </ul>
+  <p>
+    VS Code makes that connection itself, so it asks for the key or password
+    rather than taking this app's. On a production connection Sitekeeper asks
+    first, because from then on the editor writes straight to the live box.
+  </p>
+  <p>
+    Insiders, Cursor, VSCodium and Windsurf work too
+    (<em>Settings ▸ File transfer</em> picks between them), and the local pane
+    has the same entry beside <em>Open in Explorer</em>.
+  </p>
+</section>
+
+<section id="permissions">
+  <h2>Permissions</h2>
+  <p>
+    Presets (755 / 644 / 400 / 775 …), a checkbox grid and an octal box that stay
+    in step. Recursive, with a files-only or folders-only scope, and a warning
+    before anything world-writable.
+  </p>
+</section>
+
+<hr class="rule">
+
+<section id="mcp">
+  <h2>Letting Claude use your servers</h2>
+  <p class="section-note">
+    Sitekeeper ships an MCP server, so Claude Code and Claude Desktop can
+    browse, deploy to and query the same servers the app manages - against the
+    same encrypted vault, with nothing re-configured.
+  </p>
+
+<pre><code>claude mcp add sitekeeper -- python -m mysql_runner.mcp</code></pre>
+
+  <h3>Read-only, always available</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>What it answers</th></tr></thead>
+      <tbody>
+        <tr><td><code>list_profiles</code></td><td>Which connections are in scope, and a warning when a label names a target the connection does not actually use</td></tr>
+        <tr><td><code>list_remote_dir</code></td><td>A listing with permissions, owner:group, size, time and symlink targets. <code>depth</code> walks subdirectories in one call</td></tr>
+        <tr><td><code>stat_remote</code></td><td>What one or more paths are: type, size, mode, ownership, link target</td></tr>
+        <tr><td><code>check_remote_access</code></td><td>Whether a given user - <code>www-data</code> by default - can read, write and traverse these paths, and what is in the way</td></tr>
+        <tr><td><code>read_remote_file</code></td><td>Contents. <code>tail_lines</code> reads the end of a log, <code>offset</code> a window, so a 200 MB error log costs what a small one does</td></tr>
+        <tr><td><code>search_remote</code></td><td><code>grep -rn</code> on the server, ripgrep where installed</td></tr>
+        <tr><td><code>diff_remote</code></td><td>Whether a local path matches a remote one, by content digest, file or whole tree</td></tr>
+        <tr><td><code>download_file</code></td><td>One file, fetched</td></tr>
+        <tr><td><code>list_undo_history</code></td><td>The restore points Sitekeeper kept, with the ids <code>undo_remote_change</code> takes</td></tr>
+        <tr><td><code>run_query</code></td><td>SQL on a MySQL profile. <code>via=</code>an SFTP profile on that server runs it through the server's own <code>mysql</code> client - which makes a phpMyAdmin profile usable, and is the only way into a database listening on localhost</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Writing, once granted</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>upload_files</code></td><td>A named list of files in one call. <code>base_dir</code> keeps each file's path relative to a local root; <code>dry_run</code> reports new / would-overwrite / already-identical and sends nothing</td></tr>
+        <tr><td><code>upload_folder</code></td><td>A whole directory, ignore rules honoured. <strong>Merges; never deletes</strong></td></tr>
+        <tr><td><code>upload_file</code></td><td>One file</td></tr>
+        <tr><td><code>make_remote_dir</code></td><td>Parents included; does nothing to a directory that exists</td></tr>
+        <tr><td><code>chmod_remote</code></td><td>Octal only, symbolic modes refused; recursive with a files or dirs scope</td></tr>
+        <tr><td><code>chown_remote</code></td><td>Owner and/or group; needs a shell, and root for an owner change</td></tr>
+        <tr><td><code>move_remote</code></td><td>Rename or move on the server; falls back to <code>mv</code> across filesystems</td></tr>
+        <tr><td><code>copy_remote</code></td><td><code>cp -a</code> on the server</td></tr>
+        <tr><td><code>symlink_remote</code></td><td>Point a name at another path. SFTP only; refuses to replace a real file</td></tr>
+        <tr><td><code>undo_remote_change</code></td><td>Put one file back from a restore point</td></tr>
+        <tr><td><code>run_command</code></td><td>One shell command, its output and exit status</td></tr>
+        <tr><td><code>delete_remote</code></td><td>The destructive one: a directory goes recursively</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <p>
+      Every description states what the tool does to the server - "read only",
+      "merges; never deletes", "a directory goes recursively" - because a tool
+      description is the whole of the interface a model sees, and a caller who
+      cannot rule out the destructive reading will do the job by hand instead.
+    </p>
+  </div>
+</section>
+
+<section id="grants">
+  <h2>What Claude may do</h2>
+  <p class="section-note">
+    <strong>Tools → Connect Claude.</strong> The ticks <em>are</em> the
+    permission: they are read on every tool call, so they take effect at once,
+    in every project, with nothing restarted.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Ticked</th><th>Grants</th></tr></thead>
+      <tbody>
+        <tr><td><em>nothing</em></td><td>Listings with permissions, stats, access reports, file reads, remote search, diffs, downloads, restore-point list, <code>SELECT</code>-style SQL</td></tr>
+        <tr><td>Upload files and create folders</td><td>Uploads, mkdir, chmod, chown, move, copy, symlink, and restoring from a restore point</td></tr>
+        <tr><td>Delete files and folders</td><td>Deleting remote files and directories</td></tr>
+        <tr><td>Run SQL that changes data</td><td>Anything past <code>SELECT</code> / <code>SHOW</code> / <code>DESCRIBE</code> / <code>EXPLAIN</code></td></tr>
+        <tr><td>Run commands on the server</td><td><code>run_command</code>: one shell command per call</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Connections marked <span class="pill prod">production</span> are granted one
+    at a time, beside that connection. The same window limits which connections
+    Claude can see at all.
+  </p>
+
+  <h3>The work happens in the app</h3>
+  <p>
+    While Sitekeeper is running, everything Claude does to a server is carried
+    out by the tab that already holds that connection, over a loopback socket:
+  </p>
+  <ul>
+    <li><strong>Uploads and downloads</strong> become transfer-queue rows - cancellable, rate-limited, and undoable with <em>Undo replace</em>.</li>
+    <li><strong>Deletes</strong> go through the tab that owns the shadow-backup journal, so they can be restored from <em>History</em>.</li>
+    <li><strong>Queries</strong> run in the SQL console open on that connection, statement and output landing in the transcript, marked as Claude's.</li>
+    <li><strong>Commands</strong> run on the connection that tab already has open, so nothing logs in a second time and what Claude ran joins the history you recall with <kbd>↑</kbd>.</li>
+  </ul>
+  <p>
+    Each call waits for the work to really finish, so Claude reports what
+    happened rather than that it submitted something. With the app closed, the
+    server does the work itself and says which of the two it did. Credentials
+    are never exposed through the tools.
+  </p>
+</section>
+
+<hr class="rule">
+
+<section id="vault">
+  <h2>The vault</h2>
+  <ul>
+    <li>A random Data Encryption Key protects every credential. Nothing is ever written to disk in plaintext.</li>
+    <li>The key lives in memory only while the app runs, and is wiped on <strong>Lock</strong> or idle auto-lock - 15 minutes by default, configurable. Auto-lock is off when there is no master password, since re-unlocking would be instant.</li>
+    <li>Exported <code>.mrx</code> files are encrypted with a passphrase you choose. Keep that passphrase safe; there is no way back without it.</li>
+  </ul>
+</section>
+
+<section id="hostkeys">
+  <h2>Host keys</h2>
+  <p>
+    The first time you connect over SFTP there is nothing to check the server's
+    identity against, so Sitekeeper shows you the fingerprint and asks - in both
+    SHA256 and MD5 form, because the value you have to compare against is often
+    a control panel that still prints MD5.
+  </p>
+  <p>
+    Accepted keys are recorded in <code>known_hosts</code>. If a known host's key
+    later changes, <strong>the connection is refused rather than trusted</strong>.
+    When a server has genuinely been rekeyed, delete its line from that file.
+  </p>
+</section>
+
+<section id="files">
+  <h2>Files on disk</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Path</th><th>Holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>%APPDATA%\Sitekeeper\vault.json</code></td><td>Encrypted key metadata</td></tr>
+        <tr><td><code>%APPDATA%\Sitekeeper\servers.enc</code></td><td>The connections, encrypted</td></tr>
+        <tr><td><code>%APPDATA%\Sitekeeper\settings.json</code></td><td>Interface preferences, plain JSON</td></tr>
+        <tr><td><code>%APPDATA%\Sitekeeper\sync_rules.json</code></td><td>Synced folders and their triggers</td></tr>
+        <tr><td><code>%APPDATA%\Sitekeeper\known_hosts</code></td><td>SSH host keys you have accepted</td></tr>
+        <tr><td><code>%APPDATA%\Sitekeeper\mcp_policy.json</code></td><td>What Claude may do - kept out of settings deliberately, because a permission grant should not be reset by anything that resets the interface</td></tr>
+        <tr><td><code>%APPDATA%\Sitekeeper\keys\</code></td><td>Private keys handed over by a hosting provider, written only after you accept</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Uninstalling leaves all of this intact.</p>
+</section>
+
+<hr class="rule">
+
+<section id="hosts-why">
+  <p class="eyebrow">Part two</p>
+  <h2>For hosting providers</h2>
+  <p class="lede">
+    How to put an <strong>Open in Sitekeeper</strong> button next to an account
+    in your control panel, so a customer goes from "here are your FTP details"
+    to a working, saved connection without ever seeing a password field.
+  </p>
+  <p>
+    Written for the engineers who build the panel. It assumes you can add a
+    button to a page and an authenticated endpoint to your backend, and nothing
+    about Sitekeeper beyond that.
+  </p>
+
+  <h3>The moment this replaces</h3>
+  <p>
+    A customer who buys hosting gets six facts: a hostname, a port, a username, a
+    password, a protocol and a directory. They open a transfer client and retype
+    all six, usually wrongly, usually into a client that stores the password in
+    something reversible. The first support ticket of the account's life is
+    often <em>"I can't connect"</em>.
+  </p>
+  <p>
+    One click replaces that. And because you know the document root and they do
+    not, the pane opens on their website rather than on <code>bin</code>,
+    <code>etc</code>, <code>logs</code>, <code>tmp</code> and - somewhere down
+    there - their website.
+  </p>
+
+  <h3>What ships where</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Route</th><th>Customer effort</th><th>Version</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Claim ticket</strong> - a <code>sitekeeper://</code> link</td><td>One click, one confirmation</td><td><strong>1.12.0</strong></td></tr>
+        <tr><td><strong>Ticket file</strong> - you serve a <code>.skc</code></td><td>One download, one double-click, one confirmation</td><td><strong>1.12.0</strong></td></tr>
+        <tr><td><strong>Connection-string list</strong> - a <code>.txt</code></td><td>Download, then a menu and a file picker</td><td>1.11.0</td></tr>
+        <tr><td><strong>Encrypted bundle</strong> - a <code>.mrx</code> and a passphrase</td><td>Download, menu, file picker, passphrase</td><td>1.11.0</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Build the claim ticket. The <code>.skc</code> file is the same backend
+    endpoint behind a different button, so it costs almost nothing once the
+    first is done, and it covers customers whose browser refuses custom schemes.
+  </p>
+</section>
+
+<section id="hosts-flow">
+  <h2>The claim ticket flow</h2>
+  <div class="note key">
+    <p>
+      <strong>The link carries a ticket, never a credential.</strong>
+      Credentials travel one way only: over TLS, from your backend, in response
+      to a request that presents that ticket exactly once.
+    </p>
+  </div>
+
+  <div class="flow">
+    <div class="step">
+      <h4>Your panel mints a ticket and opens the link</h4>
+      <p>On a <code>POST</code> from the button - never on page render.</p>
+<pre><code>sitekeeper://provision/v1?src=panel.example.com&amp;t=&lt;ticket&gt;</code></pre>
+    </div>
+    <div class="step">
+      <h4>Sitekeeper shows the customer your hostname</h4>
+      <p>And nothing else. Not your product name, not the connection count, not a label - anything a link says about itself is something a forged link says just as convincingly.</p>
+    </div>
+    <div class="step">
+      <h4>It fetches the payload from you</h4>
+      <p>A single HTTPS <code>GET</code> to a fixed path on <code>src</code>, with the ticket as a bearer token. You redeem it and burn it.</p>
+    </div>
+    <div class="step">
+      <h4>The customer reviews and accepts</h4>
+      <p>Only then do the credentials reach the vault.</p>
+    </div>
+  </div>
+
+  <h3>The link</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Parameter</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>src</code></td><td>The host Sitekeeper will fetch from. A hostname, optionally <code>host:port</code>. No scheme, no path, no <code>user@</code>.</td></tr>
+        <tr><td><code>t</code></td><td>The ticket. Opaque to Sitekeeper. URL-safe printable ASCII, at least 128 bits of entropy, at most 512 characters.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    That is the whole link. There is deliberately <strong>no <code>url=</code>
+    parameter</strong>: a caller-supplied URL in a link anyone can send is
+    exactly the hole this design closes. The only thing shown to the customer
+    before a byte leaves their machine is <code>src</code>, and <code>src</code>
+    is the one thing TLS will verify a moment later.
+  </p>
+</section>
+
+<section id="hosts-endpoint">
+  <h2>The endpoint</h2>
+  <p class="section-note">
+    Sitekeeper derives the URL from <code>src</code> and a fixed path. You do
+    not get to choose the path.
+  </p>
+
+<pre><code><span class="k">GET</span> https://panel.example.com/.well-known/sitekeeper/v1/provision
+Authorization: Bearer &lt;ticket&gt;
+Accept: application/json
+Cache-Control: no-store
+Connection: close
+User-Agent: Sitekeeper/1.12.0 (Windows)</code></pre>
+
+  <p>Enforced by the app, none of it negotiable:</p>
+  <ul>
+    <li><strong>HTTPS with a valid chain.</strong> No self-signed certificates, no exceptions, no plain HTTP even on a port you think is internal.</li>
+    <li><strong>No IP literals in <code>src</code></strong>, and no name resolving to loopback, link-local or an RFC 1918 address.</li>
+    <li><strong>At most two redirects, same host only.</strong> A redirect to another host is a failure, not a hop; so is a downgrade to HTTP.</li>
+    <li><strong>At most 256 KB, at most 50 connections.</strong></li>
+    <li>A response that takes more than 15 seconds is abandoned.</li>
+  </ul>
+
+  <h3>The response</h3>
+<pre><code>{
+  <span class="s">"version"</span>: 1,
+  <span class="s">"issuer"</span>: <span class="s">"CloudCore Webhosting"</span>,
+  <span class="s">"expires_at"</span>: <span class="s">"2026-09-15T12:14:11Z"</span>,
+  <span class="s">"connections"</span>: [
+    {
+      <span class="s">"label"</span>:       <span class="s">"example.cz - web"</span>,
+      <span class="s">"kind"</span>:        <span class="s">"sftp"</span>,
+      <span class="s">"host"</span>:        <span class="s">"web12.cloudcore.cz"</span>,
+      <span class="s">"port"</span>:        22,
+      <span class="s">"username"</span>:    <span class="s">"example_cz"</span>,
+      <span class="s">"password"</span>:    <span class="s">"…"</span>,
+      <span class="s">"remote_dir"</span>:  <span class="s">"/home/example_cz/public_html"</span>,
+      <span class="s">"group"</span>:       <span class="s">"example.cz"</span>,
+      <span class="s">"environment"</span>: <span class="s">"prod"</span>
+    },
+    {
+      <span class="s">"label"</span>:       <span class="s">"example.cz - database"</span>,
+      <span class="s">"kind"</span>:        <span class="s">"mysql"</span>,
+      <span class="s">"host"</span>:        <span class="s">"sql12.cloudcore.cz"</span>,
+      <span class="s">"username"</span>:    <span class="s">"example_cz_admin"</span>,
+      <span class="s">"password"</span>:    <span class="s">"…"</span>,
+      <span class="s">"database"</span>:    <span class="s">"example_cz_wp"</span>,
+      <span class="s">"group"</span>:       <span class="s">"example.cz"</span>,
+      <span class="s">"environment"</span>: <span class="s">"prod"</span>
+    }
+  ]
+}</code></pre>
+
+  <p>
+    <code>issuer</code> is what the confirmation dialog names as the source. It
+    is rendered as plain text - markup, control characters and right-to-left
+    overrides are stripped, because a dialog asking "do you trust this" must not
+    let the thing being trusted paint the dialog. <code>expires_at</code> is
+    advisory, for display; the ticket's real lifetime is whatever your backend
+    enforces.
+  </p>
+
+  <h3>Errors</h3>
+  <p>Anything other than <code>200</code> is a failure the customer sees. Use the shape:</p>
+<pre><code>{ <span class="s">"error"</span>: <span class="s">"ticket_expired"</span>,
+  <span class="s">"message"</span>: <span class="s">"This link has already been used. Generate a new one from your panel."</span> }</code></pre>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Status</th><th><code>error</code></th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><code>401</code></td><td><code>ticket_invalid</code></td><td>Unknown, malformed, or already redeemed</td></tr>
+        <tr><td><code>401</code></td><td><code>ticket_expired</code></td><td>Past its lifetime</td></tr>
+        <tr><td><code>403</code></td><td><code>not_permitted</code></td><td>The account no longer exists or lost access</td></tr>
+        <tr><td><code>429</code></td><td><code>rate_limited</code></td><td>Honour this with <code>Retry-After</code></td></tr>
+        <tr><td><code>503</code></td><td><code>unavailable</code></td><td>Your side is down - say so rather than returning an empty list</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    <code>message</code> is shown to the customer as plain text. Write it for
+    them, not for your logs: <em>"Generate a new one from your panel"</em> beats
+    <em>"token nonce mismatch"</em>.
+  </p>
+</section>
+
+<section id="hosts-payload">
+  <h2>The connection payload</h2>
+  <p class="section-note">
+    Only <code>label</code>, <code>kind</code> and the fields that kind needs are
+    required. Unknown fields are ignored rather than rejected, so a field added
+    in a later version will not break a panel written today.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>Applies to</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>label</code></td><td>all</td><td>What the customer sees. Lead with the domain: <em>example.cz - web</em>, not <em>SFTP Account 1</em>. Trimmed at 120 characters</td></tr>
+        <tr><td><code>kind</code></td><td>all</td><td><code>sftp</code>, <code>ftp</code>, <code>ftps</code>, <code>mysql</code> or <code>phpmyadmin</code></td></tr>
+        <tr><td><code>host</code></td><td>all but phpMyAdmin</td><td>Hostname or IP of the service</td></tr>
+        <tr><td><code>port</code></td><td>all but phpMyAdmin</td><td>Omit or <code>0</code> for the protocol default - 22 / 21 / 3306</td></tr>
+        <tr><td><code>username</code>, <code>password</code></td><td>all</td><td>See <a href="#hosts-credentials">which credential to send</a></td></tr>
+        <tr><td><code>url</code></td><td>phpMyAdmin</td><td>Full <code>https://</code> URL of the login page. Any other scheme is refused</td></tr>
+        <tr><td><code>auth_type</code></td><td>phpMyAdmin</td><td><code>auto</code> (default), <code>cookie</code> or <code>basic</code></td></tr>
+        <tr><td><code>database</code></td><td>mysql</td><td>Pre-selects a schema</td></tr>
+        <tr><td><code>remote_dir</code></td><td>transfer kinds</td><td>Absolute path the remote pane opens in. <strong>Set this</strong> - it is the field that earns the integration</td></tr>
+        <tr><td><code>private_key</code></td><td>sftp</td><td>PEM private key. Written to <code>%APPDATA%\Sitekeeper\keys</code> only after the customer accepts</td></tr>
+        <tr><td><code>passive</code></td><td>ftp, ftps</td><td>Default <code>true</code></td></tr>
+        <tr><td><code>ssh_port</code></td><td>ftp, ftps</td><td>The SSH port on the same host, if the account has shell access. Lets the terminal work without asking the customer</td></tr>
+        <tr><td><code>use_agent</code></td><td>sftp</td><td>Default <code>true</code></td></tr>
+        <tr><td><code>group</code></td><td>all</td><td>Use the domain or account name. A customer with nine sites gets nine tidy groups instead of one wall of entries</td></tr>
+        <tr><td><code>environment</code></td><td>all</td><td><code>none</code>, <code>dev</code>, <code>staging</code> or <code>prod</code>. Set it honestly - <code>prod</code> is what turns on the guard</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="hosts-refused">
+  <h2>What is always refused</h2>
+  <p class="section-note">
+    Sending these is not an error you will notice - they are dropped and the
+    customer is told which - but know why, because each was taken away from you
+    on purpose.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>proxy_command</code></td><td>A local shell command run on connect. A remote party setting it is remote code execution on your customer's PC. There is no version of this that will ever be accepted from a payload</td></tr>
+        <tr><td><code>local_dir</code></td><td>A folder on the customer's machine. Combined with a synced folder it becomes a write target chosen by someone not at the keyboard</td></tr>
+        <tr><td><code>startup_script</code></td><td>SQL that runs automatically on every connect. "Runs by itself" belongs to the person who owns the machine</td></tr>
+        <tr><td><code>private_key_path</code></td><td>A path into the customer's filesystem. To ship a key, send <code>private_key</code> instead</td></tr>
+        <tr><td><code>jump_profile_id</code></td><td>Refers to an id in <em>that</em> vault. It cannot mean anything from outside it</td></tr>
+        <tr><td><code>id</code>, <code>order</code></td><td>Assigned locally. An import that could pick its own id could overwrite an existing connection</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="hosts-ticket">
+  <h2>Ticket rules</h2>
+  <p class="section-note">
+    These are your responsibility, and they are the whole security model. The
+    app's checks protect the customer from a forged link; only these protect the
+    account.
+  </p>
+  <ol>
+    <li><strong>One use.</strong> Redeem it inside a transaction and burn it. A second <code>GET</code> returns <code>401</code>, even ten milliseconds later, even from the same IP.</li>
+    <li><strong>Short-lived.</strong> Ten minutes is generous. The customer is standing at the screen; they are not coming back tomorrow.</li>
+    <li><strong>Bound to the session that minted it.</strong> A ticket is proof that <em>this</em> logged-in customer asked, at <em>this</em> moment, for <em>these</em> accounts. It is not a bearer key to the account.</li>
+    <li><strong>Scoped to what the button was next to.</strong> A ticket minted by the FTP page of <code>example.cz</code> returns that account - not every account the customer owns, and certainly not anyone else's.</li>
+    <li><strong>Minted on <code>POST</code>, never on page render.</strong> A ticket that exists because a page was loaded is a ticket in the browser history, in your access log, and in the referrer sent to every third-party script on that page.</li>
+    <li><strong>Revocable.</strong> Password changed, account suspended, customer clicked "that wasn't me" - every outstanding ticket for that account dies.</li>
+  </ol>
+</section>
+
+<section id="hosts-credentials">
+  <h2>Which credential to send</h2>
+  <p class="section-note">
+    The obvious payload is the customer's own FTP password, which your panel
+    already knows. It works, and over a one-time TLS fetch it is defensible. In
+    order of preference:
+  </p>
+  <div class="flow">
+    <div class="step">
+      <h4>Mint a dedicated credential for this handover</h4>
+      <p>An SFTP sub-account or a scoped FTP user, created when the ticket is redeemed and named so the customer can see it in your panel (<code>example_cz-sitekeeper</code>) and revoke it in one click without touching the password they use elsewhere. If the machine is later lost or sold, that is one revocation, not a password reset cascade.</p>
+    </div>
+    <div class="step">
+      <h4>Ship a key instead of a password</h4>
+      <p>Generate an Ed25519 pair, install the public half in the account's <code>authorized_keys</code>, and send the private half as <code>private_key</code>. Sitekeeper writes it into its own storage - only after the customer accepts - and points the connection at it. The password never exists.</p>
+    </div>
+    <div class="step">
+      <h4>Send the existing password</h4>
+      <p>Acceptable. If you do, do not also print it on the page next to the button: having built a flow where the customer never sees the password, do not undo it.</p>
+    </div>
+  </div>
+  <p>
+    Whichever you choose, tell the customer in your panel what happened.
+    <em>"Added to Sitekeeper on 15 Sep - revoke"</em> is the line that turns a
+    credential handover into something they can audit.
+  </p>
+</section>
+
+<section id="hosts-fallback">
+  <h2>When it is not installed</h2>
+  <p class="section-note">
+    You cannot reliably ask a browser whether a custom scheme is registered.
+    Every technique is a timing heuristic that breaks on the next browser
+    release, and its failure mode - a customer staring at a page where nothing
+    happened - is the one you were trying to avoid. So do not detect. Make both
+    paths visible and cheap.
+  </p>
+
+<pre><code>&lt;a class="primary" href="sitekeeper://provision/v1?src=panel.example.com&amp;t=TICKET"&gt;
+  Open in Sitekeeper
+&lt;/a&gt;
+&lt;p class="muted"&gt;
+  Nothing happened?
+  &lt;a href="https://example.com/sitekeeper"&gt;Install Sitekeeper&lt;/a&gt;,
+  then click the button above again.
+&lt;/p&gt;</code></pre>
+
+  <p>Two things make that second sentence work:</p>
+  <ul>
+    <li><strong>Re-mint on every click.</strong> The customer is going to leave for four minutes to run an installer. Having the button <code>POST</code> for a fresh ticket each time is simpler than a long lifetime, and strictly better.</li>
+    <li><strong>Link the publisher's own signed installer.</strong> Do not re-host the <code>.exe</code> on your CDN. A mirrored copy goes stale, loses its signature more often than you would believe, and trains your customers to accept a hosting company's unsigned binary - exactly the habit a phishing page needs them to have.</li>
+  </ul>
+
+  <h3>The <code>.skc</code> file</h3>
+  <p>
+    Serve the same ticket as a file and the URL scheme is not involved at all.
+    It is the two link parameters as JSON:
+  </p>
+<pre><code>{ <span class="s">"version"</span>: 1, <span class="s">"src"</span>: <span class="s">"panel.example.com"</span>, <span class="s">"ticket"</span>: <span class="s">"…"</span> }</code></pre>
+  <p>
+    Serve it as <code>application/vnd.sitekeeper.claim+json</code> with
+    <code>Content-Disposition: attachment; filename="example.cz.skc"</code>. The
+    1.12.0 installer associates the extension, so opening it runs the same
+    endpoint, payload and confirmation.
+  </p>
+</section>
+
+<section id="hosts-php">
+  <h2>A working endpoint</h2>
+  <p class="section-note">
+    Two routes: one that mints a ticket for the button, one that redeems it. PHP
+    because most panels are, but nothing here is PHP-specific.
+  </p>
+
+<pre><code><span class="c">// POST /panel/sitekeeper/start - behind your session auth + CSRF check.</span>
+<span class="k">function</span> sitekeeper_start(<span class="k">int</span> $customerId, <span class="k">string</span> $domain): <span class="k">string</span> {
+    $ticket = rtrim(strtr(base64_encode(random_bytes(32)), <span class="s">'+/'</span>, <span class="s">'-_'</span>), <span class="s">'='</span>);
+
+    db()-&gt;insert(<span class="s">'sitekeeper_ticket'</span>, [
+        <span class="s">'hash'</span>        =&gt; hash(<span class="s">'sha256'</span>, $ticket),  <span class="c">// never store the ticket itself</span>
+        <span class="s">'customer_id'</span> =&gt; $customerId,
+        <span class="s">'domain'</span>      =&gt; $domain,                 <span class="c">// rule 4: scope it</span>
+        <span class="s">'session_id'</span>  =&gt; session_id(),            <span class="c">// rule 3: bind it</span>
+        <span class="s">'expires_at'</span>  =&gt; time() + 600,            <span class="c">// rule 2: ten minutes</span>
+        <span class="s">'used_at'</span>     =&gt; <span class="k">null</span>,
+    ]);
+
+    <span class="k">return</span> <span class="s">'sitekeeper://provision/v1?src='</span> . rawurlencode(PANEL_HOST)
+         . <span class="s">'&amp;t='</span> . rawurlencode($ticket);
+}</code></pre>
+
+<pre><code><span class="c">// GET /.well-known/sitekeeper/v1/provision</span>
+header(<span class="s">'Content-Type: application/json; charset=utf-8'</span>);
+header(<span class="s">'Cache-Control: no-store'</span>);
+
+$auth = $_SERVER[<span class="s">'HTTP_AUTHORIZATION'</span>] ?? <span class="s">''</span>;
+<span class="k">if</span> (!preg_match(<span class="s">'/^Bearer (\S+)$/'</span>, $auth, $m)) {
+    http_response_code(401);
+    <span class="k">exit</span>(json_encode([<span class="s">'error'</span> =&gt; <span class="s">'ticket_invalid'</span>,
+        <span class="s">'message'</span> =&gt; <span class="s">'That link is not valid. Generate a new one from your panel.'</span>]));
+}
+
+<span class="c">// Rule 1: redeem and burn in one transaction. A second GET must lose.</span>
+$row = db()-&gt;transaction(<span class="k">function</span> () <span class="k">use</span> ($m) {
+    $t = db()-&gt;selectForUpdate(<span class="s">'sitekeeper_ticket'</span>, [<span class="s">'hash'</span> =&gt; hash(<span class="s">'sha256'</span>, $m[1])]);
+    <span class="k">if</span> (!$t || $t[<span class="s">'used_at'</span>] !== <span class="k">null</span> || $t[<span class="s">'expires_at'</span>] &lt; time()) <span class="k">return</span> <span class="k">null</span>;
+    db()-&gt;update(<span class="s">'sitekeeper_ticket'</span>, [<span class="s">'used_at'</span> =&gt; time()], [<span class="s">'id'</span> =&gt; $t[<span class="s">'id'</span>]]);
+    <span class="k">return</span> $t;
+});
+
+<span class="k">if</span> (!$row) {
+    http_response_code(401);
+    <span class="k">exit</span>(json_encode([<span class="s">'error'</span> =&gt; <span class="s">'ticket_expired'</span>,
+        <span class="s">'message'</span> =&gt; <span class="s">'This link has already been used. Generate a new one from your panel.'</span>]));
+}
+
+$account = account_for($row[<span class="s">'customer_id'</span>], $row[<span class="s">'domain'</span>]);
+audit_log($row[<span class="s">'customer_id'</span>], <span class="s">'sitekeeper.redeemed'</span>, $_SERVER[<span class="s">'REMOTE_ADDR'</span>]);
+
+<span class="k">echo</span> json_encode([
+    <span class="s">'version'</span>     =&gt; 1,
+    <span class="s">'issuer'</span>      =&gt; PANEL_BRAND,
+    <span class="s">'expires_at'</span>  =&gt; gmdate(<span class="s">'c'</span>, $row[<span class="s">'expires_at'</span>]),
+    <span class="s">'connections'</span> =&gt; [
+        [
+            <span class="s">'label'</span>       =&gt; $account[<span class="s">'domain'</span>] . <span class="s">' - web'</span>,
+            <span class="s">'kind'</span>        =&gt; <span class="s">'sftp'</span>,
+            <span class="s">'host'</span>        =&gt; $account[<span class="s">'ftp_host'</span>],
+            <span class="s">'port'</span>        =&gt; 22,
+            <span class="s">'username'</span>    =&gt; $account[<span class="s">'ftp_user'</span>],
+            <span class="s">'password'</span>    =&gt; $account[<span class="s">'ftp_pass'</span>],
+            <span class="s">'remote_dir'</span>  =&gt; $account[<span class="s">'docroot'</span>],   <span class="c">// the field that earns it</span>
+            <span class="s">'group'</span>       =&gt; $account[<span class="s">'domain'</span>],
+            <span class="s">'environment'</span> =&gt; <span class="s">'prod'</span>,
+        ],
+    ],
+], JSON_UNESCAPED_SLASHES);</code></pre>
+</section>
+
+<section id="hosts-security">
+  <h2>Security checklist</h2>
+  <div class="note danger">
+    <p>
+      <strong>Never put a credential in the link.</strong> A URL passed to a
+      shell handler lands in the browser's history and its address bar, in your
+      access logs if the page reloads with it, in the referrer header, in the
+      clipboard the moment anyone right-clicks <em>Copy link address</em>, and on
+      Windows in a process command line other processes can read. TLS protects
+      none of that. The endpoint fetch is the only place credentials belong.
+    </p>
+  </div>
+  <p>
+    Assume every link is hostile until the dialog is accepted. Anyone can send
+    your customer a <code>sitekeeper://</code> link naming your panel. What stops
+    it is that the ticket is worthless without your backend honouring it, and
+    your backend only honours tickets it minted for a live session - which is
+    why rules 1, 3 and 5 are not garnish.
+  </p>
+  <ul class="checklist">
+    <li>Tickets minted on <code>POST</code>, behind session auth and CSRF protection</li>
+    <li>Single use, burned inside a transaction</li>
+    <li>Expiry of ten minutes or less, enforced server-side</li>
+    <li>Scoped to the one account the button was next to</li>
+    <li>Revoked on password change, suspension and account deletion</li>
+    <li>Redemptions logged with time, IP and what was handed over - and shown to the customer in their panel</li>
+    <li>Rate limited per account and per IP</li>
+    <li>Endpoint returns <code>Cache-Control: no-store</code> and never enters a CDN cache</li>
+    <li>The ticket is in no URL that gets logged, cached, or sent as a referrer</li>
+    <li><code>environment</code> set to <code>prod</code> for production accounts</li>
+  </ul>
+  <p>
+    If your onboarding depends on the customer not seeing a confirmation dialog,
+    this integration is not the one you want. It appears every time, and there
+    is no allowlist to get onto.
+  </p>
+</section>
+
+<section id="hosts-testing">
+  <h2>Testing your integration</h2>
+<pre><code><span class="c"># Should return the payload exactly once.</span>
+curl -sS -H <span class="s">"Authorization: Bearer $TICKET"</span> \
+     https://panel.example.com/.well-known/sitekeeper/v1/provision | jq .
+
+<span class="c"># The same call again should be 401 ticket_invalid.</span>
+curl -sS -o /dev/null -w <span class="s">'%{http_code}\n'</span> -H <span class="s">"Authorization: Bearer $TICKET"</span> \
+     https://panel.example.com/.well-known/sitekeeper/v1/provision</code></pre>
+
+  <p>Then the four failures that actually happen in production:</p>
+  <ol>
+    <li>The customer clicks the button twice in a row. Fresh ticket each click, or a clear "already used" message - never a silent nothing.</li>
+    <li>The customer clicks, installs Sitekeeper, comes back and clicks again.</li>
+    <li>The account is suspended between minting and redemption.</li>
+    <li>A label, group or password contains a non-ASCII character, an apostrophe or a space.</li>
+  </ol>
+  <div class="note">
+    <p>
+      The app's half of this contract is one file,
+      <code>mysql_runner/storage/provisioning.py</code>, and it is the authority
+      wherever this page and the code disagree. The <code>v1</code> in the link
+      and the path is the contract version; a future <code>v2</code> will be a
+      new path and <code>v1</code> will keep working.
+    </p>
+  </div>
+</section>
+
+<hr class="rule">
+
+<section id="shortcuts">
+  <h2>Keyboard shortcuts</h2>
+
+  <h3>Anywhere</h3>
+  <div class="table-wrap">
+    <table class="kbd-table">
+      <tbody>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>B</kbd></td><td>Collapse / expand the sidebar</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd></td><td>Hide the sidebar entirely</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>S</kbd></td><td>Toggle split view</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd></td><td>Move the tab to the other pane</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Tab</kbd></td><td>Switch to the other pane</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd></td><td>Toggle the dark app theme</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd></td><td>Toggle dark phpMyAdmin pages</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>W</kbd></td><td>Close the current tab</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>D</kbd></td><td>Clone the current tab (same session)</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Tab</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd></td><td>Next / previous tab</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>1</kbd> … <kbd>Ctrl</kbd>+<kbd>9</kbd></td><td>Jump to tab 1–9</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd></td><td>Terminal on the selected server</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>L</kbd></td><td>Clear the SQL console screen</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>In a file-transfer tab</h3>
+  <div class="table-wrap">
+    <table class="kbd-table">
+      <tbody>
+        <tr><td><kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>Alt</kbd>+<kbd>→</kbd></td><td>Back / Forward in that pane's history</td></tr>
+        <tr><td><kbd>Alt</kbd>+<kbd>↑</kbd></td><td>Parent directory</td></tr>
+        <tr><td><kbd>F5</kbd></td><td>Refresh the active pane</td></tr>
+        <tr><td><kbd>F9</kbd></td><td>Compare both sides by hash</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo the last overwrite</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd></td><td>Show / hide the transfer queue</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd></td><td>Sync this local folder with the server</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td><td>Open a shell here</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>P</kbd></td><td>Run one command here (SFTP)</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd></td><td>Search file contents on the server (SFTP)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="legacy">
+  <h2>Older ways in</h2>
+  <p class="section-note">
+    Still supported, and worth knowing about - but the handover flow exists to
+    replace the first of them.
+  </p>
+
+  <h3>A list of connection strings</h3>
+  <p>
+    Sitekeeper reads a <code>.txt</code> of one connection per line,
+    <code>Label = url</code>, <code>#</code> for comments, via
+    <em>File ▸ Import from WinSCP or a URL list…</em>:
+  </p>
+<pre><code><span class="c"># CloudCore Webhosting - example.cz</span>
+example.cz - web      = sftp://example_cz:s3cret@web12.cloudcore.cz:22/home/example_cz/public_html
+example.cz - database = mysql://example_cz_admin:s3cret@sql12.cloudcore.cz:3306/example_cz_wp
+example.cz - pma      = https://pma.cloudcore.cz/</code></pre>
+  <p>
+    Schemes understood: <code>sftp</code>, <code>ssh</code>, <code>scp</code>,
+    <code>ftp</code>, <code>ftps</code>, <code>ftpes</code>, <code>mysql</code>,
+    <code>http</code> and <code>https</code> - the last two become phpMyAdmin
+    connections. A bare <code>host:port/path</code> with no scheme is read as
+    SFTP. Percent-encode the username and password.
+  </p>
+  <div class="note danger">
+    <p>
+      <strong>Providers: be honest with yourself about what this file is.</strong>
+      It is every credential for that account, in plaintext, in a Downloads
+      folder, where it will sit until the disk is reformatted - and in whatever
+      backup runs over that folder tonight. If you ship it, say so on the page,
+      set <code>Cache-Control: no-store</code>, and treat it as a stepping stone
+      to the ticket flow rather than the destination.
+    </p>
+  </div>
+
+  <h3>The encrypted bundle</h3>
+  <p>
+    <code>.mrx</code> avoids the plaintext problem - PBKDF2-HMAC-SHA256 over a
+    passphrase you choose, then Fernet - but trades it for a worse one: you now
+    have to get a passphrase to the customer over some channel, and the channel
+    everyone reaches for is the same page or email that carries the file. Use
+    <code>.mrx</code> for a customer migrating their own machines. Do not use it
+    as a provisioning mechanism.
+  </p>
+
+  <h3>WinSCP</h3>
+  <p>
+    <em>File ▸ Import from WinSCP or a URL list…</em> finds your sessions where
+    WinSCP actually keeps them: the registry for an installed copy, or
+    <code>WinSCP.ini</code> for a portable one, decoding the stored passwords
+    either way. Those passwords are scrambled rather than encrypted, by a
+    published algorithm - importing them into this app's encrypted vault is a
+    step up from where they came from. <em>Export for WinSCP</em> writes either
+    format back out.
+  </p>
+</section>
+
+<footer>
+  <span>Sitekeeper 1.12.0 - MIT licensed</span>
+  <span>RAPL Group, s.r.o.</span>
+  <span>Handbook last revised 15 September 2026</span>
+</footer>
+
+</main>
+
+<aside class="toc" id="toc" aria-label="On this page">
+  <strong>On this page</strong>
+  <div id="toc-links"></div>
+</aside>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var rail = document.getElementById("rail");
+  var links = Array.prototype.slice.call(rail.querySelectorAll("a"));
+  var sections = links
+    .map(function (a) { return document.getElementById(a.getAttribute("href").slice(1)); })
+    .filter(Boolean);
+
+  /* ----- index filter ---------------------------------------------------- */
+  var q = document.getElementById("q");
+  var groups = Array.prototype.slice.call(rail.querySelectorAll("h4"));
+  var empty = document.createElement("p");
+  empty.className = "no-hits";
+  empty.textContent = "Nothing in the index matches.";
+  empty.hidden = true;
+  rail.appendChild(empty);
+
+  function applyFilter() {
+    var term = q.value.trim().toLowerCase();
+    var hits = 0;
+    links.forEach(function (a) {
+      var match = !term || a.textContent.toLowerCase().indexOf(term) !== -1;
+      a.hidden = !match;
+      if (match) { hits++; }
+    });
+    groups.forEach(function (h) {
+      var visible = false;
+      var node = h.nextElementSibling;
+      while (node && node.tagName === "A") {
+        if (!node.hidden) { visible = true; }
+        node = node.nextElementSibling;
+      }
+      h.hidden = !visible;
+    });
+    empty.hidden = hits !== 0;
+  }
+  q.addEventListener("input", applyFilter);
+  q.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { q.value = ""; applyFilter(); }
+  });
+
+  /* ----- "on this page", built from the current section's own headings ---- */
+  var tocLinks = document.getElementById("toc-links");
+
+  function buildToc(section) {
+    tocLinks.textContent = "";
+    if (!section) { return; }
+    var heads = section.querySelectorAll("h3");
+    if (!heads.length) {
+      var only = document.createElement("a");
+      only.href = "#" + section.id;
+      only.textContent = section.querySelector("h1, h2")
+        ? section.querySelector("h1, h2").textContent.trim()
+        : section.id;
+      tocLinks.appendChild(only);
+      return;
+    }
+    Array.prototype.forEach.call(heads, function (h, i) {
+      if (!h.id) { h.id = section.id + "-h" + i; }
+      var a = document.createElement("a");
+      a.href = "#" + h.id;
+      a.textContent = h.textContent.trim();
+      tocLinks.appendChild(a);
+    });
+  }
+
+  /* ----- which section am I in ------------------------------------------- */
+  var current = null;
+
+  function markCurrent() {
+    var probe = (window.innerHeight * 0.28);
+    var found = sections[0];
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i].getBoundingClientRect().top <= probe) { found = sections[i]; }
+    }
+    if (found === current) { return; }
+    current = found;
+    links.forEach(function (a) {
+      a.classList.toggle("on", a.getAttribute("href") === "#" + found.id);
+    });
+    buildToc(found);
+  }
+
+  var ticking = false;
+  function onScroll() {
+    if (ticking) { return; }
+    ticking = true;
+    window.requestAnimationFrame(function () { markCurrent(); ticking = false; });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("resize", onScroll);
+
+  /* ----- drawer on narrow screens ---------------------------------------- */
+  var menu = document.getElementById("menu");
+  var narrow = window.matchMedia("(max-width: 900px)");
+
+  function syncDrawer() {
+    if (narrow.matches) {
+      rail.hidden = true;
+      menu.setAttribute("aria-expanded", "false");
+    } else {
+      rail.hidden = false;
+    }
+  }
+  menu.addEventListener("click", function () {
+    var open = rail.hidden;
+    rail.hidden = !open;
+    menu.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  rail.addEventListener("click", function (e) {
+    if (e.target.tagName === "A" && narrow.matches) { syncDrawer(); }
+  });
+  if (narrow.addEventListener) { narrow.addEventListener("change", syncDrawer); }
+  syncDrawer();
+
+  markCurrent();
+}());
+</script>
+
+</body>
+</html>

@@ -901,7 +901,7 @@ class _FilePane(QWidget):
         if selected:
             size = sum(entry.size for entry in selected)
             self._count.setText(
-                f"·  {len(selected)} selected — {_human_size(size)}"
+                f"·  {len(selected)} selected - {_human_size(size)}"
             )
             return
         if shown is None:
@@ -1547,7 +1547,7 @@ class FileManagerTab(QWidget):
         )
         self._local.selection_changed.connect(self._refresh_actions)
 
-        self._remote = _FilePane(f"Remote — {self._profile.label}", posix=True)
+        self._remote = _FilePane(f"Remote - {self._profile.label}", posix=True)
         self._remote.bind_paths(self._remote_child, self._remote_parent)
         self._remote.navigate.connect(self._list_remote)
         self._remote.open_file.connect(self._on_edit_remote)
@@ -1869,7 +1869,7 @@ class FileManagerTab(QWidget):
         self._options_changed.emit(self._pool_options())
 
     def current_title(self) -> str:
-        return f"{self._profile.label} — {self._profile.kind.value.upper()}"
+        return f"{self._profile.label} - {self._profile.kind.value.upper()}"
 
     @property
     def server_profile(self) -> ServerProfile:
@@ -3319,7 +3319,7 @@ class FileManagerTab(QWidget):
                 return
         log = self._activity()
         entry = log.log_event(
-            f"Save — {rule.name}", detail=summarise(changes)
+            f"Save - {rule.name}", detail=summarise(changes)
         )
         if uploads:
             log.add_files(
@@ -3376,8 +3376,8 @@ class FileManagerTab(QWidget):
         if stale is not None:
             log.set_outcome(stale, "superseded by a newer commit", kind="info")
         self._activity_events[rule_id] = log.log_event(
-            f"Commit — {rule.name}",
-            detail=(detail or "HEAD moved") + " — reading the commit…",
+            f"Commit - {rule.name}",
+            detail=(detail or "HEAD moved") + " - reading the commit…",
         )
         self._set_status(f"{headline} - syncing…")
         self.status_message.emit(f"{self._profile.label}: {headline}")
@@ -3419,7 +3419,7 @@ class FileManagerTab(QWidget):
         log = self._activity()
         entry = self._activity_events.pop(rule_id, None)
         if entry is None:
-            entry = log.log_event(f"Commit — {rule.name}")
+            entry = log.log_event(f"Commit - {rule.name}")
         if not uploads and not removals:
             log.set_outcome(
                 entry, "nothing in the commit touches this folder", kind="info"
@@ -3677,7 +3677,7 @@ class FileManagerTab(QWidget):
         text = (
             f"Commit {commit}" + (f" in {where}" if where else "")
             + ": pushing it would " + " and ".join(parts)
-            + f" — from {plan['local']} to {plan['remote']}, the two folders "
+            + f" - from {plan['local']} to {plan['remote']}, the two folders "
             "open in the panes."
         )
         if skipped:
@@ -3853,7 +3853,7 @@ class FileManagerTab(QWidget):
         rule = self._publish_rule()
         if not rule.local or not rule.remote:
             self._set_status(
-                "Open the folder to publish into on the right first — that "
+                "Open the folder to publish into on the right first - that "
                 "pairing is where these files go."
             )
             return
@@ -3877,13 +3877,13 @@ class FileManagerTab(QWidget):
             return
         short = sha[:8]
         entry = self._activity().log_event(
-            f"Publish — commit {short}",
+            f"Publish - commit {short}",
             detail=f"{len(placeable)} file(s) from history → {rule.remote}",
         )
         self._publish_events[sha] = entry
         self._tool_progress.start(f"Reading commit {short}…")
         self._set_status(
-            f"Extracting {len(placeable)} file(s) from {short} — your working "
+            f"Extracting {len(placeable)} file(s) from {short} - your working "
             "copy is not touched."
         )
         dest = os.path.join(self._export_root, f"{short}-{uuid.uuid4().hex[:6]}")
@@ -3978,7 +3978,7 @@ class FileManagerTab(QWidget):
         entry = self._activity_events.pop(rule_id, None)
         if entry is None:
             entry = log.log_event(
-                f"Sync — {rule.name}", detail=f"compared with {rule.remote}"
+                f"Sync - {rule.name}", detail=f"compared with {rule.remote}"
             )
         if not uploads and not removals:
             log.set_outcome(
@@ -4150,7 +4150,7 @@ class FileManagerTab(QWidget):
         self._local.set_sync_marks(marks)
         here = self._sync_store.find(self._profile.id, base) if base else None
         self._local.set_title(
-            f"Local — synced {here.mode.label.lower()}, {here.scope}"
+            f"Local - synced {here.mode.label.lower()}, {here.scope}"
             if here
             else "Local"
         )
@@ -4200,8 +4200,8 @@ class FileManagerTab(QWidget):
             ).setToolTip("Every file, and the server path each one lands on")
         menu.addSeparator()
         for mode, label in (
-            (SyncMode.ON_SAVE, "Keep in sync — on save"),
-            (SyncMode.ON_COMMIT, "Keep in sync — on git commit"),
+            (SyncMode.ON_SAVE, "Keep in sync - on save"),
+            (SyncMode.ON_COMMIT, "Keep in sync - on git commit"),
         ):
             action = menu.addAction(label, lambda m=mode: self._arm_sync(local, m))
             action.setCheckable(True)
@@ -4237,7 +4237,7 @@ class FileManagerTab(QWidget):
             listed = menu.addMenu(f"Folders synced here ({len(rules)})")
             for other in rules:
                 listed.addAction(
-                    f"{other.local} — {other.mode.label}, {other.scope}",
+                    f"{other.local} - {other.mode.label}, {other.scope}",
                     lambda rid=other.id: self._sync_now(self._rule(rid)),
                 )
             menu.addAction("Sync all of them now", self._sync_all_now)
@@ -5147,7 +5147,7 @@ class FileManagerTab(QWidget):
                 same = "identical to" if local_digest == digest else "different from"
                 local_note = f"\n\nThe local {name} is {same} this."
         QMessageBox.information(
-            self, f"Digest — {name}", f"sha256\n{digest}{local_note}"
+            self, f"Digest - {name}", f"sha256\n{digest}{local_note}"
         )
 
     # ----- context menus -------------------------------------------------
@@ -5331,7 +5331,7 @@ class FileManagerTab(QWidget):
         show = submenu.addAction("Open .deployignore")
         show.triggered.connect(self._open_ignore_file)
         show.setToolTip(
-            f"{ignore_file_path(root)} — the rules this folder's transfers use"
+            f"{ignore_file_path(root)} - the rules this folder's transfers use"
         )
         if os.path.normcase(root) != os.path.normcase(self._local.path):
             note = submenu.addAction(f"Rules live in {root}")
@@ -5531,7 +5531,7 @@ class FileManagerTab(QWidget):
                 shown += f", and {len(held) - 4} more"
             subject = "is" if len(held) == 1 else "are"
             self._set_status(
-                f"Sending {shown} — normally {subject} held back by the ignore "
+                f"Sending {shown} - normally {subject} held back by the ignore "
                 "rules, but you picked it."
             )
         return rules.allowing(names)

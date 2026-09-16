@@ -7,10 +7,16 @@ SetCompressor /SOLID lzma
 !define APP_NAME        "Sitekeeper"
 !define APP_EXE         "Sitekeeper.exe"
 !define MCP_EXE         "sitekeeper-mcp.exe"
-!define APP_VERSION     "1.11.0"
+!define APP_VERSION     "1.13.0"
 !define APP_PUBLISHER   "RAPL Group, s.r.o."
 !define APP_ID          "Sitekeeper"
 !define APP_REGKEY      "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
+; Handover from a hosting control panel: a URL scheme and a file type,
+; both of which hand the app one argument. See storage/provisioning.py.
+!define URL_SCHEME      "sitekeeper"
+!define CLAIM_EXT       ".skc"
+!define CLAIM_PROGID    "Sitekeeper.Claim"
+!define CLAIM_MIME      "application/vnd.sitekeeper.claim+json"
 
 Name "${APP_NAME}"
 BrandingText "${APP_NAME} ${APP_VERSION}"
@@ -21,7 +27,7 @@ RequestExecutionLevel admin
 ShowInstDetails show
 ShowUnInstDetails show
 
-VIProductVersion "1.11.0.0"
+VIProductVersion "1.13.0.0"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} Setup"
 VIAddVersionKey "CompanyName"     "${APP_PUBLISHER}"
@@ -142,6 +148,27 @@ Section "Sitekeeper (required)" SecMain
   WriteRegDWORD HKLM "${APP_REGKEY}" "NoModify" 1
   WriteRegDWORD HKLM "${APP_REGKEY}" "NoRepair" 1
 
+  ; --- handover from a hosting provider -----------------------------------
+  ; Two ways in, both landing on the same argument. The sitekeeper:// scheme is
+  ; the one-click path from a control panel; the .skc file is the same ticket
+  ; downloaded, for browsers that have got stricter about custom schemes and
+  ; for panels that would rather mail it. Neither carries a credential - what
+  ; the app does with the argument is in storage/provisioning.py.
+  WriteRegStr HKCR "${URL_SCHEME}" "" "URL:${APP_NAME} Handover"
+  WriteRegStr HKCR "${URL_SCHEME}" "URL Protocol" ""
+  WriteRegStr HKCR "${URL_SCHEME}\DefaultIcon" "" '"$INSTDIR\${APP_EXE}",0'
+  WriteRegStr HKCR "${URL_SCHEME}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+
+  WriteRegStr HKCR "${CLAIM_EXT}" "" "${CLAIM_PROGID}"
+  WriteRegStr HKCR "${CLAIM_EXT}" "Content Type" "${CLAIM_MIME}"
+  WriteRegStr HKCR "${CLAIM_EXT}\OpenWithProgids" "${CLAIM_PROGID}" ""
+  WriteRegStr HKCR "${CLAIM_PROGID}" "" "${APP_NAME} connection handover"
+  WriteRegStr HKCR "${CLAIM_PROGID}\DefaultIcon" "" "$INSTDIR\icon.ico"
+  WriteRegStr HKCR "${CLAIM_PROGID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+  ; Without this Explorer keeps showing the old (or no) association until the
+  ; next sign-in, which reads as "the installer did not work".
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
+
   ; Estimated size (KB)
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   IntFmt $0 "0x%08X" $0
@@ -168,5 +195,21 @@ Section "Uninstall"
 
   DeleteRegKey HKLM "${APP_REGKEY}"
   DeleteRegKey HKLM "Software\${APP_ID}"
+
+  ; Leaving these behind would point Windows at an exe that is no longer
+  ; there, so every handover link would fail with a shell error instead of
+  ; the browser offering to install the app again.
+  DeleteRegKey HKCR "${URL_SCHEME}"
+  DeleteRegKey HKCR "${CLAIM_PROGID}"
+  DeleteRegValue HKCR "${CLAIM_EXT}\OpenWithProgids" "${CLAIM_PROGID}"
+  ; Only drop the extension itself if it is still ours - another program
+  ; may have claimed it since, and taking it back on the way out would
+  ; leave the user with a file type nothing opens.
+  ReadRegStr $0 HKCR "${CLAIM_EXT}" ""
+  ${If} $0 == "${CLAIM_PROGID}"
+    DeleteRegKey HKCR "${CLAIM_EXT}"
+  ${EndIf}
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
+
   ; Note: user data in %APPDATA%\Sitekeeper is intentionally left intact.
 SectionEnd

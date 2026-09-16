@@ -12,6 +12,7 @@ class ConnectionKind(str, Enum):
 
     PHPMYADMIN = "phpmyadmin"  # Embedded browser tab with auto-login.
     MYSQL = "mysql"            # Native MySQL connection, CLI console tab.
+    MSSQL = "mssql"            # Microsoft SQL Server, the one SSMS opens.
     FTP = "ftp"                # Plain FTP file transfer.
     FTPS = "ftps"              # FTP over explicit TLS.
     SFTP = "sftp"              # SFTP over SSH.
@@ -20,6 +21,16 @@ class ConnectionKind(str, Enum):
     def is_transfer(self) -> bool:
         """Whether this kind opens the dual-pane file manager."""
         return self in (ConnectionKind.FTP, ConnectionKind.FTPS, ConnectionKind.SFTP)
+
+    @property
+    def is_sql(self) -> bool:
+        """Whether this kind opens a SQL console on a database server.
+
+        Asked instead of ``== MYSQL`` everywhere, because every one of those
+        comparisons was really asking this - and each one left behind was a
+        place SQL Server silently did not work.
+        """
+        return self in (ConnectionKind.MYSQL, ConnectionKind.MSSQL)
 
 
 class AuthType(str, Enum):
@@ -42,6 +53,7 @@ class Environment(str, Enum):
 #: Port used when a profile leaves the port field at 0.
 DEFAULT_PORTS = {
     ConnectionKind.MYSQL: 3306,
+    ConnectionKind.MSSQL: 1433,
     ConnectionKind.FTP: 21,
     ConnectionKind.FTPS: 21,
     ConnectionKind.SFTP: 22,
@@ -70,6 +82,26 @@ class ServerProfile:
     local_dir: str = ""
     private_key_path: str = ""   # SFTP key-based auth (optional).
     passive: bool = True         # FTP/FTPS passive mode.
+    #: SQL Server only. A named instance - "SQLEXPRESS" - reached through the
+    #: SQL Browser service, which is how a development SQL Server is usually
+    #: addressed: SSMS shows it as MACHINE\SQLEXPRESS and there is no port to
+    #: type. Leave it empty for a default instance on a port.
+    mssql_instance: str = ""
+    #: Log in as the Windows account this app is running as, the way SSMS's
+    #: "Windows Authentication" does, instead of a SQL login and password.
+    mssql_windows_auth: bool = False
+    #: Encrypt the connection. ODBC Driver 18 does this by default and the
+    #: two below are what make that workable on a server with its own
+    #: certificate rather than a bought one.
+    mssql_encrypt: bool = True
+    #: Accept the server's certificate without checking who signed it. On by
+    #: default because an in-house SQL Server almost always presents a
+    #: self-signed certificate, and driver 18 refuses those outright - the
+    #: alternative is a connection nobody can make at all.
+    mssql_trust_cert: bool = True
+    #: Which installed ODBC driver to use. Empty means the newest one found,
+    #: which is what anyone who has not been told otherwise wants.
+    mssql_odbc_driver: str = ""
     #: Where this server's shell is, for the terminal and for server-side
     #: commands. FTP and FTPS have no shell of their own, so both borrow SSH
     #: on the same host with the same credentials. Zero means nobody has
@@ -113,6 +145,19 @@ class ServerProfile:
             user = self.username or "?"
             suffix = f"/{self.database}" if self.database else ""
             return f"mysql://{user}@{target}{suffix}"
+        if self.kind == ConnectionKind.MSSQL:
+            # Named instances are how SSMS shows these, so that is how they
+            # are written back: MACHINE\SQLEXPRESS, no port in sight.
+            where = (
+                f"{self.host}\\{self.mssql_instance}"
+                if self.mssql_instance
+                else target
+            )
+            user = "windows-auth" if self.mssql_windows_auth else (
+                self.username or "?"
+            )
+            suffix = f"/{self.database}" if self.database else ""
+            return f"mssql://{user}@{where}{suffix}"
         return f"{self.kind.value}://{self.username or 'anonymous'}@{target}"
 
     def to_dict(self) -> dict:
@@ -144,6 +189,11 @@ class ServerProfile:
             local_dir=data.get("local_dir", ""),
             private_key_path=data.get("private_key_path", ""),
             passive=bool(data.get("passive", True)),
+            mssql_instance=str(data.get("mssql_instance", "") or ""),
+            mssql_windows_auth=bool(data.get("mssql_windows_auth", False)),
+            mssql_encrypt=bool(data.get("mssql_encrypt", True)),
+            mssql_trust_cert=bool(data.get("mssql_trust_cert", True)),
+            mssql_odbc_driver=str(data.get("mssql_odbc_driver", "") or ""),
             ssh_port=int(data.get("ssh_port", 0) or 0),
             use_agent=bool(data.get("use_agent", True)),
             use_default_keys=bool(data.get("use_default_keys", False)),

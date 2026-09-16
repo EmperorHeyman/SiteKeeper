@@ -1,7 +1,8 @@
 # Sitekeeper
 
 > Keeps your sites in order. Save a server once, then open it as an
-> auto-logging-in **phpMyAdmin** tab, a native **MySQL console**, or a
+> auto-logging-in **phpMyAdmin** tab, a native **MySQL** or **SQL Server**
+> console, or a
 > WinSCP-style **FTP / FTPS / SFTP** pane that can keep a folder deployed on
 > every save - or every git commit.
 
@@ -19,6 +20,7 @@ double-click it to open. What opens depends on the connection type you picked:
 | ---- | ------------ |
 | **phpMyAdmin** | A browser tab that fills in the login form for you and keeps its own isolated session. |
 | **MySQL** | A real `mysql>` prompt talking straight to port 3306: ASCII result tables, multi-line statements, history, `\G` vertical output. No phpMyAdmin involved. |
+| **Microsoft SQL Server** | The same console against the server SSMS opens, on 1433 or a named instance. T-SQL as it is actually written: `GO` ends a batch, `[brackets]` quote an identifier, `#temp` is a table. Windows Authentication, named instances and driver 18's encryption settings are all on the form. |
 | **SFTP / FTP / FTPS** | A dual-pane file manager - local on the left, remote on the right - with recursive upload/download, drag and drop between the panes, hash comparison, and folders that keep themselves deployed on every save or every git commit. |
 
 Open as many as you like at once, in tabs, and put two of them side by side.
@@ -36,7 +38,8 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
   **Windows Credential Manager**, so you rarely have to retype it. Nothing is ever written
   to disk in plaintext.
 - **Connection list with real categories** - connections are filed by what they are:
-  **phpMyAdmin**, **MySQL** and **Other (FTP/SFTP)**, each heading carrying its count, and
+  **phpMyAdmin**, **MySQL**, **SQL Server** and **Other (FTP/SFTP)**, each heading carrying
+  its count, and
   empty categories are never drawn. Give a connection a group of its own (Production,
   Client A...) and that wins instead; *Move to a group* on the right-click menu offers the
   groups you already use. The search box matches hostnames as well as labels, so
@@ -63,11 +66,38 @@ launch - see [Upgrading from MySQL Runner](#upgrading-from-mysql-runner).</sub>
 - **Auto-lock on idle** - after 15 minutes of inactivity (configurable) the key is wiped
   from memory and the keyring cache is cleared. Step away safely.
 - **Portable export / import** - export your connections to an encrypted `.mrx` file
-  protected by a passphrase, and import them on another PC.
-- **Native SQL console** - connect straight to MySQL (port 3306) and get the command-line
-  client's behaviour inside a tab: bordered result tables, `Empty set` / `Query OK` summaries
+  protected by a passphrase, and import them on another PC. Adopting a whole machine's
+  worth of sessions is separate: Sitekeeper reads a `WinSCP.ini` or a plain list of
+  connection strings.
+- **Straight from your hosting provider** - a host can put an *Open in Sitekeeper*
+  button next to an account in their control panel. Clicking it opens Sitekeeper,
+  which asks whether that host may add connections, shows exactly what is on offer -
+  right host, right port, right protocol, opening in the document root, tinted red if
+  it is production - and saves it to the vault. Nothing is typed and nothing is pasted.
+
+  The link carries a single-use **ticket**, never a credential; the details come back
+  over HTTPS from the provider, once, in answer to it. Only HTTPS with a valid
+  certificate, only a hostname (never an IP, never one resolving to your own network),
+  a fixed endpoint rather than one the link picks, and an allowlist that drops
+  `proxy_command`, `startup_script` and `local_dir` whatever a provider sends. There is
+  no "always allow this provider": the confirmation appears every time. Providers
+  implement the contract in [HOSTING_PROVIDERS.md](HOSTING_PROVIDERS.md); the same
+  ticket also works as a downloaded `.skc` file.
+- **Test connection, before you save it** - the Add/Edit dialog has a **Test connection**
+  button, and the connection list has the same on its right-click menu. It dials what is
+  typed rather than what is saved, and says which parts it proved: phpMyAdmin is fetched
+  and logged in to, MySQL and SQL Server are asked their version, FTP/FTPS/SFTP are logged
+  in to and the start folder opened. Three answers, not two - **Works**, **Almost** (the
+  login is fine and a start folder or a URL is not) and **Failed**, with the reason the
+  server gave. Nothing is written and nothing on the server is touched.
+- **Native SQL console** - connect straight to MySQL (port 3306) or Microsoft SQL Server
+  (1433, or a named instance through the SQL Browser) and get the command-line client's
+  behaviour inside a tab: bordered result tables, `Empty set` / `Query OK` summaries
   with timings, multi-line statements ending in `;`, `\G` for vertical output, arrow-key
-  history, and the `\c` / `\s` / `\r` / `\q` backslash commands. Queries run on a worker
+  history, **Tab completion** over the dialect's keywords and the tables in the schema,
+  and the `\c` / `\s` / `\r` / `\q` backslash commands. SQL Server tabs take T-SQL and
+  end a batch with `GO`; they connect through the Microsoft ODBC driver, so Windows
+  Authentication works without a password being stored anywhere. Queries run on a worker
   thread so the window never freezes, and oversized result sets are capped rather than
   swallowing your memory.
 - **Dual-pane file transfers** - SFTP, FTP and FTPS connections open a WinSCP-style two-pane
@@ -267,7 +297,8 @@ python main.py
 On first launch you choose a **master password** - or tick *Don't use a master password*
 to have the key sealed to your Windows account instead. Then:
 
-1. Click **Add**, pick the connection **type** (phpMyAdmin, MySQL, SFTP, FTP, FTPS) and
+1. Click **Add**, pick the connection **type** (phpMyAdmin, MySQL, Microsoft SQL Server,
+   SFTP, FTP, FTPS) and
    fill in the fields it asks for. Optionally set a group, environment level and startup SQL.
 2. Double-click the connection (or select it and press **Connect**) to open it.
 3. Use **File → Export / Import** to move your connections between machines.
@@ -301,7 +332,9 @@ Read-only, always available:
 | `diff_remote` | Whether a local path matches a remote one, by content digest, file or whole tree |
 | `download_file` | One file, fetched |
 | `list_undo_history` | The restore points Sitekeeper kept, with the ids `undo_remote_change` takes |
-| `run_query` | SQL on a MySQL profile, `mysql`-client-style output. `via=<an SFTP/FTP profile on that server>` runs it through the server's **own** `mysql` client instead - which is what makes a **phpMyAdmin profile usable** (its username and password *are* MySQL's) and the only way into a database that listens on localhost only. Also needs **Run commands on the server** |
+| `test_connection` | Connects, reports what answered, disconnects. Every kind: the phpMyAdmin login, the database version, the FTP/SFTP start folder and what the account may do. Separates a wrong password from a server that is down from a folder that does not exist |
+| `run_query` | SQL on a MySQL or SQL Server profile, `mysql`-client-style output. Runs in the app's own console tab when one is open on that connection, so the statement lands in the transcript you are watching. `via=<an SFTP/FTP profile on that server>` runs it through the server's **own** `mysql` or `sqlcmd` instead - which is what makes a **phpMyAdmin profile usable** (its username and password *are* MySQL's) and the only way into a database that listens on localhost only. Also needs **Run commands on the server** |
+| `open_console` | Opens a SQL console tab in the running app for a MySQL or SQL Server connection and waits until it has connected, so everything `run_query` does afterwards happens where you can see it. Connects; changes nothing |
 
 Writing, once **Upload files and create folders** is ticked:
 
@@ -423,7 +456,7 @@ installer once ended up wrapping a 1.1.0 exe.
 ```powershell
 .\build_release.ps1                  # -> dist_onefile_upx\Sitekeeper.exe + release\*.zip
 powershell -ExecutionPolicy Bypass -File installer\build.ps1
-                                     # -> installer\Sitekeeper-1.11.0-Setup.exe
+                                     # -> installer\Sitekeeper-1.13.0-Setup.exe
 ```
 
 It builds from the virtual environment at `%USERPROFILE%\.venvs\mysqlrunner`, which needs
@@ -448,9 +481,11 @@ mysql_runner/
   storage/store.py               Encrypted load/save of profiles
   storage/settings.py            Plain-JSON UI preferences
   storage/portable.py            Passphrase-encrypted export/import (.mrx)
+  storage/provisioning.py        Claim tickets from a hosting provider (sitekeeper://, .skc)
   crypto/dpapi.py                Windows DPAPI sealing for the password-free mode
   ui/main_window.py              Sidebar + rail, split panes, tabs, menus, shortcuts
   ui/server_dialog.py            Add/edit connection (fields follow the chosen type)
+  ui/provision_dialog.py         Ask, fetch, review: the handover confirmation
   ui/master_password_dialog.py   Set / unlock / change dialogs
   ui/settings_dialog.py          Appearance, split view, vault protection
   ui/idle_watcher.py             Global idle auto-lock timer
@@ -466,8 +501,15 @@ mysql_runner/
   ui/ssh_terminal_tab.py         Embedded SSH shell, opened in the current directory
   ui/shell_target_dialog.py      Asks once before an FTP connection borrows SSH
   ui/log_viewer.py               Live remote log viewer (tail -f)
-  db/mysql_client.py             PyMySQL connection driven on a worker thread
-  db/sqlsplit.py                 Statement splitting (quote- and comment-aware)
+  connectiontest.py              Tries a connection of any kind and says what answered
+  ui/testrunner.py               Runs one of those off the GUI thread, and cleans up
+  ui/threadwatch.py              Retires a worker thread that will not stop in time
+  transfer/backends.py           The one place a profile becomes a live backend
+  db/mysql_client.py             The console's connection, driven on a worker thread
+  db/engines.py                  What differs between MySQL and SQL Server, in one place
+  db/driver.py                   PyMySQL: import, connect arguments, error text
+  db/mssql_driver.py             pyodbc: ODBC driver discovery, connection strings
+  db/sqlsplit.py                 Statement splitting, per dialect (quote- and comment-aware)
   db/resultformat.py             ASCII result tables, vertical layout, summaries
   transfer/base.py               RemoteFS interface + capability flags
   transfer/ftp_client.py         FTP / FTPS via ftplib (MLSD, LIST fallback)
@@ -625,7 +667,7 @@ scripts that set it were protecting a real vault.
   files stay encrypted and are useless on another account or machine, but anyone who can run
   code as you on this machine can open them. Auto-lock is disabled in that mode, since
   re-unlocking would be instant.
-- Exported `.mrx` files are encrypted with a passphrase you choose — keep that passphrase safe.
+- Exported `.mrx` files are encrypted with a passphrase you choose - keep that passphrase safe.
 - SFTP host keys are recorded in `known_hosts` the first time you connect. If the key for a
   known host later changes, the connection is refused rather than trusted; when a server has
   genuinely been rekeyed, delete its line from that file.

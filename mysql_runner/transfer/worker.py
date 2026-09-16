@@ -38,7 +38,7 @@ from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from mysql_runner.storage.models import ConnectionKind
 from mysql_runner.transfer.base import RemoteFS, TransferError, Unsupported
-from mysql_runner.transfer import hostkeys
+from mysql_runner.transfer import backends, hostkeys
 from mysql_runner.transfer.history import HistoryStore
 from mysql_runner.transfer.ignore import IgnoreRules
 from mysql_runner.transfer.pool import (
@@ -120,30 +120,19 @@ class ConnectionSpec:
 
     def build(self) -> RemoteFS:
         """Instantiate the matching backend. Called on the worker thread."""
-        if self.kind == ConnectionKind.SFTP:
-            from mysql_runner.transfer.sftp_client import SFTPFileSystem
-
-            return SFTPFileSystem(
-                self.host,
-                self.port,
-                self.username,
-                self.password,
-                private_key_path=self.private_key_path,
-                use_agent=self.use_agent,
-                use_default_keys=self.use_default_keys,
-                host_key_mode=self.host_key_mode,
-                jump=self.jump,
-                proxy_command=self.proxy_command,
-            )
-        from mysql_runner.transfer.ftp_client import FTPFileSystem
-
-        return FTPFileSystem(
+        return backends.build(
+            self.kind,
             self.host,
             self.port,
             self.username,
             self.password,
-            use_tls=self.kind == ConnectionKind.FTPS,
+            private_key_path=self.private_key_path,
             passive=self.passive,
+            use_agent=self.use_agent,
+            use_default_keys=self.use_default_keys,
+            host_key_mode=self.host_key_mode,
+            jump=self.jump,
+            proxy_command=self.proxy_command,
         )
 
     def connected(self) -> RemoteFS:

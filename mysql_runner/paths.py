@@ -99,3 +99,21 @@ def mcp_policy_path() -> Path:
     its own.
     """
     return app_data_dir() / "mcp_policy.json"
+
+
+def provisioned_keys_dir() -> Path:
+    """Directory holding private keys handed over by a hosting provider.
+
+    Under the per-user AppData root, which Windows already ACLs to this account
+    alone - the same protection ~/.ssh gets on a Unix box, and the reason the
+    key does not go next to the download it arrived in.
+    """
+    path = app_data_dir() / "keys"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def provisioned_key_path(profile_id: str) -> Path:
+    """Where one provisioned connection's private key lives."""
+    safe = "".join(ch for ch in profile_id if ch.isalnum())[:64] or "key"
+    return provisioned_keys_dir() / f"{safe}.key"

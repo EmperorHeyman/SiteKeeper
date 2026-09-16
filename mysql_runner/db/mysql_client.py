@@ -1,10 +1,18 @@
-"""Native MySQL connection worker.
+"""Native SQL connection worker.
 
-The console tab talks to MySQL directly (port 3306) instead of driving
-phpMyAdmin, so every call here is potentially slow: connecting, running a
-query, fetching rows. All of it therefore lives on a worker object that the UI
-moves onto its own QThread and drives through queued signals - the GUI thread
-never blocks on the network.
+The console tab talks to the database directly - MySQL on 3306, SQL Server on
+1433 - instead of driving phpMyAdmin or SSMS, so every call here is
+potentially slow: connecting, running a query, fetching rows. All of it
+therefore lives on a worker object that the UI moves onto its own QThread and
+drives through queued signals - the GUI thread never blocks on the network.
+
+Which server it is talking to is decided once, by the ConnectionParams it is
+opened with, and answered by an engine object from db/engines.py. Nothing
+below that line knows there is more than one dialect.
+
+The module keeps its name, and ``MySQLWorker`` keeps working as an alias, so
+the FastAPI sidecar and anything else written against the MySQL-only version
+still imports what it always did.
 """
 
 from __future__ import annotations
@@ -14,20 +22,20 @@ from dataclasses import dataclass, field
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
+from mysql_runner.db import engines
 from mysql_runner.db.driver import (
     CONNECT_TIMEOUT,
     MAX_ROWS,
     MySQLUnavailable,
-    connect_kwargs,
-    database_from_use,
-    describe_error,
     driver_available,
     import_driver,
 )
-from mysql_runner.db.sqlsplit import Statement, split_statements
+from mysql_runner.db.engines import ConnectionParams
+from mysql_runner.db.mssql_driver import MSSQLUnavailable
+from mysql_runner.db.sqlsplit import Statement
 
 # Re-exported so existing importers of this module keep working; the definitions
-# live in driver.py, which carries no Qt dependency.
+# live in driver.py and engines.py, neither of which carries a Qt dependency.
 __all__ = [
     "CONNECT_TIMEOUT",
     "MAX_ROWS",
@@ -35,9 +43,15 @@ __all__ = [
     "ConnectionParams",
     "MySQLWorker",
     "QueryOutcome",
+    "SqlWorker",
     "driver_available",
     "import_driver",
 ]
+
+#: How many names Tab completion will hold for one connection. A schema with
+#: more tables than this exists, and completing from the first few thousand is
+#: still better than completing from nothing.
+MAX_COMPLETIONS = 4000
 
 
 @dataclass
@@ -59,24 +73,8 @@ class QueryOutcome:
         return bool(self.columns)
 
 
-@dataclass
-class ConnectionParams:
-    """Everything needed to dial a server, as plain data (thread-safe)."""
-
-    host: str
-    port: int
-    username: str
-    password: str
-    database: str = ""
-
-    def to_kwargs(self) -> dict:
-        return connect_kwargs(
-            self.host, self.port, self.username, self.password, self.database
-        )
-
-
-class MySQLWorker(QObject):
-    """Owns a live PyMySQL connection on a background thread."""
+class SqlWorker(QObject):
+    """Owns one live database connection on a background thread."""
 
     #: Emitted with the server banner once the connection is up.
     connected = pyqtSignal(str)
@@ -86,6 +84,8 @@ class MySQLWorker(QObject):
     outcome = pyqtSignal(object)
     #: Emitted after the last statement of a submitted batch.
     batch_finished = pyqtSignal()
+    #: Emitted with a list of names Tab completion can offer.
+    completions = pyqtSignal(object)
     #: Emitted after the connection has been closed.
     closed = pyqtSignal()
 
@@ -93,43 +93,30 @@ class MySQLWorker(QObject):
         super().__init__()
         self._conn = None
         self._database = ""
+        self._engine = engines.engine(engines.MYSQL)
 
     # ----- lifecycle ------------------------------------------------------
     @pyqtSlot(object)
     def open_connection(self, params: object) -> None:
         assert isinstance(params, ConnectionParams)
+        self._engine = engines.engine(params.engine)
+        if not self._engine.available():
+            self.failed.emit(
+                self._engine.missing_message() or "No driver for this server."
+            )
+            return
         try:
-            pymysql = import_driver()
-        except MySQLUnavailable as exc:
+            self._conn = self._engine.connect(params)
+        except (MySQLUnavailable, MSSQLUnavailable) as exc:
+            # "No driver here" is already a sentence; describe_error would
+            # try to read it as something a server said.
             self.failed.emit(str(exc))
             return
-        try:
-            self._conn = pymysql.connect(**params.to_kwargs())
-        except Exception as exc:  # pymysql raises a wide range of errors
-            self.failed.emit(describe_error(exc))
+        except Exception as exc:  # drivers raise a wide range of errors
+            self.failed.emit(self._engine.describe_error(exc))
             return
         self._database = params.database
-        self.connected.emit(self._banner(params))
-
-    def _banner(self, params: ConnectionParams) -> str:
-        version = "unknown"
-        thread_id = "?"
-        try:
-            with self._conn.cursor() as cursor:
-                cursor.execute("SELECT VERSION()")
-                row = cursor.fetchone()
-                if row:
-                    version = str(row[0])
-            thread_id = str(self._conn.thread_id())
-        except Exception:
-            pass
-        target = f"{params.host}:{params.port}"
-        db = self._database or "(none)"
-        return (
-            f"Connected to {target} as {params.username}.\n"
-            f"Server version: {version}   Connection id: {thread_id}   "
-            f"Database: {db}"
-        )
+        self.connected.emit(self._engine.banner(self._conn, params))
 
     @pyqtSlot()
     def close_connection(self) -> None:
@@ -146,60 +133,77 @@ class MySQLWorker(QObject):
     def run_sql(self, sql: str) -> None:
         """Execute every statement in ``sql``, emitting one outcome each."""
         if self._conn is None:
-            self.outcome.emit(
-                QueryOutcome(statement=sql, error="Not connected.")
-            )
+            self.outcome.emit(QueryOutcome(statement=sql, error="Not connected."))
             self.batch_finished.emit()
             return
-        for statement in split_statements(sql):
-            self.outcome.emit(self._execute(statement))
+        for statement in self._engine.split(sql):
+            for _ in range(max(1, statement.repeat)):
+                for outcome in self._execute(statement):
+                    self.outcome.emit(outcome)
         self.batch_finished.emit()
 
-    def _execute(self, statement: Statement) -> QueryOutcome:
+    def _execute(self, statement: Statement) -> list[QueryOutcome]:
         started = time.perf_counter()
         try:
-            with self._conn.cursor() as cursor:
-                cursor.execute(statement.sql)
-                elapsed = (time.perf_counter() - started) * 1000
-                if cursor.description:
-                    columns = [str(col[0]) for col in cursor.description]
-                    rows = cursor.fetchmany(MAX_ROWS)
-                    truncated = len(rows) == MAX_ROWS and bool(cursor.fetchone())
-                    return QueryOutcome(
-                        statement=statement.sql,
-                        columns=columns,
-                        rows=[tuple(r) for r in rows],
-                        rowcount=len(rows),
-                        duration_ms=elapsed,
-                        vertical=statement.vertical,
-                        truncated=truncated,
-                    )
-                affected = cursor.rowcount
-                info = getattr(self._conn, "_result", None)
-                message = getattr(info, "message", "") or ""
-                self._track_database(statement.sql)
-                return QueryOutcome(
-                    statement=statement.sql,
-                    rowcount=affected,
-                    duration_ms=elapsed,
-                    message=message.strip(),
-                    vertical=statement.vertical,
-                )
+            results = self._engine.execute(self._conn, statement.sql)
         except Exception as exc:
             elapsed = (time.perf_counter() - started) * 1000
-            return QueryOutcome(
+            return [
+                QueryOutcome(
+                    statement=statement.sql,
+                    duration_ms=elapsed,
+                    error=self._engine.describe_error(exc),
+                    vertical=statement.vertical,
+                )
+            ]
+        self._track_database(statement.sql)
+        return [
+            QueryOutcome(
                 statement=statement.sql,
-                duration_ms=elapsed,
-                error=describe_error(exc),
+                columns=result.columns,
+                rows=result.rows,
+                rowcount=result.rowcount,
+                duration_ms=result.duration_ms,
+                message=result.message,
                 vertical=statement.vertical,
+                truncated=result.truncated,
             )
+            for result in results
+        ]
+
+    # ----- Tab completion -------------------------------------------------
+    @pyqtSlot()
+    def load_completions(self) -> None:
+        """Fetch the names Tab can complete: tables, schemas, keywords.
+
+        Deliberately quiet. A console that could not read its own catalogue -
+        an account with no rights to information_schema is ordinary - simply
+        completes keywords instead, and says nothing about it.
+        """
+        names: list[str] = list(self._engine.keywords)
+        if self._conn is not None:
+            for query in self._engine.completion_sql():
+                try:
+                    for result in self._engine.execute(
+                        self._conn, query, max_rows=MAX_COMPLETIONS
+                    ):
+                        names.extend(
+                            str(row[0]) for row in result.rows if row and row[0]
+                        )
+                except Exception:
+                    continue
+        self.completions.emit(sorted(set(names)))
 
     def _track_database(self, sql: str) -> None:
         """Remember the current schema so the prompt can show it."""
-        database = database_from_use(sql)
+        database = self._engine.database_from_use(sql)
         if database:
             self._database = database
 
     @property
     def database(self) -> str:
         return self._database
+
+
+#: The name this worker had when MySQL was the only thing it spoke.
+MySQLWorker = SqlWorker

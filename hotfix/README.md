@@ -1,4 +1,4 @@
-# MySQL Runner — "Add" crash hotfix (1.0.3)
+# MySQL Runner - "Add" crash hotfix (1.0.3)
 
 ## Symptom
 Clicking **Add** (and **Edit**) in the server list closed the whole app
@@ -16,7 +16,7 @@ if dialog.exec():
 ```
 
 …but the `ServerDialog` class was **never defined or imported anywhere** in the
-shipped build — its source file was missing when the 1.0.3 one-file exe was
+shipped build - its source file was missing when the 1.0.3 one-file exe was
 frozen. So `ServerDialog(self)` raised `NameError: name 'ServerDialog' is not
 defined`. PyQt6 aborts the process on an unhandled exception raised inside a
 signal/slot handler, which is why the app simply disappeared instead of showing
@@ -29,8 +29,8 @@ disassembling the Python 3.13 bytecode embedded in the frozen build.)
 `server_dialog.py` restores the missing dialog. It matches the exact contract
 the existing (unmodified) `main_window` bytecode expects:
 
-* `ServerDialog(parent)` — add mode
-* `ServerDialog(parent, profile=<ServerProfile>)` — edit mode (pre-fills fields)
+* `ServerDialog(parent)` - add mode
+* `ServerDialog(parent, profile=<ServerProfile>)` - edit mode (pre-fills fields)
 * `.exec()` returns truthy on OK
 * `.result_profile()` returns a `ServerProfile`; in edit mode it **preserves the
   original `id`** so `ServerStore.update()` can find and replace the entry.
@@ -40,7 +40,7 @@ The form exposes every `ServerProfile` field: label, url, username, password
 (None / Development / Staging / Production) and an optional startup-SQL box.
 
 Because the original source is unavailable, the exe was patched **losslessly**
-rather than rebuilt from scratch — see `rebuild_fixed_exe.py`. Only the embedded
+rather than rebuilt from scratch - see `rebuild_fixed_exe.py`. Only the embedded
 PYZ changes (new `server_dialog` module + a one-line `mysql_runner.ui` shim that
 publishes `ServerDialog`); all other modules and all Qt binaries are byte-for-byte
 identical to the original build.
@@ -50,7 +50,7 @@ identical to the original build.
 |------|---------|-------------------------------------------|
 | `server_dialog.py` | the restored dialog | `mysql_runner/ui/server_dialog.py` |
 | `ui__init__.py` | runtime shim exposing `ServerDialog` | `mysql_runner/ui/__init__.py` |
-| `rebuild_fixed_exe.py` | rebuilds the fixed exe from the original build artifacts | — |
+| `rebuild_fixed_exe.py` | rebuilds the fixed exe from the original build artifacts | - |
 
 ## Verification
 * Unit test against the real (recovered) `ServerProfile` model: add creates a

@@ -191,7 +191,7 @@ class RemoteFolderDialog(QDialog):
         if not names:
             self._status.setText(f"{path} has no subfolders.")
         else:
-            self._status.setText(f"{path} — {len(names)} folder(s).")
+            self._status.setText(f"{path} - {len(names)} folder(s).")
         # Keep walking down to where the pane already is, and stop the moment
         # a step is missing rather than asking for children of nothing.
         while self._chain:

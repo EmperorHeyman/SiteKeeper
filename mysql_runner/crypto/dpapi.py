@@ -3,8 +3,8 @@
 Used by the vault's password-free modes: instead of deriving the key-encryption
 key from a typed master password, the Data Encryption Key is sealed with
 ``CryptProtectData`` so only the current Windows user account can unseal it.
-Credentials therefore stay encrypted at rest — copying ``vault.json`` and
-``servers.enc`` to another account or machine yields nothing usable — while the
+Credentials therefore stay encrypted at rest - copying ``vault.json`` and
+``servers.enc`` to another account or machine yields nothing usable - while the
 app never has to prompt.
 """
 

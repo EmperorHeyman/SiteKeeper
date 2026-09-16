@@ -104,7 +104,7 @@ class CommitPlanDialog(QDialog):
         repo = plan.get("repo_label") or plan.get("repo") or ""
         self._heading.setText(
             f"Commit {commit}" + (f" in {repo}" if repo else "")
-            + f" — {plan.get('detail', '')}"
+            + f" - {plan.get('detail', '')}"
         )
         colours = theme.palette(self._dark)
         self._route.setText(

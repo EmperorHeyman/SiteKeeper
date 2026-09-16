@@ -32,10 +32,12 @@ binaries = []
 # from imports in code. The three below are loaded lazily (and keyring via a
 # string, which static analysis cannot see), so they are named explicitly:
 #   pymysql   - native MySQL connections for the SQL console tab
+#   pyodbc    - Microsoft SQL Server connections for the same tab
 #   paramiko  - SFTP transport for the file-manager tab
 #   keyring   - optional Windows Credential Manager cache for the vault key
 hiddenimports = [
     "pymysql",
+    "pyodbc",
     "paramiko",
     "keyring",
     "keyring.backends.Windows",

@@ -4,10 +4,20 @@ One dialog covers every connection kind. Picking the kind at the top swaps
 which sections are shown - a phpMyAdmin entry needs a URL and an auth mode, a
 native MySQL entry needs host/port/database, and a transfer entry needs the
 starting directories on both sides.
+
+**Test connection** answers the question this form otherwise leaves open. Six
+fields copied out of a hosting email are six chances to be wrong, and until
+there was a button here the first attempt at any of them happened later, on a
+tab that failed with one line and no way to tell which field was at fault. The
+test dials exactly what is typed - not what is saved - so it can be run before
+anything is written to the vault, and it runs on a thread of its own so a
+server that will never answer does not freeze the dialog. What it concludes is
+in connectiontest.py.
 """
 
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -22,11 +32,14 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from mysql_runner import connectiontest
+from mysql_runner.db import mssql_driver
 from mysql_runner.storage.models import (
     DEFAULT_PORTS,
     AuthType,
@@ -34,14 +47,29 @@ from mysql_runner.storage.models import (
     Environment,
     ServerProfile,
 )
-from mysql_runner.transfer import hostkeys
+from mysql_runner.transfer import backends, hostkeys
+from mysql_runner.ui.testrunner import TestRunner
 
 _KIND_LABELS = {
     ConnectionKind.PHPMYADMIN: "phpMyAdmin (browser tab)",
     ConnectionKind.MYSQL: "MySQL (SQL console)",
+    ConnectionKind.MSSQL: "Microsoft SQL Server (SQL console)",
     ConnectionKind.SFTP: "SFTP (file transfer)",
     ConnectionKind.FTP: "FTP (file transfer)",
     ConnectionKind.FTPS: "FTPS (file transfer over TLS)",
+}
+
+#: What the ODBC driver box offers when nothing has been chosen.
+_AUTO_DRIVER = "Newest installed driver"
+
+#: What the pill beside the Test button says in each state. The words carry
+#: the meaning and the colour repeats it, rather than the other way round -
+#: a red dot nobody can read is not a result.
+_STATE_WORDS = {
+    connectiontest.OK: "Works",
+    connectiontest.WARN: "Almost",
+    connectiontest.FAIL: "Failed",
+    "busy": "Testing…",
 }
 
 _AUTH_LABELS = {
@@ -159,6 +187,55 @@ class ServerDialog(QDialog):
         self._host_form.addRow("", self._passive)
         layout.addWidget(self._host_box)
 
+        # ----- SQL Server ---------------------------------------------------
+        # Four settings, because a SQL Server that SSMS opens without being
+        # asked anything is usually a named instance, reached with the
+        # Windows account you are already logged in as, presenting a
+        # certificate it signed itself. Any of those missing is a connection
+        # that fails with a message about none of them.
+        self._mssql_box = QGroupBox("SQL Server")
+        mssql_form = QFormLayout(self._mssql_box)
+        self._mssql_instance = QLineEdit()
+        self._mssql_instance.setPlaceholderText("e.g. SQLEXPRESS (optional)")
+        self._mssql_instance.setToolTip(
+            "A named instance, the part after the backslash in SSMS's "
+            "MACHINE\\SQLEXPRESS. Leave empty for a default instance."
+        )
+        self._mssql_windows_auth = QCheckBox(
+            "Windows Authentication (log in as me)"
+        )
+        self._mssql_windows_auth.setToolTip(
+            "What SSMS calls Windows Authentication: the server trusts the "
+            "account this app is running as, and no password is stored."
+        )
+        self._mssql_windows_auth.toggled.connect(self._on_windows_auth_toggled)
+        self._mssql_encrypt = QCheckBox("Encrypt the connection")
+        self._mssql_encrypt.setChecked(True)
+        self._mssql_trust_cert = QCheckBox(
+            "Trust the server's certificate without checking who signed it"
+        )
+        self._mssql_trust_cert.setChecked(True)
+        self._mssql_trust_cert.setToolTip(
+            "Leave this on for a server with a self-signed certificate, "
+            "which is most in-house SQL Servers. Turn it off only when the "
+            "certificate was issued by an authority this PC trusts."
+        )
+        self._mssql_driver = QComboBox()
+        self._mssql_driver.setToolTip(
+            "Which Microsoft ODBC driver to dial with. The newest installed "
+            "one is right unless a server is too old for it."
+        )
+        mssql_form.addRow("Instance:", self._mssql_instance)
+        mssql_form.addRow("", self._mssql_windows_auth)
+        mssql_form.addRow("", self._mssql_encrypt)
+        mssql_form.addRow("", self._mssql_trust_cert)
+        mssql_form.addRow("ODBC driver:", self._mssql_driver)
+        self._mssql_hint = QLabel("")
+        self._mssql_hint.setObjectName("hint")
+        self._mssql_hint.setWordWrap(True)
+        mssql_form.addRow(self._mssql_hint)
+        layout.addWidget(self._mssql_box)
+
         # ----- credentials -------------------------------------------------
         creds = QGroupBox("Credentials")
         creds_form = QFormLayout(creds)
@@ -253,12 +330,62 @@ class ServerDialog(QDialog):
         sql_layout.addWidget(self._startup)
         layout.addWidget(self._sql_box)
 
+        # ----- test ---------------------------------------------------------
+        # On the same row as Save, on the other side of it: this is the thing
+        # you do before saving, and it is not the loud action here.
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+
+        self._test_btn = QPushButton("Test connection")
+        self._test_btn.setToolTip(
+            "Connect with what is typed here and report what answered. "
+            "Nothing is saved and nothing on the server is changed."
+        )
+        self._test_btn.clicked.connect(self._on_test)
+        self._test_pill = QLabel("Not tested")
+        self._test_pill.setObjectName("pill")
+        self._test_pill.setProperty("state", "")
+        self._test_detail = QLabel("")
+        self._test_detail.setObjectName("hint")
+        self._test_detail.setWordWrap(True)
+        self._test_detail.setVisible(False)
+        self._test_detail.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum
+        )
+        self._test_detail.setTextInteractionFlags(
+            self._test_detail.textInteractionFlags()
+            | Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        test_row = QHBoxLayout()
+        test_row.setContentsMargins(0, 0, 0, 0)
+        test_row.addWidget(self._test_btn)
+        test_row.addWidget(self._test_pill)
+        test_row.addStretch(1)
+        test_row.addWidget(buttons)
+        layout.addWidget(self._test_detail)
+        layout.addLayout(test_row)
+
+        # A result stops being true the moment the thing it was about
+        # changes, and "Works" in green beside a password that has been
+        # edited since is worse than no answer at all.
+        for field in (
+            self._url, self._host, self._username, self._password,
+            self._database, self._mssql_instance, self._remote_dir,
+            self._key_path,
+        ):
+            field.textEdited.connect(self._forget_test_result)
+        self._port.valueChanged.connect(self._forget_test_result)
+        self._mssql_windows_auth.toggled.connect(self._forget_test_result)
+
+        self._tester = TestRunner(self)
+        self._tester.finished.connect(self._on_test_done)
+        #: True while a test started by an accepted host key is re-running, so
+        #: that question is only ever asked once per press.
+        self._test_retried = False
 
         if profile:
             self._load(profile)
@@ -269,22 +396,35 @@ class ServerDialog(QDialog):
         return self._kind.currentData()
 
     def _on_kind_changed(self) -> None:
+        # Tested as an SFTP account, then switched to FTP: same host, same
+        # password, different protocol, and the answer no longer applies.
+        self._forget_test_result()
         kind = self._current_kind()
         is_web = kind == ConnectionKind.PHPMYADMIN
-        is_mysql = kind == ConnectionKind.MYSQL
+        is_sql = kind.is_sql
+        is_mssql = kind == ConnectionKind.MSSQL
         is_ftp = kind in (ConnectionKind.FTP, ConnectionKind.FTPS)
         is_sftp = kind == ConnectionKind.SFTP
 
         self._web_box.setVisible(is_web)
         self._host_box.setVisible(not is_web)
         self._ssh_box.setVisible(is_sftp)
+        self._mssql_box.setVisible(is_mssql)
         if is_sftp:
             self._fill_jump_choices()
             self._sync_forget_button()
+        if is_mssql:
+            self._fill_driver_choices()
+            self._on_windows_auth_toggled(self._mssql_windows_auth.isChecked())
+        else:
+            # Windows authentication greys these out; leaving that behind
+            # when the kind changes would lock the fields of an FTP account.
+            self._username.setEnabled(True)
+            self._password.setEnabled(True)
         self._dirs_box.setVisible(kind.is_transfer)
-        self._sql_box.setVisible(is_web or is_mysql)
+        self._sql_box.setVisible(is_web or is_sql)
 
-        _set_row_visible(self._host_form, self._database, is_mysql)
+        _set_row_visible(self._host_form, self._database, is_sql)
         _set_row_visible(self._host_form, self._key_widget, is_sftp)
         _set_row_visible(self._host_form, self._passive, is_ftp)
         # SFTP shells on the port it is already talking to; only the
@@ -295,13 +435,144 @@ class ServerDialog(QDialog):
         self._port.setToolTip(
             f"Leave at 'default' to use {default_port}" if default_port else ""
         )
-        self._password_hint.setText(
-            "With a private key set, this is the key's passphrase."
-            if is_sftp
-            else ""
-        )
+        if is_sftp:
+            self._password_hint.setText(
+                "With a private key set, this is the key's passphrase."
+            )
+        elif not is_mssql:
+            # A SQL Server profile's hint belongs to the Windows-auth box,
+            # which has already set it by the time this runs.
+            self._password_hint.setText("")
         # The dialog shrinks when sections disappear; let Qt re-fit it.
         self.adjustSize()
+
+    # ----- testing --------------------------------------------------------
+    def _on_test(self) -> None:
+        """Dial what is on the form right now, on a thread of its own."""
+        if self._tester.busy:
+            return  # already running; the button is disabled anyway
+        complaint = self._incomplete()
+        if complaint:
+            self._show_test_result(
+                connectiontest.TestResult(connectiontest.FAIL, complaint)
+            )
+            return
+        profile = self.result_profile()
+        jump, problem = backends.jump_for(profile, self._profile_by_id)
+        if problem:
+            self._show_test_result(
+                connectiontest.TestResult(connectiontest.FAIL, problem)
+            )
+            return
+
+        self._set_testing(True)
+        self._tester.start(profile, jump)
+
+    def _incomplete(self) -> str:
+        """Why there is nothing to test yet, or "" when there is."""
+        kind = self._current_kind()
+        if kind == ConnectionKind.PHPMYADMIN:
+            if not self._url.text().strip():
+                return "Enter the phpMyAdmin URL first."
+            return ""
+        if not self._host.text().strip():
+            return "Enter the server host name or address first."
+        return ""
+
+    def _profile_by_id(self, profile_id: str):
+        """The other saved connections, for resolving a named jump host."""
+        for candidate in self._profiles:
+            if candidate.id == profile_id:
+                return candidate
+        return None
+
+    def _on_test_done(self, result: object) -> None:
+        self._set_testing(False)
+        if not isinstance(result, connectiontest.TestResult):
+            return
+        unknown = result.host_key
+        if unknown is not None and not self._test_retried:
+            # The only failure with an answer the user can give here. Ask it,
+            # and if they vouch for the server, finish the test they asked
+            # for rather than making them press the button again.
+            from mysql_runner.ui.host_key_dialog import ask
+
+            if ask(unknown, self):
+                self._test_retried = True
+                self._on_test()
+                return
+        self._test_retried = False
+        self._show_test_result(result)
+
+    def _show_test_result(self, result) -> None:
+        self._test_pill.setText(_STATE_WORDS.get(result.state, "Failed"))
+        self._set_pill_state(result.state)
+        body = "\n".join(line for line in result.facts if line)
+        self._test_detail.setText(
+            f"{result.summary}\n{body}" if body else result.summary
+        )
+        self._test_detail.setVisible(True)
+        self.adjustSize()
+
+    def _set_testing(self, busy: bool) -> None:
+        self._test_btn.setEnabled(not busy)
+        if busy:
+            self._test_pill.setText(_STATE_WORDS["busy"])
+            self._set_pill_state("busy")
+            self._test_detail.setVisible(False)
+
+    def _forget_test_result(self, *_args) -> None:
+        """Drop a result that no longer describes what is on the form."""
+        if self._tester.busy or self._test_pill.text() == "Not tested":
+            return
+        self._test_pill.setText("Not tested")
+        self._set_pill_state("")
+        self._test_detail.setVisible(False)
+
+    def _set_pill_state(self, state: str) -> None:
+        """Restyle the pill: Qt only re-reads a property selector on demand."""
+        self._test_pill.setProperty("state", state)
+        self._test_pill.style().unpolish(self._test_pill)
+        self._test_pill.style().polish(self._test_pill)
+
+    def done(self, code: int) -> None:  # noqa: D102 - Qt's own signature
+        # Covers OK, Cancel, Escape and the window's close button, which is
+        # four ways to leave a dialog with a test still running.
+        self._tester.stop()
+        super().done(code)
+
+    # ----- SQL Server -----------------------------------------------------
+    def _fill_driver_choices(self) -> None:
+        """Offer the ODBC drivers this machine actually has."""
+        current = self._mssql_driver.currentData() or (
+            self._profile.mssql_odbc_driver if self._profile else ""
+        )
+        installed = mssql_driver.installed_drivers()
+        self._mssql_driver.blockSignals(True)
+        self._mssql_driver.clear()
+        self._mssql_driver.addItem(_AUTO_DRIVER, "")
+        for name in installed:
+            self._mssql_driver.addItem(name, name)
+        index = self._mssql_driver.findData(current)
+        self._mssql_driver.setCurrentIndex(max(0, index))
+        self._mssql_driver.blockSignals(False)
+        # Saying this here, while the connection is being written, beats
+        # saying it when the tab fails to open half an hour later.
+        self._mssql_hint.setText(
+            mssql_driver.missing_driver_message()
+            or f"Using {mssql_driver.default_driver()}."
+        )
+
+    def _on_windows_auth_toggled(self, enabled: bool) -> None:
+        """A Windows login has no username or password to store."""
+        self._username.setEnabled(not enabled)
+        self._password.setEnabled(not enabled)
+        if self._current_kind() == ConnectionKind.MSSQL:
+            self._password_hint.setText(
+                "Signed in as this PC's Windows account; nothing is stored."
+                if enabled
+                else ""
+            )
 
     # ----- SSH ------------------------------------------------------------
     def _fill_jump_choices(self) -> None:
@@ -401,6 +672,10 @@ class ServerDialog(QDialog):
         self._use_agent.setChecked(profile.use_agent)
         self._use_default_keys.setChecked(profile.use_default_keys)
         self._proxy_command.setText(profile.proxy_command)
+        self._mssql_instance.setText(profile.mssql_instance)
+        self._mssql_windows_auth.setChecked(profile.mssql_windows_auth)
+        self._mssql_encrypt.setChecked(profile.mssql_encrypt)
+        self._mssql_trust_cert.setChecked(profile.mssql_trust_cert)
 
     def _on_accept(self) -> None:
         if not self._label.text().strip():
@@ -416,6 +691,18 @@ class ServerDialog(QDialog):
         elif not self._host.text().strip():
             QMessageBox.warning(
                 self, "Missing host", "Please enter the server host name or address."
+            )
+            return
+        if (
+            self._current_kind() == ConnectionKind.MSSQL
+            and not self._mssql_windows_auth.isChecked()
+            and not self._username.text().strip()
+        ):
+            QMessageBox.warning(
+                self,
+                "Missing login",
+                "Enter the SQL login, or tick Windows Authentication to "
+                "connect as the account you are signed in with.",
             )
             return
         self.accept()
@@ -444,6 +731,11 @@ class ServerDialog(QDialog):
             "use_default_keys": self._use_default_keys.isChecked(),
             "jump_profile_id": str(self._jump.currentData() or ""),
             "proxy_command": self._proxy_command.text().strip(),
+            "mssql_instance": self._mssql_instance.text().strip(),
+            "mssql_windows_auth": self._mssql_windows_auth.isChecked(),
+            "mssql_encrypt": self._mssql_encrypt.isChecked(),
+            "mssql_trust_cert": self._mssql_trust_cert.isChecked(),
+            "mssql_odbc_driver": str(self._mssql_driver.currentData() or ""),
         }
         if self._profile:
             # ``order`` is where this connection sits in its group. It is not

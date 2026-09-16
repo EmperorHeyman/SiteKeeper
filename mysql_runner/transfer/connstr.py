@@ -30,6 +30,8 @@ SCHEMES = {
     "ftps": ConnectionKind.FTPS,
     "ftpes": ConnectionKind.FTPS,
     "mysql": ConnectionKind.MYSQL,
+    "mssql": ConnectionKind.MSSQL,
+    "sqlserver": ConnectionKind.MSSQL,
     "http": ConnectionKind.PHPMYADMIN,
     "https": ConnectionKind.PHPMYADMIN,
 }
@@ -40,6 +42,7 @@ _KIND_SCHEME = {
     ConnectionKind.FTP: "ftp",
     ConnectionKind.FTPS: "ftps",
     ConnectionKind.MYSQL: "mysql",
+    ConnectionKind.MSSQL: "mssql",
 }
 
 
@@ -81,7 +84,10 @@ def parse_url(text: str, *, label: str = "") -> ServerProfile:
         username=username,
         password=password,
     )
-    if kind == ConnectionKind.MYSQL:
+    if kind.is_sql:
+        # A named SQL Server instance has no place in a URL - a backslash
+        # in the host is not one - so an imported profile names a port and
+        # the instance is set in the dialog if there is one.
         profile.database = path.lstrip("/")
     elif path not in ("", "/"):
         profile.remote_dir = path.rstrip("/")
@@ -100,7 +106,7 @@ def to_url(profile: ServerProfile, *, include_password: bool = False) -> str:
             credentials += ":" + url_quote(profile.password, safe="")
         credentials += "@"
     port = f":{profile.port}" if profile.port else ""
-    if profile.kind == ConnectionKind.MYSQL:
+    if profile.kind.is_sql:
         tail = f"/{profile.database}" if profile.database else ""
     else:
         tail = profile.remote_dir if profile.remote_dir.startswith("/") else ""

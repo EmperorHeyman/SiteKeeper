@@ -9,7 +9,7 @@ Each run of the queue is one timestamped batch, newest at the top - the thing
 that just happened is the thing being looked for, and it should never be at the
 bottom of a scroll. Batches are grouped by the minute rather than the second,
 and everything started by one trigger inside that minute folds into a single
-headline: "14:32 — 7 file(s) · git sync: fix the login form" with the outcome
+headline: "14:32 - 7 file(s) · git sync: fix the login form" with the outcome
 alongside. That last part matters most on a busy afternoon, because "why is it
 uploading?" is answered by *what started it*, not by how many files it is - and
 for a commit that means the message it was written with - the same thing every
@@ -262,8 +262,8 @@ class TransferQueuePanel(QWidget):
         self._batch_total = total
 
     def _headline(self, total: int) -> str:
-        """"14:32 — 7 file(s) · git sync: fix the login form"."""
-        text = f"{self._batch_minute} — {total} file(s)"
+        """"14:32 - 7 file(s) · git sync: fix the login form"."""
+        text = f"{self._batch_minute} - {total} file(s)"
         label, note = self._split_origin()
         if label and note:
             return f"{text}  ·  {label}: {_elide(note)}"
