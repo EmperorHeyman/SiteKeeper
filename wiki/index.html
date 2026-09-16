@@ -593,7 +593,7 @@ html { scroll-behavior: smooth; }
     </svg>
     <span>Sitekeeper</span>
   </a>
-  <span class="version">v1.12.0</span>
+  <span class="version">v1.13.0</span>
   <span class="bar-spacer"></span>
   <div class="filter">
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -611,6 +611,7 @@ html { scroll-behavior: smooth; }
   <a href="#top">What Sitekeeper is</a>
   <a href="#install">Installing and first launch</a>
   <a href="#adding">Adding connections</a>
+  <a href="#testing">Testing a connection</a>
   <a href="#handover">Connections from your host</a>
 
   <h4>The connection list</h4>
@@ -619,7 +620,7 @@ html { scroll-behavior: smooth; }
 
   <h4>Sessions</h4>
   <a href="#phpmyadmin">phpMyAdmin tabs</a>
-  <a href="#console">The MySQL console</a>
+  <a href="#console">The SQL console</a>
   <a href="#terminal">Terminals</a>
   <a href="#server-tools">Server-side tools</a>
 
@@ -664,20 +665,20 @@ html { scroll-behavior: smooth; }
 <main>
 
 <section id="top">
-  <p class="eyebrow">Handbook · version 1.12.0</p>
+  <p class="eyebrow">Handbook · version 1.13.0</p>
   <h1>Sitekeeper</h1>
   <p class="lede">
     Save a server once - encrypted locally - then double-click it. What opens
     depends on what you saved: an auto-logging-in phpMyAdmin tab, a real
-    <code>mysql&gt;</code> prompt, or a two-pane file manager that can keep a
-    folder deployed on every save or every git commit. Open as many as you like
-    at once, in tabs, two side by side.
+    <code>mysql&gt;</code> or <code>mssql&gt;</code> prompt, or a two-pane file
+    manager that can keep a folder deployed on every save or every git commit.
+    Open as many as you like at once, in tabs, two side by side.
   </p>
   <div class="pill-row">
     <span class="pill">Windows</span>
     <span class="pill">Python 3.10+</span>
     <span class="pill">MIT licensed</span>
-    <span class="pill new">1.12.0 · one-click handover from hosting providers</span>
+    <span class="pill new">1.13.0 · SQL Server, and a Test button on every connection</span>
   </div>
 
   <div class="kinds">
@@ -700,6 +701,17 @@ html { scroll-behavior: smooth; }
         <h4>MySQL</h4>
       </div>
       <p>A real prompt on port 3306: ASCII result tables, multi-line statements, history, <code>\G</code>. No phpMyAdmin involved.</p>
+    </div>
+    <div class="kind">
+      <div class="kind-head">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="#8a8a92" stroke-width="1.5" aria-hidden="true">
+          <ellipse cx="10" cy="5.2" rx="6.4" ry="2.6"/>
+          <path d="M3.6 5.2v9.6c0 1.44 2.87 2.6 6.4 2.6s6.4-1.16 6.4-2.6V5.2"/>
+          <path d="M3.6 10c0 1.44 2.87 2.6 6.4 2.6s6.4-1.16 6.4-2.6"/>
+        </svg>
+        <h4>SQL Server</h4>
+      </div>
+      <p>The same prompt against the server SSMS opens, speaking T-SQL: <code>GO</code> ends a batch, Windows Authentication and named instances included.</p>
     </div>
     <div class="kind">
       <div class="kind-head">
@@ -779,8 +791,16 @@ python main.py</code></pre>
   <p>
     Whichever route, a connection carries: a label, the connection type, host
     and port (or a phpMyAdmin URL), username and password, optionally a group,
-    an environment level, a starting directory on each side, and - for MySQL -
-    a database and a startup query to run on connect.
+    an environment level, a starting directory on each side, and - for a
+    database - a schema and a startup query to run on connect. A SQL Server
+    connection also carries its instance name, whether to log in as your
+    Windows account, and what to do about the server's certificate.
+  </p>
+  <p>
+    Before saving any of it, press <strong>Test connection</strong> -
+    <a href="#testing">see below</a>. It dials what is on the form, not what
+    is in the vault, so a typo costs you one click rather than a session that
+    fails later for a reason you cannot pin down.
   </p>
 
   <h3>Harder-to-reach servers</h3>
@@ -792,6 +812,50 @@ python main.py</code></pre>
     <code>%p</code> and <code>%r</code> are replaced with the host, port and
     username.
   </p>
+</section>
+
+<section id="testing">
+  <h2>Testing a connection <span class="pill new">new in 1.13.0</span></h2>
+  <p class="section-note">
+    <strong>Test connection</strong> sits on the Add/Edit form, beside Save, and
+    on the right-click menu of any connection already saved. It logs in, reports
+    what answered, and disconnects. Nothing is written and nothing on the server
+    is changed.
+  </p>
+  <p>
+    Six fields copied out of a hosting email are six chances to be wrong, and
+    without this the first attempt at any of them happens later - on a tab that
+    fails with one line, when the host, the port, the password, the protocol and
+    the folder are all still suspect. So the answer says which parts it proved:
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Type</th><th>What the test actually does</th></tr></thead>
+      <tbody>
+        <tr><td><strong>phpMyAdmin</strong></td><td>Fetches the page, then logs in to it - the real login form, hidden token and all, or HTTP Basic when the server asks for that instead</td></tr>
+        <tr><td><strong>MySQL / SQL Server</strong></td><td>Logs in, reads the version, edition and current schema back</td></tr>
+        <tr><td><strong>SFTP / FTP / FTPS</strong></td><td>Logs in, opens the starting directory and counts what is in it, and says what that account is allowed to do - shell, permissions, symlinks</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    There are three answers rather than two, because the middle one is the
+    useful one:
+  </p>
+  <ul>
+    <li><strong>Works</strong> - the login was accepted, and here is what answered.</li>
+    <li><strong>Almost</strong> - the server is there and the credentials are good, and something typed beside them is not: a starting folder that does not exist, a URL that is a web page but not phpMyAdmin, a password saved for HTTP Basic when phpMyAdmin wanted its own. Worth seeing now rather than at the point of use, and not a failure.</li>
+    <li><strong>Failed</strong> - with the reason the server itself gave, not "connection failed".</li>
+  </ul>
+  <div class="note">
+    <p>
+      A server whose SSH identity has never been confirmed asks for its
+      fingerprint here, exactly as it would when connecting, and the test
+      finishes once you vouch for it - see <a href="#hostkeys">Host keys</a>. A
+      result also clears itself the moment you edit a field it was about, so a
+      green <em>Works</em> never sits beside a password that has changed since.
+    </p>
+  </div>
 </section>
 
 <section id="handover">
@@ -935,17 +999,46 @@ python main.py</code></pre>
 </section>
 
 <section id="console">
-  <h2>The MySQL console</h2>
+  <h2>The SQL console</h2>
   <p class="section-note">
-    A native connection to port 3306 with the command-line client's behaviour,
+    A native connection to the database - MySQL on 3306, Microsoft SQL Server
+    on 1433 or a named instance - with the command-line client's behaviour,
     inside a tab.
   </p>
   <ul>
     <li>Bordered result tables, <code>Empty set</code> and <code>Query OK</code> summaries with timings.</li>
-    <li>Multi-line statements ending in <code>;</code>, and <code>\G</code> for vertical output.</li>
+    <li>Multi-line statements ending in <code>;</code>, and <code>\G</code> for vertical output on MySQL.</li>
+    <li><kbd>Tab</kbd> completes the dialect's keywords and the tables in the schema: one match fills it in, several fill in as far as they agree, and past that it lists them the way a shell does.</li>
     <li>Arrow-key history, plus the <code>\c</code>, <code>\s</code>, <code>\r</code> and <code>\q</code> backslash commands. <kbd>Ctrl</kbd>+<kbd>L</kbd> clears the screen.</li>
     <li>Queries run on a worker thread, so the window never freezes, and oversized result sets are capped rather than swallowing your memory.</li>
   </ul>
+
+  <h3>SQL Server <span class="pill new">new in 1.13.0</span></h3>
+  <p>
+    The same tab, against the server SSMS opens, and it takes T-SQL as it is
+    actually written: a line containing only <code>GO</code> ends a batch
+    (<code>GO 5</code> runs it five times), <code>[brackets]</code> quote an
+    identifier, and <code>#temp</code> is a temporary table rather than the
+    start of a comment. A batch that returns several result sets prints all of
+    them.
+  </p>
+  <p>
+    It connects through the Microsoft ODBC driver - the one installed
+    alongside SSMS - which is what makes the awkward half of that login dialog
+    work here too: <strong>Windows Authentication</strong> with no password
+    stored anywhere, <strong>named instances</strong> such as
+    <code>MACHINE\SQLEXPRESS</code> reached through the SQL Browser, and the
+    encryption settings driver 18 made mandatory.
+  </p>
+  <div class="note">
+    <p>
+      <strong>Trusting the certificate is on by default.</strong> An in-house
+      SQL Server almost always presents one it signed itself, and driver 18
+      refuses those outright - so the alternative is a connection nobody can
+      make at all. Turn it off on the Edit form when the certificate was
+      issued by an authority this PC already trusts.
+    </p>
+  </div>
 </section>
 
 <section id="terminal">
@@ -959,10 +1052,12 @@ python main.py</code></pre>
   </p>
   <p>
     It is line-oriented on purpose. That is what lets it remember your commands
-    per server, suggest and complete them, <kbd>Ctrl</kbd>+<kbd>R</kbd> back
-    through them, and ask before something destructive on a production box. The
-    same menu hands the connection to PuTTY, Windows Terminal, <code>ssh.exe</code>
-    or WSL instead.
+    per server, suggest them as you type, <kbd>Ctrl</kbd>+<kbd>R</kbd> back
+    through them, and ask before something destructive on a production box.
+    <kbd>Tab</kbd> completes remote paths over the same SSH connection - the
+    real directory listing rather than a guess - and command names you have
+    used here before. The same menu hands the connection to PuTTY, Windows
+    Terminal, <code>ssh.exe</code> or WSL instead.
   </p>
   <div class="note">
     <p>
@@ -1239,7 +1334,9 @@ python main.py</code></pre>
         <tr><td><code>diff_remote</code></td><td>Whether a local path matches a remote one, by content digest, file or whole tree</td></tr>
         <tr><td><code>download_file</code></td><td>One file, fetched</td></tr>
         <tr><td><code>list_undo_history</code></td><td>The restore points Sitekeeper kept, with the ids <code>undo_remote_change</code> takes</td></tr>
-        <tr><td><code>run_query</code></td><td>SQL on a MySQL profile. <code>via=</code>an SFTP profile on that server runs it through the server's own <code>mysql</code> client - which makes a phpMyAdmin profile usable, and is the only way into a database listening on localhost</td></tr>
+        <tr><td><code>run_query</code></td><td>SQL on a MySQL or SQL Server profile. Runs in the app's own console tab when one is open on that connection, so the statement lands in the transcript you are watching. <code>via=</code>an SFTP profile on that server runs it through the server's own <code>mysql</code> or <code>sqlcmd</code> instead - which makes a phpMyAdmin profile usable, and is the only way into a database listening on localhost</td></tr>
+        <tr><td><code>open_console</code></td><td>Opens a SQL console tab in the running window and waits until it has connected, so everything <code>run_query</code> does afterwards happens where you can see it</td></tr>
+        <tr><td><code>test_connection</code></td><td>Connects, reports what answered, disconnects - the same test the Test button runs, for every kind. Separates a wrong password from a server that is down from a folder that does not exist</td></tr>
       </tbody>
     </table>
   </div>
@@ -1474,7 +1571,7 @@ Authorization: Bearer &lt;ticket&gt;
 Accept: application/json
 Cache-Control: no-store
 Connection: close
-User-Agent: Sitekeeper/1.12.0 (Windows)</code></pre>
+User-Agent: Sitekeeper/1.13.0 (Windows)</code></pre>
 
   <p>Enforced by the app, none of it negotiable:</p>
   <ul>
@@ -1925,9 +2022,9 @@ example.cz - pma      = https://pma.cloudcore.cz/</code></pre>
 </section>
 
 <footer>
-  <span>Sitekeeper 1.12.0 - MIT licensed</span>
+  <span>Sitekeeper 1.13.0 - MIT licensed</span>
   <span>RAPL Group, s.r.o.</span>
-  <span>Handbook last revised 15 September 2026</span>
+  <span>Handbook last revised 16 September 2026</span>
 </footer>
 
 </main>

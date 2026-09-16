@@ -24,8 +24,15 @@ fragment, so nothing depends on where it is mounted.
 
 ## Keeping it current
 
-The page states a version in three places: the title block, the badge in the top
-bar, and the footer. When Sitekeeper's version changes, so do those. The
-provider contract is the part most worth keeping honest - if
+The page states a version in four places: the title block, the badge in the top
+bar, the footer, and the `User-Agent:` line in the example provisioning request
+(the app builds that header from `__version__`, so a stale one here is a lie
+about what a panel will actually see). When Sitekeeper's version changes, so do
+those, along with the "Handbook last revised" date in the footer.
+
+Historical mentions - "new in 1.12.0", the availability column in the delivery
+table - are facts about when something arrived and stay as they are.
+
+The provider contract is the part most worth keeping honest - if
 `mysql_runner/storage/provisioning.py` and this page ever disagree, the code is
 right and the page is stale.
